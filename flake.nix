@@ -27,7 +27,7 @@
       in
       {
         packages = {
-          "flake-start" = package;
+          "mint-rabbit" = package;
           default = package;
         };
 

@@ -4,7 +4,7 @@
 }:
 
 stdenv.mkDerivation {
-  name = "flake-start";
+  name = "mint-rabbit";
 
   src = lib.cleanSource ./.;
 
@@ -18,12 +18,12 @@ stdenv.mkDerivation {
     printf '%s\n' \
       '#!/usr/bin/env bash' \
       'set -euo pipefail' \
-      'echo "Hello from flake-start"' \
-      >"$out/bin/flake-start"
-    chmod +x "$out/bin/flake-start"
+      'echo "Hello from mint-rabbit"' \
+      >"$out/bin/mint-rabbit"
+    chmod +x "$out/bin/mint-rabbit"
 
     runHook postInstall
   '';
 
-  meta.mainProgram = "flake-start";
+  meta.mainProgram = "mint-rabbit";
 }
