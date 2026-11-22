@@ -288,8 +288,8 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     })
 }
 
-/// The images the project file in `dir` refers to, or none if there is no
-/// readable project file.
+/// The images the project file in `dir` refers to that a save may later
+/// remove, or none if there is no readable project file.
 fn referenced_images(dir: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(dir.join(PROJECT_FILE)) else {
         return Vec::new();
@@ -303,7 +303,13 @@ fn referenced_images(dir: &Path) -> Vec<PathBuf> {
             ContentFile::Painted(variants) => variants.iter().map(|v| v.underlay.clone()).collect(),
             ContentFile::External { preview } => vec![preview.clone()],
         })
-        .filter(|rel| relative_inside(rel))
+        // Only images saves write: PNGs directly in the image directory.
+        .filter(|rel| {
+            let path = Path::new(rel);
+            relative_inside(rel)
+                && path.parent() == Some(Path::new(IMAGE_DIR))
+                && path.extension().is_some_and(|e| e == "png")
+        })
         .map(|rel| dir.join(rel))
         .collect()
 }
@@ -861,6 +867,22 @@ mod tests {
         assert_eq!(load(dir.path()).unwrap(), p);
         assert!(reference.is_file());
         std::fs::remove_file(&reference).unwrap();
+
+        // A project file naming other files as images can't get them removed.
+        let manifest = dir.path().join(PROJECT_FILE);
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let first_image = images(dir.path())[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            &manifest,
+            text.replace(&format!("textures/{first_image}"), "project.ron"),
+        )
+        .unwrap();
+        save(&p, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), p);
         let second = images(dir.path());
         assert_eq!(second.len(), 3);
         assert!(
