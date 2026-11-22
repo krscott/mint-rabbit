@@ -161,7 +161,7 @@ impl TextureExport {
     /// model bank and the fields after the textures from `base`, a villager
     /// on the same model, or leaves `MODEL_BANK` and comments to fill in
     /// without one. `TEXTURE_BANK` is always left to replace with the new
-    /// texture set's object bank.
+    /// texture set's object bank. A `base` on another model is an error.
     pub fn table_entry(&self, base: Option<&VillagerRef>) -> Result<String, crate::WriteError> {
         if let Some(b) = base.filter(|b| b.model != self.model) {
             return Err(crate::WriteError::OtherModel {

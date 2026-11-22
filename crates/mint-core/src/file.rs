@@ -196,11 +196,13 @@ enum StyleFile {
 
 /// Writes `project` into directory `dir`, creating it if needed.
 ///
-/// Image files are named after their contents, so a save never changes an
-/// image the previous project file refers to. The project file is written
-/// beside its destination and renamed into place, and only then are images
-/// it no longer uses removed; an interrupted save leaves the previous project
-/// intact.
+/// Image files are named after their contents, so a save only ever
+/// rewrites an image the previous project file refers to with the same
+/// bytes. The project file is written beside its destination and renamed
+/// into place, and only then are the previous project file's images that the
+/// new one doesn't use removed; an interrupted save leaves the previous
+/// project intact, and the images it wrote stay behind. Saves to one
+/// directory must not overlap.
 pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
     stage(project, dir)?.commit(dir)
 }
@@ -306,19 +308,18 @@ fn referenced_images(dir: &Path) -> Vec<PathBuf> {
         // Only images saves write: PNGs directly in the image directory.
         .filter(|rel| {
             let path = Path::new(rel);
-            relative_inside(rel)
-                && path.parent() == Some(Path::new(IMAGE_DIR))
+            path.parent() == Some(Path::new(IMAGE_DIR))
                 && path.extension().is_some_and(|e| e == "png")
         })
-        .map(|rel| dir.join(rel))
+        // Resolved inside the project directory, as load requires.
+        .filter_map(|rel| image_path(dir, &rel).ok())
         .collect()
 }
 
 impl Staged {
     /// Replaces the project file, then removes the images only the previous
-    /// project file used. Other files, such as images another save is still
-    /// staging, are left alone, and failing to remove one doesn't fail the
-    /// save.
+    /// project file used. Other files are left alone, and failing to remove
+    /// one doesn't fail the save.
     fn commit(self, dir: &Path) -> Result<(), SaveError> {
         let manifest = dir.join(PROJECT_FILE);
         write_atomic(&manifest, self.text.as_bytes()).map_err(|e| SaveError::Io(manifest, e))?;
@@ -620,13 +621,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let permissions = std::fs::metadata(path).map_or_else(
-        |_| std::fs::Permissions::from_mode(0o666),
-        |m| m.permissions(),
-    );
     let mut tmp = tempfile::Builder::new()
-        .permissions(permissions)
+        .permissions(std::fs::Permissions::from_mode(0o666))
         .tempfile_in(dir)?;
+    // Set explicitly, as creating a file applies the umask.
+    if let Ok(old) = std::fs::metadata(path) {
+        tmp.as_file().set_permissions(old.permissions())?;
+    }
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -897,12 +898,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.c");
+        // Group-writable, which a typical umask (022) would remove.
         std::fs::write(&path, "old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
         write_atomic(&path, b"new").unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o644
+            0o664
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
