@@ -265,7 +265,8 @@ impl Decomp {
         dir: &Path,
     ) -> Result<[PathBuf; 2], WriteError> {
         let existing = self.root.join(Self::texture_path(&export.texture_set));
-        if existing.exists() {
+        // Anything at that path counts, a dangling link included.
+        if std::fs::symlink_metadata(&existing).is_ok() {
             return Err(WriteError::Exists(export.texture_set.clone(), existing));
         }
         let v = self.villager(base)?;
