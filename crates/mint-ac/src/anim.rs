@@ -81,7 +81,8 @@ pub fn sample(
             let n = keys
                 .next()
                 .ok_or_else(|| malformed("key table too short".into()))?;
-            let n = usize::try_from(n).map_err(|_| malformed(format!("key count {n} is negative")))?;
+            let n =
+                usize::try_from(n).map_err(|_| malformed(format!("key count {n} is negative")))?;
             let v = key_value(&t.data, data_index, n, frame)
                 .ok_or_else(|| malformed("data table too short".into()))?;
             data_index = data_index.saturating_add(n);
