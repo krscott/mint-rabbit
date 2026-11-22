@@ -94,6 +94,21 @@ enum Confirm {
     OverwriteFolder(PathBuf),
 }
 
+/// The texture-only export of a project to the texture set it was imported
+/// from.
+fn export_imported(project: &Project) -> Result<mint_ac::TextureExport, String> {
+    mint_ac::imported_from(project)
+        .and_then(|i| mint_ac::export_textures(project, i.texture_set))
+        .map_err(|e| e.to_string())
+}
+
+/// The line at the bottom of the window: the last thing done or what
+/// went wrong.
+enum Status {
+    Info(String),
+    Error(String),
+}
+
 /// An export the side panel asks for, run once its borrows end.
 enum Request {
     ExportInPlace,
@@ -120,9 +135,10 @@ pub struct App {
     camera: Orbit,
     linear_filter: bool,
     show_uv: bool,
-    error: Option<String>,
-    /// The last thing done, or why an edit was refused.
-    message: Option<String>,
+    status: Option<Status>,
+    /// Why the last edit in a panel or view was refused, moved into
+    /// `status` after them.
+    refusal: Option<String>,
     confirm: Option<Confirm>,
     texture_view: TextureView,
     tool: Tool,
@@ -140,6 +156,11 @@ impl App {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             Renderer::install(rs);
         }
+        // A press anywhere else, a drag included, leaves a text field, so
+        // keys and edits go where the pointer went.
+        cc.egui_ctx.options_mut(|o| {
+            o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Presses;
+        });
         let mut app = Self {
             decomp_path: options
                 .decomp
@@ -155,8 +176,8 @@ impl App {
             camera: Orbit::framing(Vec3::splat(-1.0), Vec3::ONE),
             linear_filter: true,
             show_uv: true,
-            error: None,
-            message: None,
+            status: None,
+            refusal: None,
             confirm: None,
             texture_view: TextureView::default(),
             tool: Tool::Select,
@@ -178,8 +199,16 @@ impl App {
         app
     }
 
+    fn fail(&mut self, error: impl Into<String>) {
+        self.status = Some(Status::Error(error.into()));
+    }
+
+    fn tell(&mut self, message: impl Into<String>) {
+        self.status = Some(Status::Info(message.into()));
+    }
+
     fn open_decomp(&mut self) {
-        self.error = None;
+        self.status = None;
         let result = Decomp::open(self.decomp_path.trim(), self.version.trim())
             .and_then(|d| d.villagers().map(|v| (d, v)));
         match result {
@@ -191,7 +220,7 @@ impl App {
             Err(e) => {
                 self.decomp = None;
                 self.villagers.clear();
-                self.error = Some(e.to_string());
+                self.fail(e.to_string());
             }
         }
     }
@@ -233,24 +262,24 @@ impl App {
     }
 
     fn import(&mut self) {
-        self.error = None;
+        self.status = None;
         let (Some(decomp), Some(v)) = (&self.decomp, self.villagers.get(self.villager)) else {
             return;
         };
         match decomp.import(v) {
             Ok(project) => self.set_doc(project, None),
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.fail(e.to_string()),
         }
     }
 
     fn open_project(&mut self, dir: &Path) {
-        self.error = None;
+        self.status = None;
         match mint_core::file::load(dir) {
             Ok(project) => {
                 self.set_doc(project, Some(dir.to_owned()));
-                self.message = Some(format!("Opened {}", dir.display()));
+                self.tell(format!("Opened {}", dir.display()));
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.fail(e.to_string()),
         }
     }
 
@@ -280,35 +309,32 @@ impl App {
 
     fn save_to(&mut self, dir: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
-        self.error = None;
         match mint_core::file::save(doc.editor.project(), &dir) {
             Ok(()) => {
-                self.message = Some(format!("Saved {}", dir.display()));
+                let saved = format!("Saved {}", dir.display());
                 doc.editor.saved(dir);
+                self.tell(saved);
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.fail(e.to_string()),
         }
     }
 
     /// Asks to replace the imported texture set's source in the decomp.
     fn export_in_place(&mut self) {
-        self.error = None;
+        self.status = None;
         let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
             return;
         };
         let project = doc.editor.project();
-        let result = mint_ac::imported_from(project)
-            .and_then(|i| mint_ac::export_textures(project, i.texture_set))
-            .map_err(|e| e.to_string())
-            .and_then(|e| {
-                decomp
-                    .check_texture_set(&e)
-                    .map(|p| (e, p))
-                    .map_err(|e| e.to_string())
-            });
+        let result = export_imported(project).and_then(|e| {
+            decomp
+                .check_texture_set(&e)
+                .map(|p| (e, p))
+                .map_err(|e| e.to_string())
+        });
         match result {
             Ok((export, path)) => self.confirm = Some(Confirm::ReplaceInDecomp(export, path)),
-            Err(e) => self.error = Some(e),
+            Err(e) => self.fail(e),
         }
     }
 
@@ -333,7 +359,7 @@ impl App {
     }
 
     fn write_folder(&mut self, dir: &Path) {
-        self.error = None;
+        self.status = None;
         let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
             return;
         };
@@ -351,13 +377,13 @@ impl App {
             });
         match result {
             Ok([c, notes]) => {
-                self.message = Some(format!(
+                self.tell(format!(
                     "Wrote {} and {}; the notes say how to add it to the decomp",
                     c.display(),
                     notes.display()
                 ));
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => self.fail(e),
         }
     }
 
@@ -440,10 +466,7 @@ impl App {
             let generation = doc.editor.generation();
             if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
                 let project = doc.editor.project();
-                let result = mint_ac::imported_from(project)
-                    .and_then(|i| mint_ac::export_textures(project, i.texture_set))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
+                let result = export_imported(project).map(|_| ());
                 doc.check = Some((generation, result));
             }
             match &doc.check {
@@ -456,11 +479,16 @@ impl App {
                 None => {}
             }
             let ready = matches!(doc.check, Some((_, Ok(())))) && self.decomp.is_some();
+            let why_not = if self.decomp.is_none() {
+                "Open the decomp this project came from"
+            } else {
+                "Fix what the export check above reports"
+            };
             let set = mint_ac::imported_from(doc.editor.project()).map(|i| i.texture_set.to_owned());
             if let Ok(set) = &set {
                 if ui
                     .add_enabled(ready, egui::Button::new(format!("Replace {set} in the decomp…")))
-                    .on_disabled_hover_text("Open the decomp this project came from")
+                    .on_disabled_hover_text(why_not)
                     .clicked()
                 {
                     request = Some(Request::ExportInPlace);
@@ -547,7 +575,7 @@ impl App {
                     )
                     .on_hover_text("Stroke width, for strokes and the brush");
                 });
-                panels::palette(ui, &mut doc.editor, &mut self.paint, &mut self.message);
+                panels::palette(ui, &mut doc.editor, &mut self.paint, &mut self.refusal);
             });
 
         if let Some(r) = doc.variant() {
@@ -559,7 +587,7 @@ impl App {
                         &mut doc.editor,
                         r,
                         &mut doc.selection,
-                        &mut self.message,
+                        &mut self.refusal,
                     );
                 });
             egui::CollapsingHeader::new("Shapes")
@@ -571,7 +599,7 @@ impl App {
                         r,
                         &mut doc.selection,
                         self.paint,
-                        &mut self.message,
+                        &mut self.refusal,
                     );
                 });
         }
@@ -634,7 +662,7 @@ impl App {
                 paint: self.paint,
                 selection: &mut doc.selection,
                 show_uv: self.show_uv,
-                message: &mut self.message,
+                message: &mut self.refusal,
             },
         );
     }
@@ -649,11 +677,14 @@ impl App {
         if ctx.egui_wants_keyboard_input() || self.confirm.is_some() {
             return;
         }
-        if pressed(shift_command(Key::Z)) || pressed(command(Key::Y)) {
+        // Not mid-drag, which would keep editing the restored project.
+        let held = ctx.input(|i| i.pointer.any_down());
+        if !held && (pressed(shift_command(Key::Z)) || pressed(command(Key::Y))) {
             if let Some(d) = &mut self.doc {
                 d.editor.redo();
             }
-        } else if pressed(command(Key::Z))
+        } else if !held
+            && pressed(command(Key::Z))
             && let Some(d) = &mut self.doc
         {
             d.editor.undo();
@@ -665,7 +696,7 @@ impl App {
             && let Some(d) = &mut self.doc
             && let Some(r) = d.variant()
         {
-            panels::duplicate(&mut d.editor, r, &mut d.selection, &mut self.message);
+            panels::duplicate(&mut d.editor, r, &mut d.selection, &mut self.refusal);
         }
         let tools = [
             (Key::V, Tool::Select),
@@ -717,7 +748,7 @@ impl App {
             ),
         };
         let mut choice = None;
-        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.heading(title);
             ui.label(body);
             ui.horizontal(|ui| {
@@ -729,6 +760,10 @@ impl App {
                 }
             });
         });
+        // Escape or a click outside cancels.
+        if choice.is_none() && modal.should_close() {
+            choice = Some(false);
+        }
         match choice {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Discard(r)) => self.do_replace(r, ctx),
@@ -736,12 +771,12 @@ impl App {
                     let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
                     match result {
                         Some(Ok(path)) => {
-                            self.message = Some(format!(
+                            self.tell(format!(
                                 "Wrote {}; build with `python configure.py --non-matching && ninja`",
                                 path.display()
                             ));
                         }
-                        Some(Err(e)) => self.error = Some(e.to_string()),
+                        Some(Err(e)) => self.fail(e.to_string()),
                         None => {}
                     }
                 }
@@ -776,12 +811,14 @@ impl eframe::App for App {
         }
         self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
-            if let Some(error) = &self.error {
-                ui.colored_label(Color32::from_rgb(255, 110, 110), error);
-            } else if let Some(message) = &self.message {
-                ui.label(message);
-            } else {
+        egui::Panel::bottom("status").show(ui, |ui| match &self.status {
+            Some(Status::Error(e)) => {
+                ui.colored_label(Color32::from_rgb(255, 110, 110), e);
+            }
+            Some(Status::Info(m)) => {
+                ui.label(m);
+            }
+            None => {
                 ui.label(" ");
             }
         });
@@ -812,6 +849,9 @@ impl eframe::App for App {
             });
         });
         self.confirm_dialog(&ctx);
+        if let Some(refusal) = self.refusal.take() {
+            self.fail(refusal);
+        }
         // A continuous edit (a drag, a slider, typing) is one undo step until
         // the pointer is released and no field has focus.
         if let Some(d) = &mut self.doc

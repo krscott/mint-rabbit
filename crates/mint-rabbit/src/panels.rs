@@ -11,20 +11,24 @@ use crate::texture_view::{Paint, Selection};
 /// Most colors an Animal Crossing villager's palette holds.
 const AC_PALETTE: usize = 16;
 
-/// Runs `f` on a variant as one undoable edit, reporting a refused edit.
+/// The edit's result, or `None` with the reason it was refused in
+/// `message`.
+fn report<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    message: &mut Option<String>,
+) -> Option<T> {
+    result.map_err(|e| *message = Some(e.to_string())).ok()
+}
+
+/// Runs `f` on a variant as an undoable step of its own, reporting a
+/// refused edit.
 fn edit_variant<T>(
     editor: &mut Editor,
     r: VariantRef,
     message: &mut Option<String>,
     f: impl FnOnce(&mut mint_core::Variant) -> T,
 ) -> Option<T> {
-    match editor.edit(|p| p.edit_variant(r, f)) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            *message = Some(e.to_string());
-            None
-        }
-    }
+    report(editor.edit_variant(r, f), message)
 }
 
 fn swatch(ui: &mut egui::Ui, color: Rgba8, picked: bool) -> egui::Response {
@@ -87,12 +91,13 @@ pub fn palette(
         if changed {
             // One undo step while the picker is held; the app ends it.
             let [r, g, b, a] = rgba;
-            editor.begin_gesture(("palette color", paint.color.0));
-            if let Err(e) =
-                editor.edit(|p| p.set_palette_color(paint.color, Rgba8::new(r, g, b, a)))
-            {
-                *message = Some(e.to_string());
-            }
+            let color = paint.color;
+            report(
+                editor.edit_continuous(("palette color", color.0), |p| {
+                    p.set_palette_color(color, Rgba8::new(r, g, b, a))
+                }),
+                message,
+            );
         }
         if ui
             .button("Add")
@@ -184,8 +189,12 @@ pub fn layers(
                     .clamping(egui::SliderClamping::Always),
             );
             if slider.changed() {
-                editor.begin_gesture(("layer opacity", r, i));
-                edit_variant(editor, r, message, |v| v.layers_mut()[i].opacity = opacity);
+                report(
+                    editor.edit_variant_continuous(("layer opacity", r, i), r, |v| {
+                        v.layers_mut()[i].opacity = opacity;
+                    }),
+                    message,
+                );
             }
             slider.on_hover_text("Opacity in the views; export ignores it");
         });
@@ -245,8 +254,12 @@ pub fn layers(
         ui.horizontal(|ui| {
             ui.label("Name");
             if ui.text_edit_singleline(&mut name).changed() {
-                editor.begin_gesture(("layer name", r, i));
-                edit_variant(editor, r, message, |v| v.layers_mut()[i].name = name);
+                report(
+                    editor.edit_variant_continuous(("layer name", r, i), r, |v| {
+                        v.layers_mut()[i].name = name;
+                    }),
+                    message,
+                );
             }
         });
     }
@@ -341,7 +354,7 @@ pub fn shapes(
         let mut fill = style == Style::Fill;
         if ui.checkbox(&mut fill, "Filled").changed() {
             let width = paint.width;
-            set_style(editor, r, layer, &picked, message, |s| match s {
+            set_style(editor, None, r, layer, &picked, message, |s| match s {
                 Style::Fill => Style::Stroke {
                     width,
                     closed: true,
@@ -361,15 +374,15 @@ pub fn shapes(
                     .suffix(" px"),
             );
             if drag.changed() {
-                editor.begin_gesture(("stroke width", r, layer));
-                set_style(editor, r, layer, &picked, message, |s| match s {
+                let key = Some(("stroke width", r, layer));
+                set_style(editor, key, r, layer, &picked, message, |s| match s {
                     Style::Stroke { closed, .. } => Style::Stroke { width: w, closed },
                     Style::Fill => Style::Fill,
                 });
             }
             let mut c = closed;
             if ui.checkbox(&mut c, "Closed").changed() {
-                set_style(editor, r, layer, &picked, message, |s| match s {
+                set_style(editor, None, r, layer, &picked, message, |s| match s {
                     Style::Stroke { width, .. } => Style::Stroke { width, closed: c },
                     Style::Fill => Style::Fill,
                 });
@@ -446,16 +459,18 @@ pub fn shapes(
     });
 }
 
-/// Restyles each picked shape with `restyle` of its own style.
+/// Restyles each picked shape with `restyle` of its own style, as part of
+/// the continuous edit `key` if any.
 fn set_style(
     editor: &mut Editor,
+    key: Option<(&str, VariantRef, usize)>,
     r: VariantRef,
     layer: usize,
     picked: &[usize],
     message: &mut Option<String>,
     restyle: impl Fn(Style) -> Style,
 ) {
-    let result = editor.edit(|p| {
+    let apply = |p: &mut mint_core::Project| {
         let mut err = None;
         p.edit_variant(r, |v| {
             for &s in picked {
@@ -467,10 +482,12 @@ fn set_style(
         })
         .map_err(|e| e.to_string())?;
         err.map_or(Ok(()), |e| Err(e.to_string()))
-    });
-    if let Err(e) = result {
-        *message = Some(e);
-    }
+    };
+    let result = match key {
+        Some(key) => editor.edit_continuous(key, apply),
+        None => editor.edit(apply),
+    };
+    report(result, message);
 }
 
 /// Copies the picked shapes on top of their layer and picks the copies.

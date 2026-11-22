@@ -92,7 +92,12 @@ impl Selection {
             };
             return;
         }
-        let count = layers[self.layer].shapes().len();
+        // Shapes on a locked or hidden layer can't stay picked.
+        let layer = &layers[self.layer];
+        if layer.locked || !layer.visible {
+            self.shapes.clear();
+        }
+        let count = layer.shapes().len();
         self.shapes.retain(|&s| s < count);
         if self.shapes.len() != 1
             || self
@@ -364,9 +369,6 @@ impl TextureView {
                 .map(|p| at.to_texture(p))
         {
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
-            if self.drag.is_some() {
-                editor.begin_gesture("canvas drag");
-            }
         } else if response.clicked()
             && let Some(p) = pointer
         {
@@ -390,8 +392,9 @@ impl TextureView {
         if response.double_clicked()
             && tool == Tool::Select
             && let (Some(p), Some(s)) = (pointer, selection.single())
+            && let Some(k) = insert_anchor(editor, r, selection.layer, s, p, at)
         {
-            insert_anchor(editor, r, selection.layer, s, p, at);
+            selection.anchor = Some(k);
         }
 
         if let (Some(drag), Some(p)) = (&mut self.drag, pointer) {
@@ -410,7 +413,8 @@ impl TextureView {
         }
 
         // Keys, while the view has the pointer.
-        if response.hovered() || !self.pen.is_empty() {
+        // Keys a text field is using are its own.
+        if (response.hovered() || !self.pen.is_empty()) && !ui.ctx().egui_wants_keyboard_input() {
             let (enter, delete) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),
@@ -439,8 +443,11 @@ impl TextureView {
                     self.pen.clear();
                 }
             }
-            if delete && !ui.ctx().egui_wants_keyboard_input() {
-                delete_selected(editor, r, selection);
+            if delete {
+                // While drawing a pen path, its last anchor goes first.
+                if self.pen.pop().is_none() {
+                    delete_selected(editor, r, selection);
+                }
             }
         }
 
@@ -755,9 +762,6 @@ fn start_select(
         .iter()
         .map(|&i| layer.shapes()[i].clone())
         .collect();
-    if layer.locked {
-        return None;
-    }
     if let [s] = &picked[..] {
         for (k, a) in s.anchors().iter().enumerate() {
             let parts = [
@@ -815,13 +819,12 @@ fn start_select(
 /// Replaces the picked shapes with `shapes`, in the same order.
 fn replace_picked(editor: &mut Editor, r: VariantRef, selection: &Selection, shapes: Vec<Shape>) {
     let (layer, picked) = (selection.layer, selection.shapes.clone());
-    let _ = editor.edit(|p| {
-        p.edit_variant(r, |v| {
-            let slots = v.layers_mut()[layer].shapes_mut();
-            for (&i, s) in picked.iter().zip(shapes) {
-                slots[i] = s;
-            }
-        })
+    // A drag's edits undo as one step.
+    let _ = editor.edit_variant_continuous("canvas drag", r, |v| {
+        let slots = v.layers_mut()[layer].shapes_mut();
+        for (&i, s) in picked.iter().zip(shapes) {
+            slots[i] = s;
+        }
     });
 }
 
@@ -998,8 +1001,10 @@ pub fn add_shape(
         }
     };
     let layers = editor.project().variant(r).layers();
-    if layers.get(selection.layer).is_some_and(|l| l.locked) {
-        *message = Some("The layer is locked.".into());
+    if let Some(l) = layers.get(selection.layer)
+        && (l.locked || !l.visible)
+    {
+        *message = Some("The layer is locked or hidden.".into());
         return;
     }
     let layer = if layers.is_empty() {
@@ -1080,9 +1085,9 @@ fn insert_anchor(
     shape: usize,
     p: Vec2,
     at: Placement,
-) {
+) -> Option<usize> {
     let s = &editor.project().variant(r).layers()[layer].shapes()[shape];
-    let Some((seg, t, d)) = s
+    let (seg, t, d) = s
         .segments()
         .enumerate()
         .flat_map(|(i, c)| {
@@ -1091,12 +1096,9 @@ fn insert_anchor(
                 (i, t, cubic(c, t).distance(p))
             })
         })
-        .min_by(|a, b| a.2.total_cmp(&b.2))
-    else {
-        return;
-    };
+        .min_by(|a, b| a.2.total_cmp(&b.2))?;
     if d > at.hit() {
-        return;
+        return None;
     }
     let c: [Vec2; 4] = s.segments().nth(seg).expect("segment exists");
     // De Casteljau at t.
@@ -1106,8 +1108,8 @@ fn insert_anchor(
     let mid = lerp(before, after);
     let n = s.anchors().len();
     let (i, j) = (seg, (seg + 1) % n);
-    let _ = editor.edit(|project| {
-        project.edit_variant(r, |v| {
+    editor
+        .edit_variant(r, |v| {
             let s = &mut v.layers_mut()[layer].shapes_mut()[shape];
             let anchors = s.anchors_mut();
             anchors[i].handle_out = a - c[0];
@@ -1121,7 +1123,8 @@ fn insert_anchor(
                 },
             );
         })
-    });
+        .ok()
+        .map(|()| i + 1)
 }
 
 fn cubic([p0, p1, p2, p3]: [Vec2; 4], t: f32) -> Vec2 {

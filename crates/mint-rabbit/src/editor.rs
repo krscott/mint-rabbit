@@ -3,7 +3,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
-use mint_core::Project;
+use mint_core::{EditError, Project, Variant, VariantRef};
 
 /// How many edits undo can go back.
 const UNDO_LIMIT: usize = 200;
@@ -69,10 +69,54 @@ impl Editor {
         self.dirty = false;
     }
 
-    /// Applies `f` to the project as one undoable step. If it fails, the
-    /// project is put back as it was; if it changes nothing, no step is
-    /// recorded. Within an open gesture, the whole gesture is one step.
+    /// Applies `f` to the project as an undoable step of its own. If it
+    /// fails, the project is put back as it was; if it changes nothing, no
+    /// step is recorded.
     pub fn edit<T, E>(&mut self, f: impl FnOnce(&mut Project) -> Result<T, E>) -> Result<T, E> {
+        self.end_gesture();
+        self.apply(f)
+    }
+
+    /// Like [`Self::edit`], for one of many edits a control makes while
+    /// held, such as a drag or a slider, named by `key`: edits by the same
+    /// control until [`Self::end_gesture`] undo as one step.
+    pub fn edit_continuous<T, E>(
+        &mut self,
+        key: impl Hash,
+        f: impl FnOnce(&mut Project) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        let key = h.finish();
+        if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
+            self.gesture = Gesture::Open {
+                key,
+                recorded: false,
+            };
+        }
+        self.apply(f)
+    }
+
+    /// [`Self::edit`] of one variant.
+    pub fn edit_variant<T>(
+        &mut self,
+        r: VariantRef,
+        f: impl FnOnce(&mut Variant) -> T,
+    ) -> Result<T, EditError> {
+        self.edit(|p| p.edit_variant(r, f))
+    }
+
+    /// [`Self::edit_continuous`] of one variant.
+    pub fn edit_variant_continuous<T>(
+        &mut self,
+        key: impl Hash,
+        r: VariantRef,
+        f: impl FnOnce(&mut Variant) -> T,
+    ) -> Result<T, EditError> {
+        self.edit_continuous(key, |p| p.edit_variant(r, f))
+    }
+
+    fn apply<T, E>(&mut self, f: impl FnOnce(&mut Project) -> Result<T, E>) -> Result<T, E> {
         let before = self.project.clone();
         let out = match f(&mut self.project) {
             Ok(out) => out,
@@ -96,21 +140,7 @@ impl Editor {
         Ok(out)
     }
 
-    /// Opens a gesture by the control named `key`, such as a drag or a
-    /// slider: its edits until [`Self::end_gesture`] undo as one step. A
-    /// gesture by another control ends the open one.
-    pub fn begin_gesture(&mut self, key: impl Hash) {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        let key = h.finish();
-        if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
-            self.gesture = Gesture::Open {
-                key,
-                recorded: false,
-            };
-        }
-    }
-
+    /// Ends a continuous edit, so the next edit is a step of its own.
     pub fn end_gesture(&mut self) {
         self.gesture = Gesture::None;
     }
@@ -197,26 +227,32 @@ mod tests {
     }
 
     #[test]
-    fn a_gesture_undoes_as_one_step() {
+    fn a_continuous_edit_undoes_as_one_step() {
         let mut e = editor();
-        e.begin_gesture("picker");
+        let continuous = |e: &mut Editor, key: &str, r: u8| {
+            e.edit_continuous(key, |p| {
+                p.set_palette_color(PaletteIndex(0), Rgba8::new(r, 0, 0, 255))
+            })
+            .unwrap();
+        };
         for r in 1..=10 {
-            e.begin_gesture("picker");
-            red(&mut e, r);
+            continuous(&mut e, "picker", r);
         }
         e.end_gesture();
         e.undo();
         assert_eq!(current(&e), 0);
         assert!(!e.can_undo());
 
-        // Another control's gesture is a step of its own.
+        // Another control, or a one-off edit, is a step of its own.
         e.redo();
-        e.begin_gesture("picker");
-        red(&mut e, 20);
-        e.begin_gesture("slider");
-        red(&mut e, 30);
+        continuous(&mut e, "picker", 20);
+        continuous(&mut e, "slider", 30);
         e.undo();
         assert_eq!(current(&e), 20);
+        continuous(&mut e, "picker", 40);
+        red(&mut e, 50);
+        e.undo();
+        assert_eq!(current(&e), 40);
     }
 
     #[test]
