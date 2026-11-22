@@ -4,6 +4,13 @@
 //! Texture space is a texture's UV space scaled by its pixel size: one unit is
 //! one texel, the origin is the top-left corner, and pixel (x, y) has its
 //! center at (x + 0.5, y + 0.5).
+//!
+//! Coverage is exact for straight edges, which shapes sharing an edge agree
+//! on whichever way each runs. Curves are covered as flattened to within
+//! [`TOLERANCE`], so a pixel center closer than that to a curve, or within
+//! float rounding of a stroke's edge, may fall either way. That includes
+//! zero-area curves that run out and back along one line with unequal
+//! handles, which can cover centers lying exactly on that line.
 
 use glam::{Affine2, Vec2};
 
