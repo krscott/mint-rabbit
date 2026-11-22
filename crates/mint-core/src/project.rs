@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use glam::UVec2;
+
 use crate::{
     Layer, Material, MaterialId, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Shape,
     Texture, TextureId, Variant,
@@ -35,7 +37,8 @@ pub struct VariantRef {
 /// The editable document for one model.
 ///
 /// Every palette index in it, in underlays and shapes, refers to an entry of
-/// its palette; the editing methods keep it so.
+/// its palette, and every variant matches its texture's size; the editing
+/// methods keep it so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     target: ExportTarget,
@@ -55,6 +58,14 @@ pub enum PaletteError {
     Full(#[from] PaletteFull),
     #[error("palette entry {0} cannot merge into itself")]
     SameEntry(u8),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EditError {
+    #[error("palette entry {index} does not exist; the palette has {len}")]
+    MissingColor { index: u8, len: usize },
+    #[error("the variant's underlay is {actual} but its texture is {expected}")]
+    Size { expected: UVec2, actual: UVec2 },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -204,10 +215,47 @@ impl Project {
         &self.textures[r.texture.index()].variants()[r.variant]
     }
 
-    /// The variant, to edit its layers. Panics if `r` is not a painted
-    /// variant of this project.
-    pub fn variant_mut(&mut self, r: VariantRef) -> &mut Variant {
-        &mut self.textures[r.texture.index()].variants_mut()[r.variant]
+    /// Edits a variant's layers and shapes with `f`. If the variant then
+    /// uses a color the palette lacks, or its underlay no longer matches its
+    /// texture's size, the edit is undone and reported. Panics if `r` is not
+    /// a painted variant of this project.
+    pub fn edit_variant<T>(
+        &mut self,
+        r: VariantRef,
+        f: impl FnOnce(&mut Variant) -> T,
+    ) -> Result<T, EditError> {
+        let texture = &mut self.textures[r.texture.index()];
+        let size = texture.size();
+        let variant = &mut texture.variants_mut()[r.variant];
+        let before = variant.clone();
+        let out = f(variant);
+        let check = || {
+            let actual = variant.underlay().size();
+            if actual != size {
+                return Err(EditError::Size {
+                    expected: size,
+                    actual,
+                });
+            }
+            let shapes = variant.layers().iter().flat_map(Layer::shapes);
+            match shapes
+                .map(Shape::color)
+                .find(|&c| !self.palette.contains(c))
+            {
+                Some(PaletteIndex(index)) => Err(EditError::MissingColor {
+                    index,
+                    len: self.palette.len(),
+                }),
+                None => Ok(()),
+            }
+        };
+        match check() {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                *variant = before;
+                Err(e)
+            }
+        }
     }
 
     fn check_color(&self, index: PaletteIndex) -> Result<(), PaletteError> {
@@ -221,61 +269,24 @@ impl Project {
         }
     }
 
-    /// Inserts `shape` into a layer of `r` before position `index`.
-    pub fn insert_shape(
+    pub fn set_palette_color(
         &mut self,
-        r: VariantRef,
-        layer: usize,
-        index: usize,
-        shape: Shape,
+        index: PaletteIndex,
+        color: Rgba8,
     ) -> Result<(), PaletteError> {
-        self.check_color(shape.color())?;
-        self.variant_mut(r)
-            .layer_mut(layer)
-            .insert_shape(index, shape);
-        Ok(())
-    }
-
-    pub fn set_shape_color(
-        &mut self,
-        r: VariantRef,
-        layer: usize,
-        shape: usize,
-        color: PaletteIndex,
-    ) -> Result<(), PaletteError> {
-        self.check_color(color)?;
-        self.variant_mut(r).layer_mut(layer).shapes_mut()[shape].set_color(color);
-        Ok(())
-    }
-
-    /// Inserts `layer`, shapes and all, into `r` at position `index`.
-    pub fn insert_layer(
-        &mut self,
-        r: VariantRef,
-        index: usize,
-        layer: Layer,
-    ) -> Result<(), PaletteError> {
-        for s in layer.shapes() {
-            self.check_color(s.color())?;
-        }
-        self.variant_mut(r).insert_layer(index, layer);
-        Ok(())
-    }
-
-    pub fn set_color(&mut self, index: PaletteIndex, color: Rgba8) -> Result<(), PaletteError> {
         self.check_color(index)?;
         self.palette.set(index, color);
         Ok(())
     }
 
     /// Appends a palette entry.
-    pub fn add_color(&mut self, color: Rgba8) -> Result<PaletteIndex, PaletteError> {
+    pub fn add_palette_color(&mut self, color: Rgba8) -> Result<PaletteIndex, PaletteError> {
         Ok(self.palette.push(color)?)
     }
 
     /// Removes palette entry `from`, recoloring every pixel and shape that
     /// used it with `into`. Later entries move down by one.
-    pub fn merge_color(
+    pub fn merge_palette_color(
         &mut self,
         from: PaletteIndex,
         into: PaletteIndex,
@@ -306,7 +317,7 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use glam::{UVec2, Vec2};
+    use glam::Vec2;
 
     use super::*;
     use crate::{IndexedImage, Slot, Style, Transform, shape};
@@ -327,7 +338,7 @@ mod tests {
             [("1".to_owned(), img)],
         )
         .unwrap();
-        t.variants_mut()[0].add_layer(0, "paint");
+        t.variants_mut()[0].insert_layer(0, Layer::new("paint"));
         Project::new(
             ExportTarget::new("test"),
             palette,
@@ -357,27 +368,49 @@ mod tests {
     }
 
     #[test]
-    fn shapes_and_layers_must_use_palette_entries() {
+    fn edits_that_break_the_project_are_undone() {
         let mut p = project(2, [0; 4]);
-        let missing = Err(PaletteError::Missing { index: 2, len: 2 });
-        assert_eq!(p.insert_shape(V, 0, 0, dot(2)), missing);
-        assert_eq!(p.insert_shape(V, 0, 0, dot(1)), Ok(()));
-        assert_eq!(p.set_shape_color(V, 0, 0, PaletteIndex(2)), missing);
-        let mut layer = Layer::new("copied");
-        layer.insert_shape(0, dot(2));
-        assert_eq!(p.insert_layer(V, 0, layer.clone()), missing);
-        p.add_color(Rgba8::new(9, 9, 9, 255)).unwrap();
-        assert_eq!(p.insert_layer(V, 0, layer), Ok(()));
-        assert_eq!(p.variant(V).layers().len(), 2);
+        let missing = Err(EditError::MissingColor { index: 2, len: 2 });
+        let add = |c: u8| move |v: &mut Variant| v.layers_mut()[0].insert_shape(0, dot(c));
+        assert_eq!(p.edit_variant(V, add(1)), Ok(()));
+        let before = p.clone();
+        assert_eq!(p.edit_variant(V, add(2)), missing);
+        assert_eq!(
+            p.edit_variant(V, |v| v.layers_mut()[0].shapes_mut()[0] = dot(2)),
+            missing
+        );
+        assert_eq!(p, before);
+
+        // Replacing the whole variant is checked too.
+        let other = project(2, [0; 4]);
+        let mut wrong_size = Texture::painted(
+            "big",
+            Slot("body".into()),
+            UVec2::ONE,
+            [(
+                "1".to_owned(),
+                IndexedImage::new(UVec2::ONE, vec![PaletteIndex(0)]).unwrap(),
+            )],
+        )
+        .unwrap();
+        let big = wrong_size.variants_mut()[0].clone();
+        assert_eq!(
+            p.edit_variant(V, |v| *v = big),
+            Err(EditError::Size {
+                expected: UVec2::new(2, 2),
+                actual: UVec2::ONE
+            })
+        );
+        assert_eq!(p, before);
+        let copy = other.variant(V).clone();
+        assert_eq!(p.edit_variant(V, |v| *v = copy), Ok(()));
     }
 
     #[test]
     fn project_rejects_shapes_with_missing_colors() {
         let p = project(2, [0; 4]);
         let mut textures = p.textures().to_vec();
-        textures[0].variants_mut()[0]
-            .layer_mut(0)
-            .insert_shape(0, dot(5));
+        textures[0].variants_mut()[0].layers_mut()[0].insert_shape(0, dot(5));
         let err = Project::new(
             p.target().clone(),
             p.palette().clone(),
@@ -396,10 +429,14 @@ mod tests {
     #[test]
     fn merge_recolors_and_renumbers() {
         let mut p = project(4, [0, 1, 2, 3]);
-        for c in [3, 1, 2] {
-            p.insert_shape(V, 0, 0, dot(c)).unwrap();
-        }
-        p.merge_color(PaletteIndex(1), PaletteIndex(3)).unwrap();
+        p.edit_variant(V, |v| {
+            for c in [3, 1, 2] {
+                v.layers_mut()[0].insert_shape(0, dot(c));
+            }
+        })
+        .unwrap();
+        p.merge_palette_color(PaletteIndex(1), PaletteIndex(3))
+            .unwrap();
         // 1 becomes 3; entries above 1 move down.
         let px: Vec<u8> = p
             .variant(V)
@@ -415,11 +452,11 @@ mod tests {
             &[0, 2, 3].map(|r| Rgba8::new(r, 0, 0, 255))
         );
         assert_eq!(
-            p.merge_color(PaletteIndex(0), PaletteIndex(0)),
+            p.merge_palette_color(PaletteIndex(0), PaletteIndex(0)),
             Err(PaletteError::SameEntry(0))
         );
         assert_eq!(
-            p.merge_color(PaletteIndex(3), PaletteIndex(0)),
+            p.merge_palette_color(PaletteIndex(3), PaletteIndex(0)),
             Err(PaletteError::Missing { index: 3, len: 3 })
         );
     }
@@ -428,11 +465,11 @@ mod tests {
     fn palette_is_capped() {
         let mut p = project(Palette::MAX_LEN, [0; 4]);
         assert_eq!(
-            p.add_color(Rgba8::new(0, 0, 0, 0)),
+            p.add_palette_color(Rgba8::new(0, 0, 0, 0)),
             Err(PaletteError::Full(PaletteFull))
         );
         assert_eq!(
-            p.set_color(PaletteIndex(255), Rgba8::new(1, 2, 3, 4)),
+            p.set_palette_color(PaletteIndex(255), Rgba8::new(1, 2, 3, 4)),
             Ok(())
         );
         assert_eq!(p.palette().colors()[255], Rgba8::new(1, 2, 3, 4));

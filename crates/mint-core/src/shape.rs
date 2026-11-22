@@ -154,9 +154,7 @@ impl Shape {
         self.color
     }
 
-    /// Sets the color without checking it against a palette; projects check
-    /// through [`crate::Project::set_shape_color`].
-    pub(crate) fn set_color(&mut self, color: PaletteIndex) {
+    pub fn set_color(&mut self, color: PaletteIndex) {
         self.color = color;
     }
 
@@ -173,11 +171,7 @@ impl Shape {
     /// closing segment of a closed path.
     pub fn segments(&self) -> impl Iterator<Item = [Vec2; 4]> + '_ {
         let n = self.anchors.len();
-        let count = if self.style.closed() && n > 1 {
-            n
-        } else {
-            n - 1
-        };
+        let count = if self.style.closed() { n } else { n - 1 };
         (0..count).map(move |i| {
             let a = self.anchors[i];
             let b = self.anchors[(i + 1) % n];
@@ -210,8 +204,13 @@ impl Shape {
 }
 
 /// Appends points along a cubic, excluding its start, enough of them that
-/// the lines between stay within [`TOLERANCE`] (Wang's formula).
+/// the lines between stay within [`TOLERANCE`] (Wang's formula). A segment
+/// with no handles is a straight line, appended exactly as its end.
 fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
+    if p1 == p0 && p2 == p3 {
+        out.push(p3);
+        return;
+    }
     let d = (p0 - 2.0 * p1 + p2)
         .length()
         .max((p1 - 2.0 * p2 + p3).length());
@@ -336,12 +335,9 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
     let mut kept = Vec::new();
-    if let (Some(&first), Some(&last)) = (points.first(), points.last()) {
+    if let Some(&first) = points.first() {
         kept.push(first);
         simplify(points, tolerance, &mut kept);
-        if kept.len() == 1 && last != first {
-            kept.push(last);
-        }
     }
     let n = kept.len();
     (0..n)
@@ -364,12 +360,11 @@ fn simplify(points: &[Vec2], tolerance: f32, out: &mut Vec<Vec2>) {
         .iter()
         .enumerate()
         .map(|(i, &p)| {
-            let d = if line == Vec2::ZERO {
-                p.distance(first)
-            } else {
-                line.perp_dot(p - first).abs() / line.length()
-            };
-            (i + 1, d)
+            // Distance to the segment, not the line through it, so a stroke
+            // that doubles back keeps its turning point.
+            let t = ((p - first).dot(line) / line.length_squared().max(f32::MIN_POSITIVE))
+                .clamp(0.0, 1.0);
+            (i + 1, p.distance(first + line * t))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1));
     match far {
@@ -474,6 +469,43 @@ mod tests {
     }
 
     #[test]
+    fn straight_edges_on_pixel_centers_cover_consistently() {
+        // The top edge runs through the centers of row 0, which belong to
+        // the fill along the whole edge.
+        let o = fill(rectangle(Vec2::splat(0.5), Vec2::new(8.5, 4.5))).outline();
+        assert_eq!(o.points().len(), 4);
+        for x in 1..8 {
+            assert!(o.covers(Vec2::new(x as f32 + 0.5, 0.5)), "{x}");
+        }
+    }
+
+    #[test]
+    fn closed_strokes_cover_their_outline_only() {
+        let style = Style::Stroke {
+            width: 1.0,
+            closed: true,
+        };
+        let ring = Shape::new(
+            rectangle(Vec2::ZERO, Vec2::splat(8.0)),
+            style,
+            PaletteIndex(0),
+        );
+        let o = ring.unwrap().outline();
+        // The closing edge, from the last corner back to the first.
+        assert!(o.covers(Vec2::new(0.0, 4.0)));
+        assert!(o.covers(Vec2::new(4.0, 0.4)));
+        assert!(!o.covers(Vec2::splat(4.0)));
+
+        // One anchor whose handles loop back to it encloses an area.
+        let loop_ = Anchor {
+            point: Vec2::splat(4.0),
+            handle_in: Vec2::new(0.0, 8.0),
+            handle_out: Vec2::new(8.0, 0.0),
+        };
+        assert!(fill(vec![loop_]).outline().covers(Vec2::splat(6.5)));
+    }
+
+    #[test]
     fn freehand_simplifies_and_smooths() {
         let points: Vec<Vec2> = (0..=20).map(|i| Vec2::new(i as f32, 0.0)).collect();
         let anchors = freehand(&points, 0.5);
@@ -488,6 +520,9 @@ mod tests {
         let anchors = freehand(&bend, 0.5);
         assert_eq!(anchors.len(), 3);
         assert_eq!(anchors[1].handle_out, Vec2::new(10.0 / 6.0, 0.0));
+        // A stroke that doubles back keeps its far end.
+        let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
+        assert_eq!(freehand(&back, 0.25).len(), 3);
         assert!(freehand(&[], 0.5).is_empty());
         assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
     }

@@ -10,7 +10,7 @@ mod texture;
 
 pub use model::{Corner, Mesh, Model, Node, NodeId, Transform, Triangle, Vertex};
 pub use pose::Pose;
-pub use project::{ExportTarget, PaletteError, Project, ProjectError, VariantRef};
+pub use project::{EditError, ExportTarget, PaletteError, Project, ProjectError, VariantRef};
 pub use shape::{Anchor, Outline, Shape, ShapeError, Style};
 pub use texture::{
     AlphaMode, IndexedImage, Layer, Material, MaterialId, Palette, PaletteFull, PaletteIndex,

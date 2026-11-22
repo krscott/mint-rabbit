@@ -237,8 +237,6 @@ impl Layer {
         &self.shapes
     }
 
-    /// The shapes, to edit or reorder; adding one goes through
-    /// [`crate::Project::insert_shape`], which checks its color.
     pub fn shapes_mut(&mut self) -> &mut [Shape] {
         &mut self.shapes
     }
@@ -253,7 +251,7 @@ impl Layer {
         self.shapes.insert(to, shape);
     }
 
-    pub(crate) fn insert_shape(&mut self, index: usize, shape: Shape) {
+    pub fn insert_shape(&mut self, index: usize, shape: Shape) {
         self.shapes.insert(index, shape);
     }
 }
@@ -282,21 +280,11 @@ impl Variant {
         &self.layers
     }
 
-    pub fn layer_mut(&mut self, index: usize) -> &mut Layer {
-        &mut self.layers[index]
-    }
-
-    pub(crate) fn layers_mut(&mut self) -> &mut [Layer] {
+    pub fn layers_mut(&mut self) -> &mut [Layer] {
         &mut self.layers
     }
 
-    /// Inserts an empty layer at `index`; layers with shapes go through
-    /// [`crate::Project::insert_layer`], which checks their colors.
-    pub fn add_layer(&mut self, index: usize, name: impl Into<String>) {
-        self.layers.insert(index, Layer::new(name));
-    }
-
-    pub(crate) fn insert_layer(&mut self, index: usize, layer: Layer) {
+    pub fn insert_layer(&mut self, index: usize, layer: Layer) {
         self.layers.insert(index, layer);
     }
 
@@ -406,7 +394,9 @@ impl Texture {
         }
     }
 
-    pub fn variants_mut(&mut self) -> &mut [Variant] {
+    /// The variants, for the crate's checked edits; see
+    /// [`crate::Project::edit_variant`].
+    pub(crate) fn variants_mut(&mut self) -> &mut [Variant] {
         match &mut self.content {
             TextureContent::Painted(v) => v,
             TextureContent::External { .. } => &mut [],
@@ -484,16 +474,14 @@ mod tests {
         let rect = |a: Vec2, b: Vec2, c: u8| {
             Shape::new(shape::rectangle(a, b), Style::Fill, PaletteIndex(c)).unwrap()
         };
-        v.add_layer(0, "low");
-        v.add_layer(1, "high");
-        v.layer_mut(0)
-            .insert_shape(0, rect(Vec2::ZERO, Vec2::new(3.0, 2.0), 1));
+        v.insert_layer(0, Layer::new("low"));
+        v.insert_layer(1, Layer::new("high"));
+        v.layers_mut()[0].insert_shape(0, rect(Vec2::ZERO, Vec2::new(3.0, 2.0), 1));
         // Covers the centers of pixels 2 and 3 on the top row only.
-        v.layer_mut(1)
-            .insert_shape(0, rect(Vec2::new(1.6, -1.0), Vec2::new(9.0, 0.9), 2));
+        v.layers_mut()[1].insert_shape(0, rect(Vec2::new(1.6, -1.0), Vec2::new(9.0, 0.9), 2));
         let px = |v: &Variant| -> Vec<u8> { v.rasterize().pixels().iter().map(|i| i.0).collect() };
         assert_eq!(px(v), [1, 1, 2, 2, 1, 1, 1, 0]);
-        v.layer_mut(1).visible = false;
+        v.layers_mut()[1].visible = false;
         assert_eq!(px(v), [1, 1, 1, 0, 1, 1, 1, 0]);
         assert_eq!(v.underlay().pixels(), &[PaletteIndex(0); 8]);
     }

@@ -698,35 +698,31 @@ mod tests {
             texture: TextureId(0),
             variant: 1,
         };
-        p.variant_mut(r).add_layer(0, "low");
-        p.variant_mut(r).add_layer(1, "high");
-        p.variant_mut(r).layer_mut(1).opacity = 0.5;
-        p.variant_mut(r).layer_mut(1).locked = true;
         let stroke = Style::Stroke {
             width: 1.5,
             closed: true,
         };
-        let shapes = [
-            (
-                1,
-                Shape::new(
-                    shape::ellipse(Vec2::splat(2.0), Vec2::ONE),
-                    stroke,
-                    PaletteIndex(1),
-                ),
-            ),
-            (
-                0,
-                Shape::new(
-                    shape::rectangle(Vec2::ZERO, Vec2::ONE),
-                    Style::Fill,
-                    PaletteIndex(0),
-                ),
-            ),
-        ];
-        for (layer, s) in shapes {
-            p.insert_shape(r, layer, 0, s.unwrap()).unwrap();
-        }
+        let ring = Shape::new(
+            shape::ellipse(Vec2::splat(2.0), Vec2::ONE),
+            stroke,
+            PaletteIndex(1),
+        );
+        let square = Shape::new(
+            shape::rectangle(Vec2::ZERO, Vec2::ONE),
+            Style::Fill,
+            PaletteIndex(0),
+        );
+        p.edit_variant(r, |v| {
+            let mut low = Layer::new("low");
+            low.insert_shape(0, square.unwrap());
+            let mut high = Layer::new("high");
+            high.opacity = 0.5;
+            high.locked = true;
+            high.insert_shape(0, ring.unwrap());
+            v.insert_layer(0, low);
+            v.insert_layer(1, high);
+        })
+        .unwrap();
         p
     }
 
