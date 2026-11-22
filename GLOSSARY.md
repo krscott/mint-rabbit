@@ -1,24 +1,25 @@
 # mint-rabbit
 
-A standalone tool for building textured 3D characters: start from a base model,
+A standalone tool for building textured 3D models: start from a base model,
 paint on it with editable vector shapes, add geometry, and export to a target
-format such as an Animal Crossing (GameCube) villager.
+format, the first being Animal Crossing (GameCube) villagers.
 
 ## Language
 
 ### Document
 
 **Project**:
-The editable document for one character: its model, palette, textures, and
+The editable document for one model: its node tree, palette, textures, and
 every layer and shape on them.
 _Avoid_: File, scene, workspace
 
-**Character**:
-The one model plus its set of textures that a project produces.
-_Avoid_: Villager, species, NPC (these are Animal Crossing export terms)
+**Model**:
+The node tree a project edits, with the meshes its nodes own.
+_Avoid_: Character, scene; villager and species are Animal Crossing export
+terms
 
 **Base Model**:
-The node tree and textures a project was imported from.
+The model and textures a project was imported from.
 _Avoid_: Template, base mesh
 
 **Node**:

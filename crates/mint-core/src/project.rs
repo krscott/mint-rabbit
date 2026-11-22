@@ -4,7 +4,7 @@ use crate::{Material, MaterialId, Model, Palette, PaletteIndex, Pose, Texture, T
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TargetId(pub String);
 
-/// The editable document for one character.
+/// The editable document for one model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     target: TargetId,
