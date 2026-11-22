@@ -205,7 +205,7 @@ impl Project {
 
     /// Edits a variant's name, layers, and shapes with `f`. If the edit
     /// changes the underlay, which is never edited, or leaves a shape using a
-    /// color the palette lacks, it is undone and reported. Panics if `r` is
+    /// color the palette lacks, it is discarded and reported. Panics if `r` is
     /// not a painted variant of this project.
     pub fn edit_variant<T>(
         &mut self,
@@ -213,27 +213,21 @@ impl Project {
         f: impl FnOnce(&mut Variant) -> T,
     ) -> Result<T, EditError> {
         let variant = &mut self.textures[r.texture.index()].variants_mut()[r.variant];
-        let before = variant.clone();
-        let out = f(variant);
-        let check = || {
-            if variant.underlay() != before.underlay() {
-                return Err(EditError::UnderlayChanged);
-            }
-            match missing_color(&self.palette, shape_colors(variant)) {
-                Some(PaletteIndex(index)) => Err(EditError::MissingColor {
-                    index,
-                    len: self.palette.len(),
-                }),
-                None => Ok(()),
-            }
-        };
-        match check() {
-            Ok(()) => Ok(out),
-            Err(e) => {
-                *variant = before;
-                Err(e)
-            }
+        // Edit a copy, so a failed check or a panic in `f` leaves the
+        // project as it was.
+        let mut draft = variant.clone();
+        let out = f(&mut draft);
+        if draft.underlay() != variant.underlay() {
+            return Err(EditError::UnderlayChanged);
         }
+        if let Some(PaletteIndex(index)) = missing_color(&self.palette, shape_colors(&draft)) {
+            return Err(EditError::MissingColor {
+                index,
+                len: self.palette.len(),
+            });
+        }
+        *variant = draft;
+        Ok(out)
     }
 
     fn check_color(&self, index: PaletteIndex) -> Result<(), PaletteError> {
