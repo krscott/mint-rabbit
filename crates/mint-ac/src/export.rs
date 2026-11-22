@@ -536,14 +536,21 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
     // N-th of them with a display list.
     let order = tree.preorder();
     let children: Vec<usize> = order.iter().map(|&id| tree.children(id).count()).collect();
-    if !children
+    if let Some((&id, (&found, &expected))) = order
         .iter()
-        .copied()
-        .eq(VILLAGER_JOINT_CHILDREN.map(usize::from))
+        .zip(children.iter().zip(&VILLAGER_JOINT_CHILDREN))
+        .find(|(_, (found, expected))| **found != usize::from(**expected))
     {
         return Err(ExportError::Skeleton(format!(
-            "found {} joints with child counts {children:?}",
-            children.len()
+            "node {:?} has {found} children where the skeleton has {expected}",
+            tree.node(id).name
+        )));
+    }
+    if children.len() != VILLAGER_JOINT_CHILDREN.len() {
+        return Err(ExportError::Skeleton(format!(
+            "{} nodes; the skeleton has {}",
+            children.len(),
+            VILLAGER_JOINT_CHILDREN.len()
         )));
     }
     let slots: HashMap<NodeId, u32> = order

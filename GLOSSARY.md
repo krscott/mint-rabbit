@@ -61,7 +61,7 @@ _Avoid_: Segment, channel, role
 
 **External Texture**:
 A texture whose slot the export target fills at runtime, such as a villager's
-clothing; it holds only a preview underlay with its own colors and is never
+clothing; it holds only a preview image with its own colors and is never
 exported.
 _Avoid_: Placeholder, runtime texture
 

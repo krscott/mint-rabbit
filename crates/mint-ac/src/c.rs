@@ -117,7 +117,7 @@ impl Expr {
             // `sizeof(Mtx) * 10.0` in rhn_1.
             Expr::Float(v) if v.fract() == 0.0 && v.abs() < 1e15 => *v as i64,
             Expr::Sizeof(ty) => size_of_type(ty)?,
-            Expr::Unary('-', e) => -e.as_int()?,
+            Expr::Unary('-', e) => e.as_int()?.checked_neg()?,
             Expr::Unary('~', e) => !e.as_int()?,
             Expr::Binary(op, l, r) => {
                 let (l, r) = (l.as_int()?, r.as_int()?);
@@ -316,8 +316,14 @@ fn tokenize(
             let directive = text[i + 1..end].trim();
             // Splicing both branches of a conditional would silently pick the
             // wrong definitions.
-            let word = directive.split_whitespace().next().unwrap_or("");
-            if matches!(word, "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif") {
+            let word: String = directive
+                .chars()
+                .take_while(char::is_ascii_alphabetic)
+                .collect();
+            if matches!(
+                word.as_str(),
+                "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif"
+            ) {
                 return Err(syntax(
                     line,
                     format!("conditional compilation (#{word}) is not supported in asset sources"),
@@ -684,7 +690,7 @@ mod tests {
 
     #[test]
     fn refuses_conditional_compilation() {
-        let err = CFile::parse_str(Path::new("t.c"), "#if 0\nint a = 1;\n#endif\n").unwrap_err();
+        let err = CFile::parse_str(Path::new("t.c"), "#if(0)\nint a = 1;\n#endif\n").unwrap_err();
         assert!(err.to_string().contains("#if"), "{err}");
     }
 

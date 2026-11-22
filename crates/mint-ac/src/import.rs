@@ -513,6 +513,11 @@ fn translation(j: &Joint) -> Transform {
     Transform::from_translation(Vec3::from(j.translation.map(|v| v as f32)))
 }
 
+/// Special NPC models the importer refuses: unsupported combiners or
+/// commands (fob, gst, hem) and a custom-design eye palette slot (mka).
+#[cfg(test)]
+pub(crate) const SPECIAL_NPC_MODELS: [&str; 4] = ["fob_1", "gst_1", "hem_1", "mka_1"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +568,12 @@ mod tests {
             let file = CFile::parse_str(&path, &text).unwrap();
             let js = joints(&file, &model).unwrap();
             assert!(parents(&js).is_some(), "{model}");
+            // Export relies on every model sharing this skeleton.
+            assert_eq!(
+                js.iter().map(|j| j.children).collect::<Vec<_>>(),
+                crate::VILLAGER_JOINT_CHILDREN.map(usize::from),
+                "{model}"
+            );
             count += 1;
             for j in &js {
                 let Some(dl) = &j.dl else { continue };
@@ -577,7 +588,7 @@ mod tests {
         eprintln!("{count} models; refused: {refused:#?}");
         assert_eq!(count, 72);
         let refused: Vec<_> = refused.keys().map(String::as_str).collect();
-        assert_eq!(refused, ["fob_1", "gst_1", "hem_1", "mka_1"]);
+        assert_eq!(refused, SPECIAL_NPC_MODELS);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use mint_core::{Model, NodeId, Palette, Project, Rgba8, TargetId, TextureContent, Transform};
 
 use crate::c::CFile;
-use crate::import::{build_project, parse_villagers};
+use crate::import::{SPECIAL_NPC_MODELS, build_project, parse_villagers};
 use crate::{Decomp, ExportError, export, gx};
 
 /// Slot, size, variant pixels, and whether the texture is external.
@@ -341,10 +341,19 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
 
     let mut extra = p.model().clone();
     extra.add_child(NodeId::ROOT, "extra", Transform::default());
-    let extra = variant_of(&p, crate::TARGET, palette, extra);
+    let extra = variant_of(&p, crate::TARGET, palette.clone(), extra);
     assert!(matches!(
         export(&extra, "rt_1", "rt_1"),
         Err(ExportError::Skeleton(_))
+    ));
+
+    // Both display lists would be named body_rt_model.
+    let mut renamed = p.model().clone();
+    renamed.node_mut(NodeId(HEAD_JOINT as u32)).name = "body".into();
+    let renamed = variant_of(&p, crate::TARGET, palette, renamed);
+    assert!(matches!(
+        export(&renamed, "rt_1", "rt_1"),
+        Err(ExportError::Node { .. })
     ));
 }
 
@@ -353,8 +362,15 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
 #[test]
 fn export_writes_joints_depth_first() {
     let (p, pose) = synthetic_project();
-    // Rebuild the same tree, adding joint 5 (a leaf of the first leg) last,
-    // so its id comes after nodes it precedes depth-first.
+    // Give joint 5 (a leaf of the first leg) a mesh, so it takes matrix
+    // slot 0 ahead of the body that the head's seam vertices follow.
+    let mut with_leg = p.model().clone();
+    let leg = with_leg.node_mut(NodeId(5));
+    leg.name = "leg".into();
+    leg.mesh = p.model().node(NodeId(BODY_JOINT as u32)).mesh.clone();
+    let p = variant_of(&p, crate::TARGET, p.palette().clone(), with_leg);
+    // Rebuild the same tree, adding joint 5 last, so its id comes after
+    // nodes it precedes depth-first.
     let model = p.model();
     let mut shuffled = Model::new(
         model.node(NodeId::ROOT).name.clone(),
@@ -419,8 +435,7 @@ fn every_built_villager_round_trips() {
     let unexpected: Vec<&str> = refused
         .iter()
         .filter(|(model, e)| {
-            !["fob_1", "gst_1", "hem_1", "mka_1"].contains(&model.as_str())
-                && !e.starts_with("flg_12:")
+            !SPECIAL_NPC_MODELS.contains(&model.as_str()) && !e.starts_with("flg_12:")
         })
         .map(|(_, e)| e.as_str())
         .collect();

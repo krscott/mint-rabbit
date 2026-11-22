@@ -30,9 +30,10 @@ just format
 just check
 ```
 
-- `just test-decomp [PATH]` also parses every model source in a decomp
-  checkout and round-trips every villager (import, export, import); the
-  round trip needs a built checkout.
+- `just test-decomp-sources [PATH]` parses every model source and the
+  villager table of a decomp checkout, built or not.
+- `just test-decomp PATH` also round-trips every villager (import, export,
+  import); it needs a built checkout.
 - `just snapshot [PATH]` renders the first villager of a decomp offscreen to
   `target/model-view.png`; it needs a GPU.
 

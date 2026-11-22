@@ -60,11 +60,6 @@ impl Palette {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    #[must_use]
-    pub fn get(&self, index: PaletteIndex) -> Option<Rgba8> {
-        self.entries.get(usize::from(index.0)).copied()
-    }
 }
 
 /// A raster image whose pixels are palette indices, row-major from the top

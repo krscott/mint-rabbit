@@ -12,8 +12,12 @@ run *args:
 test:
     cargo test --locked --workspace
 
-# Run tests that read an ac-decomp checkout (DECOMP defaults to .multi/repos/ac-decomp).
-test-decomp decomp=".multi/repos/ac-decomp":
+# Parse every model source and the villager table of an ac-decomp checkout (built or not).
+test-decomp-sources decomp=".multi/repos/ac-decomp":
+    MINT_AC_DECOMP="$(realpath {{ decomp }})" cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
+
+# Run every decomp test, including the round trip of every villager; needs a built checkout.
+test-decomp decomp:
     MINT_AC_DECOMP="$(realpath {{ decomp }})" cargo test --locked -p mint-ac -- --include-ignored
 
 # Write a generated demo villager as a decomp-shaped directory and open it.
