@@ -327,9 +327,16 @@ impl Outline {
                     (a, b)
                 };
                 let ab = b - a;
-                let t =
-                    ((p - a).dot(ab) / ab.length_squared().max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
-                p.distance(a + ab * t)
+                let t = (p - a).dot(ab) / ab.length_squared().max(f32::MIN_POSITIVE);
+                // Past either end, measure to the end itself, which
+                // `a + ab` would only approximate.
+                if t <= 0.0 {
+                    p.distance(a)
+                } else if t >= 1.0 {
+                    p.distance(b)
+                } else {
+                    p.distance(a + ab * t)
+                }
             })
             .fold(f32::INFINITY, f32::min)
     }
@@ -592,6 +599,15 @@ mod tests {
                 let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
                 assert_eq!(forward.covers(c), back.covers(c), "{c}");
             }
+        }
+
+        // Round end caps measure to the ends exactly in either direction.
+        let cap = [Vec2::new(1.2, 0.9), Vec2::new(0.0, 60.0)].map(Anchor::corner);
+        for anchors in [cap, [cap[1], cap[0]]] {
+            let o = Shape::new(anchors.to_vec(), style, PaletteIndex(0))
+                .unwrap()
+                .outline();
+            assert!(o.covers(Vec2::new(1.5, 0.5)));
         }
 
         // A loop back to its own anchor flattens to the same points in
