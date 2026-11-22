@@ -299,7 +299,8 @@ fn synthetic_villager_round_trips() {
 /// are left out.
 #[test]
 fn export_rasterizes_painted_layers() {
-    use mint_core::{PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
+    use glam::Vec2;
+    use mint_core::{Layer, PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
     let (mut p, pose) = synthetic_project();
     let texture = p
         .textures()
@@ -311,25 +312,32 @@ fn export_rasterizes_painted_layers() {
         variant: 2,
     };
     let size = p.texture(r.texture).size().as_vec2();
-    for (name, color) in [("shown", 3), ("hidden", 5)] {
-        let v = p.variant_mut(r);
-        v.add_layer(0, name);
-        let anchors = shape::ellipse(size / 2.0, size / 3.0);
-        p.insert_shape(
-            r,
-            0,
-            0,
-            Shape::new(anchors, Style::Fill, PaletteIndex(color)).unwrap(),
-        )
-        .unwrap();
-    }
-    // Layer 0 is the one painting entry 5, drawn under the other.
-    let mut shown_only = p.variant(r).clone();
-    shown_only.remove_layer(0);
-    p.variant_mut(r).layer_mut(0).visible = false;
+    // A shown ellipse, with a hidden rectangle over all of it.
+    let shapes = [
+        Shape::new(
+            shape::ellipse(size / 2.0, size / 3.0),
+            Style::Fill,
+            PaletteIndex(3),
+        ),
+        Shape::new(
+            shape::rectangle(Vec2::ZERO, size),
+            Style::Fill,
+            PaletteIndex(5),
+        ),
+    ];
+    p.edit_variant(r, |v| {
+        for (i, s) in shapes.into_iter().enumerate() {
+            let mut layer = Layer::new(format!("layer {i}"));
+            layer.insert_shape(0, s.unwrap());
+            v.insert_layer(i, layer);
+        }
+        v.layers_mut()[1].visible = false;
+    })
+    .unwrap();
     let painted = p.variant(r).rasterize();
+    let center = painted.pixel(size.x as u32 / 2, size.y as u32 / 2);
+    assert_eq!(center, PaletteIndex(3));
     assert_ne!(&painted, p.variant(r).underlay());
-    assert_eq!(painted, shown_only.rasterize());
 
     let again = reimport(&p, &pose);
     assert_eq!(again.variant(r).underlay(), &painted);
