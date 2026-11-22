@@ -4,22 +4,20 @@ default:
     just --list
 
 build:
-    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''Hello from hello.sh\n'\''' > hello.sh
-    chmod +x hello.sh
+    cargo build --locked
 
-run: build
-    ./hello.sh
+run *args:
+    cargo run --locked -p mint-rabbit -- "$@"
 
-# Test the locally built program.
-test: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    expected='Hello from hello.sh'
-    actual=$(./hello.sh)
-    if [[ "$actual" != "$expected" ]]; then
-        printf 'Expected: %s\nActual: %s\n' "$expected" "$actual" >&2
-        exit 1
-    fi
+test:
+    cargo test --locked --workspace
+
+# Run tests that read an ac-decomp checkout (DECOMP defaults to .multi/repos/ac-decomp).
+test-decomp decomp=".multi/repos/ac-decomp":
+    MINT_AC_DECOMP="$(realpath {{ decomp }})" cargo test --locked --workspace -- --include-ignored
+
+clippy:
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # Format files, or all tracked files when no files are provided.
 format *files:
@@ -64,6 +62,13 @@ _format mode *files:
                     nixfmt "$file"
                 fi
             ;;
+            *.rs)
+                if [[ "$mode" == check ]]; then
+                    rustfmt --edition 2024 --check "$file"
+                else
+                    rustfmt --edition 2024 "$file"
+                fi
+            ;;
             *.sh|.githooks/*|*/.githooks/*)
                 if [[ "$mode" == check ]]; then
                     shfmt -d -i 4 "$file"
@@ -86,7 +91,7 @@ lint:
     done < <(git ls-files -z)
 
 # Run non-mutating formatting, shell, and Nix checks.
-check: format-check lint
+check: format-check lint clippy
     nix flake check -L --no-update-lock-file
 
 # Format staged files for git pre-commit.

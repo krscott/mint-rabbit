@@ -1,0 +1,12 @@
+[package]
+name = "mint-ac"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam = "0.34.3"
+mint-core = { version = "0.1.0", path = "../mint-core" }
+thiserror = "2.0.21"
+
+[lints]
+workspace = true

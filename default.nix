@@ -1,29 +1,46 @@
 {
   lib,
+  rustPlatform,
   stdenv,
+  libGL,
+  libxkbcommon,
+  vulkan-loader,
+  wayland,
+  xorg,
 }:
 
-stdenv.mkDerivation {
-  name = "mint-rabbit";
+let
+  # winit and wgpu load these with dlopen at runtime.
+  runtimeLibs = lib.optionals stdenv.hostPlatform.isLinux [
+    libGL
+    libxkbcommon
+    vulkan-loader
+    wayland
+    xorg.libX11
+    xorg.libXcursor
+    xorg.libXi
+    xorg.libXrandr
+  ];
+in
+rustPlatform.buildRustPackage {
+  pname = "mint-rabbit";
+  version = "0.1.0";
 
   src = lib.cleanSource ./.;
 
-  nativeBuildInputs = [ ];
-  buildInputs = [ ];
+  cargoLock.lockFile = ./Cargo.lock;
 
-  installPhase = ''
-    runHook preInstall
+  buildInputs = runtimeLibs;
 
-    mkdir -p "$out/bin"
-    printf '%s\n' \
-      '#!/usr/bin/env bash' \
-      'set -euo pipefail' \
-      'echo "Hello from mint-rabbit"' \
-      >"$out/bin/mint-rabbit"
-    chmod +x "$out/bin/mint-rabbit"
-
-    runHook postInstall
+  postFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
+    patchelf --add-rpath ${lib.makeLibraryPath runtimeLibs} "$out/bin/mint-rabbit"
   '';
 
-  meta.mainProgram = "mint-rabbit";
+  passthru = { inherit runtimeLibs; };
+
+  meta = {
+    description = "3D model and vector texture painter";
+    mainProgram = "mint-rabbit";
+    platforms = lib.platforms.unix;
+  };
 }
