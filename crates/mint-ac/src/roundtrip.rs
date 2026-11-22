@@ -397,6 +397,26 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
     let again = decomp.import(&v).unwrap();
     assert_eq!(again.variant(r).underlay(), &p.variant(r).rasterize());
 
+    // A folder export for a new texture set is checked against the base
+    // villager's model too.
+    let folder = tempfile::tempdir().unwrap();
+    let new_set = export_textures(&p, "t_9").unwrap();
+    let [c, notes] = decomp
+        .write_texture_folder(&new_set, "t_1", folder.path())
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(c).unwrap(), new_set.texture_c);
+    assert!(
+        std::fs::read_to_string(notes)
+            .unwrap()
+            .contains("t_9_tmem_txt")
+    );
+    let mut shrunk = new_set.clone();
+    shrunk.texture_sizes[0].1 /= 2;
+    assert!(matches!(
+        decomp.write_texture_folder(&shrunk, "t_1", folder.path()),
+        Err(WriteError::TextureSizes { .. })
+    ));
+
     // A new villager's entry copies the base's settings.
     let entry = painted.table_entry(Some(&v)).unwrap();
     assert!(entry.contains("1, TEXTURE_BANK"), "{entry}");

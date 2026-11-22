@@ -30,6 +30,8 @@ const FORMAT: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
+    #[error("texture {texture:?} is {size}; textures are at most {MAX_TEXTURE_SIDE} texels a side")]
+    TextureTooLarge { texture: String, size: UVec2 },
     #[error("{0} is a link; images are saved only into a directory inside the project")]
     ImageDirLink(PathBuf),
     #[error("{0}: {1}")]
@@ -245,6 +247,14 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     };
     let mut textures = Vec::new();
     for (t, texture) in project.textures().iter().enumerate() {
+        // Load would refuse it.
+        let size = texture.size();
+        if size.max_element() > MAX_TEXTURE_SIDE {
+            return Err(SaveError::TextureTooLarge {
+                texture: texture.name.clone(),
+                size,
+            });
+        }
         let content = match texture.content() {
             TextureContent::Painted(variants) => {
                 let mut out = Vec::new();
@@ -354,6 +364,12 @@ impl Staged {
     fn commit(self, dir: &Path) -> Result<(), SaveError> {
         let manifest = dir.join(PROJECT_FILE);
         write_atomic(&manifest, self.text.as_bytes()).map_err(|e| SaveError::Io(manifest, e))?;
+        // Old images go only once the new project file is known to be on
+        // disk; otherwise a power loss could bring back the old project
+        // file without them.
+        if std::fs::File::open(dir).and_then(|d| d.sync_all()).is_err() {
+            return Ok(());
+        }
         // Staging checked that the image directory is a real directory, and
         // removing a link removes the link itself, never its target.
         let images = dir.join(IMAGE_DIR);
@@ -991,6 +1007,29 @@ mod tests {
             .unwrap();
         save(&p, dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), p);
+    }
+
+    #[test]
+    fn save_refuses_textures_load_would_refuse() {
+        let size = UVec2::new(MAX_TEXTURE_SIDE + 1, 1);
+        let wide = IndexedImage::new(size, vec![PaletteIndex(0); size.x as usize]).unwrap();
+        let texture =
+            Texture::painted("wide", Slot("body".into()), size, [("1".to_owned(), wide)]).unwrap();
+        let p = Project::new(
+            ExportTarget::new("test"),
+            Palette::from_colors([Rgba8::new(0, 0, 0, 255)]).unwrap(),
+            Model::new("root", Transform::default()),
+            vec![texture],
+            Vec::new(),
+            Pose::default(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            save(&p, dir.path()),
+            Err(SaveError::TextureTooLarge { .. })
+        ));
+        assert!(!dir.path().join(PROJECT_FILE).exists());
     }
 
     #[test]

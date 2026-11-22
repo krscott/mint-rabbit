@@ -218,15 +218,7 @@ impl Decomp {
                 export: ours,
             });
         }
-        let expected = crate::export::texture_sizes(&self.import(&v)?);
-        if expected != export.texture_sizes {
-            return Err(WriteError::TextureSizes {
-                model: v.model,
-                texture_set: set.clone(),
-                expected,
-                actual: export.texture_sizes.clone(),
-            });
-        }
+        self.check_sizes(export, &v)?;
         let rel = Self::texture_path(set);
         let existing: BTreeSet<String> =
             self.read(&rel)?.decls.into_iter().map(|d| d.name).collect();
@@ -240,6 +232,45 @@ impl Decomp {
             });
         }
         Ok(path)
+    }
+
+    /// Checks that `export`'s textures have the slots and sizes the model of
+    /// villager `v` reads.
+    fn check_sizes(&self, export: &TextureExport, v: &VillagerRef) -> Result<(), WriteError> {
+        let expected = crate::export::texture_sizes(&self.import(v)?);
+        if expected == export.texture_sizes {
+            Ok(())
+        } else {
+            Err(WriteError::TextureSizes {
+                model: v.model.clone(),
+                texture_set: v.texture_set.clone(),
+                expected,
+                actual: export.texture_sizes.clone(),
+            })
+        }
+    }
+
+    /// Writes `export` as a new texture set into folder `dir`, with the table
+    /// entry and steps for adding it to the decomp, based on the row of
+    /// texture set `base` (the villager it replaces). The base must be on
+    /// the export's model, whose loads the textures must match. Returns the
+    /// paths written.
+    pub fn write_texture_folder(
+        &self,
+        export: &TextureExport,
+        base: &str,
+        dir: &Path,
+    ) -> Result<[PathBuf; 2], WriteError> {
+        let v = self.villager(base)?;
+        if v.model != export.model {
+            return Err(WriteError::OtherModel {
+                texture_set: v.texture_set,
+                actual: v.model,
+                expected: export.model.clone(),
+            });
+        }
+        self.check_sizes(export, &v)?;
+        export.write_to(dir, Some(&v))
     }
 
     /// Replaces the source of an existing texture set with `export`, after

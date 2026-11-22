@@ -207,8 +207,9 @@ impl TextureExport {
 
     /// Writes `<texture_set>.c`, and `<texture_set>_draw_data.txt` with the
     /// rest of what a new texture set needs in the decomp, into `dir`,
-    /// returning their paths.
-    pub fn write_to(
+    /// returning their paths. [`crate::Decomp::write_texture_folder`] checks
+    /// the export against the model first.
+    pub(crate) fn write_to(
         &self,
         dir: &std::path::Path,
         base: Option<&VillagerRef>,
