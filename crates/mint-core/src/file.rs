@@ -227,6 +227,17 @@ struct Staged {
 
 /// Writes the images of `project` into `dir` and prepares its project file.
 fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
+    // Load would refuse it; checked before anything is written.
+    if let Some(t) = project
+        .textures()
+        .iter()
+        .find(|t| t.size().max_element() > MAX_TEXTURE_SIDE)
+    {
+        return Err(SaveError::TextureTooLarge {
+            texture: t.name.clone(),
+            size: t.size(),
+        });
+    }
     let previous = referenced_images(dir);
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
@@ -247,14 +258,6 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     };
     let mut textures = Vec::new();
     for (t, texture) in project.textures().iter().enumerate() {
-        // Load would refuse it.
-        let size = texture.size();
-        if size.max_element() > MAX_TEXTURE_SIDE {
-            return Err(SaveError::TextureTooLarge {
-                texture: texture.name.clone(),
-                size,
-            });
-        }
         let content = match texture.content() {
             TextureContent::Painted(variants) => {
                 let mut out = Vec::new();
@@ -1015,11 +1018,13 @@ mod tests {
         let wide = IndexedImage::new(size, vec![PaletteIndex(0); size.x as usize]).unwrap();
         let texture =
             Texture::painted("wide", Slot("body".into()), size, [("1".to_owned(), wide)]).unwrap();
+        let mut textures = sample().textures().to_vec();
+        textures.push(texture);
         let p = Project::new(
             ExportTarget::new("test"),
-            Palette::from_colors([Rgba8::new(0, 0, 0, 255)]).unwrap(),
+            sample().palette().clone(),
             Model::new("root", Transform::default()),
-            vec![texture],
+            textures,
             Vec::new(),
             Pose::default(),
         )
@@ -1029,7 +1034,7 @@ mod tests {
             save(&p, dir.path()),
             Err(SaveError::TextureTooLarge { .. })
         ));
-        assert!(!dir.path().join(PROJECT_FILE).exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

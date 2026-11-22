@@ -212,7 +212,7 @@ impl TextureExport {
     pub(crate) fn write_to(
         &self,
         dir: &std::path::Path,
-        base: Option<&VillagerRef>,
+        base: &VillagerRef,
     ) -> Result<[std::path::PathBuf; 2], crate::WriteError> {
         let set = &self.texture_set;
         let io = |path: &std::path::Path| {
@@ -222,7 +222,7 @@ impl TextureExport {
         std::fs::create_dir_all(dir).map_err(io(dir))?;
         let c = dir.join(format!("{set}.c"));
         let table = dir.join(format!("{set}_draw_data.txt"));
-        let entry = self.table_entry(base)?;
+        let entry = self.table_entry(Some(base))?;
         let notes = format!(
             "// To add texture set {set} to the decomp:
 // 1. Copy {set}.c to src/data/npc/model/tex/{set}.c.
@@ -234,15 +234,10 @@ impl TextureExport {
 {}// 4. The game finds a villager's row in npc_draw_data_tbl by its NPC id, so
 //    replace the row of the villager this texture set is for with this
 //    one (adding a row would shift every later villager), replacing
-//    TEXTURE_BANK with the texture set's object bank{}:
+//    TEXTURE_BANK with the texture set's object bank:
 {}// 5. Build with `python configure.py --non-matching && ninja`.
 ",
             self.table_externs(),
-            if base.is_some() {
-                ""
-            } else {
-                ", MODEL_BANK with the model's, and the commented fields with the base villager's"
-            },
             entry
         );
         mint_core::file::write_atomic(&c, self.texture_c.as_bytes()).map_err(io(&c))?;

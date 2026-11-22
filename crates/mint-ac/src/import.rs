@@ -270,7 +270,7 @@ impl Decomp {
             });
         }
         self.check_sizes(export, &v)?;
-        export.write_to(dir, Some(&v))
+        export.write_to(dir, &v)
     }
 
     /// Replaces the source of an existing texture set with `export`, after
