@@ -1,7 +1,7 @@
 //! `GameCube` texture and palette encodings used by villager models: CI4
 //! textures tiled in 8x8 blocks, and RGB5A3 palette entries.
 
-use mint_core::{PaletteIndex, Rgba8};
+use mint_core::{PaletteIndex, Rgba8, Wrap};
 
 /// Width and height of a CI4 tile in texels.
 pub const TILE: u32 = 8;
@@ -12,6 +12,10 @@ const TILE_BYTES: usize = 32;
 pub enum GxError {
     #[error("texture size {width}x{height} is not a multiple of 8 within 8..=1024 on both sides")]
     BadSize { width: u32, height: u32 },
+    #[error(
+        "a texture {width} wide and {height} high can only repeat or mirror along power-of-two sides"
+    )]
+    WrapNeedsPowerOfTwo { width: u32, height: u32 },
     #[error("CI4 texture {width}x{height} needs {expected} bytes, found {actual}")]
     WrongLength {
         width: u32,
@@ -21,6 +25,17 @@ pub enum GxError {
     },
     #[error("CI4 pixel uses palette entry {0}; only entries 0-15 fit in 4 bits")]
     IndexTooLarge(u8),
+}
+
+/// Checks that each axis that repeats or mirrors has a power-of-two size, as
+/// `GXInitTexObj` requires.
+pub fn check_wrap(width: u32, height: u32, wrap: [Wrap; 2]) -> Result<(), GxError> {
+    let ok = |side: u32, w: Wrap| w == Wrap::Clamp || side.is_power_of_two();
+    if ok(width, wrap[0]) && ok(height, wrap[1]) {
+        Ok(())
+    } else {
+        Err(GxError::WrapNeedsPowerOfTwo { width, height })
+    }
 }
 
 /// Bytes a CI4 texture of this size takes.
@@ -185,6 +200,13 @@ mod tests {
         assert_eq!(encode_rgb5a3(Rgba8::new(200, 0, 0, 254)) & 0x8000, 0x8000);
         // Mostly transparent uses the alpha form.
         assert_eq!(quantize_rgb5a3(Rgba8::new(255, 255, 255, 40)).a, 36);
+    }
+
+    #[test]
+    fn wrapping_axes_need_power_of_two_sizes() {
+        assert!(check_wrap(24, 16, [Wrap::Clamp, Wrap::Repeat]).is_ok());
+        assert!(check_wrap(24, 16, [Wrap::Mirror, Wrap::Clamp]).is_err());
+        assert!(check_wrap(32, 48, [Wrap::Repeat, Wrap::Repeat]).is_err());
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub enum ExportError {
         texture: String,
         source: gx::GxError,
     },
+    #[error("body textures take {0:#x} bytes; texture addresses hold offsets below 0x1000000")]
+    BodyTooLarge(usize),
     #[error("the clothing texture is {}x{}; the game's clothing is 32x32", .0.x, .0.y)]
     ClothingSize(glam::UVec2),
     #[error("node {node:?}: {problem}")]
@@ -180,6 +182,10 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
                 check_count(SLOT_BODY, 1)?;
                 let offset = out.body.len();
                 out.body.extend(variant_bytes(texture)?.concat());
+                // Offsets share a 32-bit address with the segment number.
+                if out.body.len() > 0x100_0000 {
+                    return Err(ExportError::BodyTooLarge(out.body.len()));
+                }
                 Placement::Body { offset }
             }
             (slot, _) => {
@@ -682,6 +688,14 @@ pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Expor
     }
     check_name(model)?;
     check_name(texture_set)?;
+    for m in project.materials() {
+        let texture = project.texture(m.texture);
+        let size = texture.size();
+        gx::check_wrap(size.x, size.y, m.wrap).map_err(|source| ExportError::Gx {
+            texture: texture.name.clone(),
+            source,
+        })?;
+    }
     let layout = layout(project)?;
     let (draw_data_externs, draw_data_entry) = draw_data(model, texture_set, &layout);
     Ok(Export {

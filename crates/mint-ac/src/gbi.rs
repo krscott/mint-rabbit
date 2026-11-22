@@ -418,11 +418,13 @@ impl Interp<'_> {
         };
         let (width, height) = (side(2)?, side(3)?);
         crate::gx::check_size(width, height).map_err(|e| e.to_string())?;
+        let wrap = [wrap(&args[5])?, wrap(&args[6])?];
+        crate::gx::check_wrap(width, height, wrap).map_err(|e| e.to_string())?;
         self.tex = Some(TexLoad {
             source,
             width,
             height,
-            wrap: [wrap(&args[5])?, wrap(&args[6])?],
+            wrap,
         });
         Ok(())
     }

@@ -2,9 +2,10 @@
 //! top-level `name = initializer;` declarations whose initializers are
 //! brace lists of constant expressions and macro calls.
 //!
-//! `#include` lines naming a `.inc` file are spliced in, since that is how the
-//! decomp pulls extracted asset data into its sources. Every other
-//! preprocessor line is skipped.
+//! The only directive accepted is a plain `#include "file"`; any other is a
+//! syntax error. Included `.inc` files are spliced in, since that is how the
+//! decomp pulls extracted asset data into its sources; other includes are
+//! headers the reader does not need.
 
 use std::collections::HashMap;
 use std::fmt;
