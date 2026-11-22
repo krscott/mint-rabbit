@@ -209,10 +209,13 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
 struct Staged {
     text: String,
     images: Vec<PathBuf>,
+    /// Images the previous project file referred to.
+    previous: Vec<PathBuf>,
 }
 
 /// Writes the images of `project` into `dir` and prepares its project file.
 fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
+    let previous = referenced_images(dir);
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
     let mut written = Vec::new();
@@ -282,20 +285,41 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     Ok(Staged {
         text,
         images: written,
+        previous,
     })
 }
 
+/// The images the project file in `dir` refers to, or none if there is no
+/// readable project file.
+fn referenced_images(dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(dir.join(PROJECT_FILE)) else {
+        return Vec::new();
+    };
+    let Ok(file) = ron::from_str::<ProjectFile>(&text) else {
+        return Vec::new();
+    };
+    file.textures
+        .iter()
+        .flat_map(|t| match &t.content {
+            ContentFile::Painted(variants) => variants.iter().map(|v| v.underlay.clone()).collect(),
+            ContentFile::External { preview } => vec![preview.clone()],
+        })
+        .filter(|rel| relative_inside(rel))
+        .map(|rel| dir.join(rel))
+        .collect()
+}
+
 impl Staged {
-    /// Replaces the project file, then removes the images of earlier saves.
+    /// Replaces the project file, then removes the images only the previous
+    /// project file used. Other files, such as images another save is still
+    /// staging, are left alone, and failing to remove one doesn't fail the
+    /// save.
     fn commit(self, dir: &Path) -> Result<(), SaveError> {
         let manifest = dir.join(PROJECT_FILE);
         write_atomic(&manifest, self.text.as_bytes()).map_err(|e| SaveError::Io(manifest, e))?;
-        let images = dir.join(IMAGE_DIR);
-        let entries = std::fs::read_dir(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
-        for entry in entries {
-            let path = entry.map_err(|e| SaveError::Io(images.clone(), e))?.path();
-            if path.extension().is_some_and(|e| e == "png") && !self.images.contains(&path) {
-                std::fs::remove_file(&path).map_err(|e| SaveError::Io(path.clone(), e))?;
+        for old in self.previous.iter().filter(|p| !self.images.contains(p)) {
+            if std::fs::symlink_metadata(old).is_ok_and(|m| m.is_file()) {
+                let _ = std::fs::remove_file(old);
             }
         }
         Ok(())
@@ -557,12 +581,23 @@ fn layer(l: LayerFile) -> Result<Layer, crate::ShapeError> {
     Ok(layer)
 }
 
+/// Whether `rel` is a relative path that names no parent directory.
+fn relative_inside(rel: &str) -> bool {
+    Path::new(rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// Resolves an image path from the project file, which must stay inside
-/// the project directory.
+/// the project directory, links included.
 fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
-    let path = Path::new(rel);
-    if path.components().all(|c| matches!(c, Component::Normal(_))) {
-        Ok(dir.join(path))
+    if !relative_inside(rel) {
+        return Err(LoadError::ImagePath(rel.to_owned()));
+    }
+    let path = dir.join(rel);
+    let resolve = |p: &Path| p.canonicalize().map_err(|e| LoadError::Io(p.to_owned(), e));
+    if resolve(&path)?.starts_with(resolve(dir)?) {
+        Ok(path)
     } else {
         Err(LoadError::ImagePath(rel.to_owned()))
     }
@@ -570,15 +605,19 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
 
 /// Replaces the file at `path` with `bytes` all at once: they are written
 /// to a new, uniquely named file beside it (never one already there, such as
-/// a planted link), synced, and renamed over it. A failed write removes the
-/// new file and leaves the old one.
+/// a planted link), synced, and renamed over it, and the directory is synced
+/// so the rename survives a power loss. A failed write removes the new file
+/// and leaves the old one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn encode_indexed(image: &IndexedImage, palette: &Palette) -> Result<Vec<u8>, png::EncodingError> {
@@ -807,9 +846,14 @@ mod tests {
         let staged = stage(&p, dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), sample());
 
-        // Once it is replaced, only the new images remain.
+        // Once it is replaced, the old project's images go, but files the
+        // project never referred to stay.
+        let reference = dir.path().join(IMAGE_DIR).join("reference.png");
+        std::fs::write(&reference, b"not ours").unwrap();
         staged.commit(dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), p);
+        assert!(reference.is_file());
+        std::fs::remove_file(&reference).unwrap();
         let second = images(dir.path());
         assert_eq!(second.len(), 3);
         assert!(
@@ -817,6 +861,18 @@ mod tests {
                 .iter()
                 .all(|f| !first.contains(f) || f.to_string_lossy().contains("preview"))
         );
+    }
+
+    #[test]
+    fn load_refuses_images_linked_from_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        save(&sample(), dir.path()).unwrap();
+        let inside = images(dir.path()).remove(0);
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("elsewhere.png");
+        std::fs::rename(&inside, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &inside).unwrap();
+        assert!(matches!(load(dir.path()), Err(LoadError::ImagePath(_))));
     }
 
     #[test]

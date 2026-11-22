@@ -222,8 +222,10 @@ impl TextureExport {
 //    and add it to its module's link order with configure.py's
 //    link_order_callback (see the comment above it there).
 // 3. Add these declarations to src/data/npc/npc_draw_data.c:
-{}// 4. Add this entry to npc_draw_data_tbl, replacing TEXTURE_BANK with the
-//    texture set's object bank{}:
+{}// 4. The game finds a villager's row in npc_draw_data_tbl by its NPC id, so
+//    replace the row of the villager this texture set is for with this
+//    one (adding a row would shift every later villager), replacing
+//    TEXTURE_BANK with the texture set's object bank{}:
 {}// 5. Build with `python configure.py --non-matching && ninja`.
 ",
             self.table_externs(),
