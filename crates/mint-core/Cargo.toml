@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 glam = "0.34.3"
+png = "0.18.1"
+ron = "0.12.3"
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

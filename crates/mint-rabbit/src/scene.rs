@@ -7,7 +7,7 @@ use mint_core::{MaterialId, Project, Rgba8, Texture, TextureContent, TextureId};
 
 /// Converts a palette color to what the export target displays.
 pub fn display_color(project: &Project, c: Rgba8) -> Rgba8 {
-    if project.target().0 == mint_ac::TARGET {
+    if project.target().id == mint_ac::TARGET {
         mint_ac::quantize_color(c)
     } else {
         c
@@ -124,7 +124,7 @@ mod tests {
     use glam::{Quat, UVec2};
     use mint_core::{
         AlphaMode, Corner, IndexedImage, Material, Mesh, Model, NodeId, Palette, PaletteIndex,
-        Pose, Slot, TargetId, Transform, Triangle, Vertex, Wrap,
+        Pose, Slot, Transform, Triangle, Vertex, Wrap,
     };
 
     use super::*;
@@ -167,7 +167,7 @@ mod tests {
         let texture =
             Texture::painted("t", Slot("body".into()), UVec2::ONE, [("1".into(), img)]).unwrap();
         Project::new(
-            TargetId(mint_ac::TARGET.into()),
+            mint_core::ExportTarget::new(mint_ac::TARGET),
             Palette::from_colors([Rgba8::new(255, 1, 2, 255)]).unwrap(),
             model,
             vec![texture],

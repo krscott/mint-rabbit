@@ -9,7 +9,7 @@ use mint_core::{AlphaMode, MaterialId, NodeId, Project, Texture, TextureContent,
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
-use crate::{SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
+use crate::{OPTION_MODEL, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
 
 /// Most triangles one `gsSPNTrianglesInit_5b` group can count.
 const MAX_GROUP_TRIANGLES: usize = 128;
@@ -32,6 +32,8 @@ type CornerKey = (u32, [i16; 2]);
 pub enum ExportError {
     #[error("the project targets {0:?}, not {TARGET:?}")]
     WrongTarget(String),
+    #[error("the project has no {0:?} export target option")]
+    MissingOption(&'static str),
     #[error("{0:?} is not a C identifier")]
     BadName(String),
     #[error(
@@ -63,18 +65,49 @@ pub enum ExportError {
     Node { node: String, problem: String },
 }
 
-/// The exported sources.
+/// The exported sources of a model and its texture set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Export {
     /// Contents of `src/data/npc/model/mdl/<model>.c`.
     pub model_c: String,
+    pub textures: TextureExport,
+}
+
+/// The exported sources of a texture set drawn on an existing model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextureExport {
+    /// The model the textures are drawn on, such as `cat_1`.
+    pub model: String,
+    /// The texture set's name, such as `cat_2`.
+    pub texture_set: String,
     /// Contents of `src/data/npc/model/tex/<texture_set>.c`.
     pub texture_c: String,
+    /// The arrays `texture_c` defines, in order.
+    pub symbols: Vec<String>,
     /// Declarations the `npc_draw_data_tbl` file needs for the entry.
     pub draw_data_externs: String,
     /// The `npc_draw_data_tbl` entry, with `MODEL_BANK` and `TEXTURE_BANK`
     /// to replace and a reminder to fill the fields after the textures.
     pub draw_data_entry: String,
+}
+
+impl TextureExport {
+    /// Writes `<texture_set>.c` and `<texture_set>_draw_data.txt`, the table
+    /// entry to paste, into `dir`, returning their paths.
+    pub fn write_to(&self, dir: &std::path::Path) -> std::io::Result<[std::path::PathBuf; 2]> {
+        std::fs::create_dir_all(dir)?;
+        let c = dir.join(format!("{}.c", self.texture_set));
+        let table = dir.join(format!("{}_draw_data.txt", self.texture_set));
+        std::fs::write(&c, &self.texture_c)?;
+        std::fs::write(
+            &table,
+            format!(
+                "// Declarations for src/data/npc/npc_draw_data.c:\n{}\n// Entry for npc_draw_data_tbl:\n{}",
+                self.draw_data_externs, self.draw_data_entry
+            ),
+        )?;
+        Ok([c, table])
+    }
 }
 
 fn check_name(name: &str) -> Result<(), ExportError> {
@@ -215,11 +248,18 @@ fn byte_array(out: &mut String, name: &str, data: &[u8]) {
     out.push_str("};\n\n");
 }
 
-fn texture_c(project: &Project, set: &str, layout: &Layout) -> Result<String, ExportError> {
+/// Names of the arrays a texture set defines, in the order `texture_c`
+/// writes them.
+fn symbols(set: &str, layout: &Layout) -> Vec<String> {
+    let mut out = vec![format!("{set}_pal")];
+    out.extend((1..=layout.eyes.len()).map(|k| format!("{set}_eye{k}_TA_tex_txt")));
+    out.extend((1..=layout.mouths.len()).map(|k| format!("{set}_mouth{k}_TA_tex_txt")));
+    out.push(format!("{set}_tmem_txt"));
+    out
+}
+
+fn texture_c(project: &Project, set: &str, layout: &Layout) -> String {
     let colors = project.palette().colors();
-    if colors.len() > PALETTE_LEN {
-        return Err(ExportError::PaletteTooLarge(colors.len()));
-    }
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -234,14 +274,16 @@ fn texture_c(project: &Project, set: &str, layout: &Layout) -> Result<String, Ex
         let _ = write!(out, " 0x{:04X},", gx::encode_rgb5a3(c));
     }
     out.push_str("\n};\n\n");
-    for (k, data) in layout.eyes.iter().enumerate() {
-        byte_array(&mut out, &format!("{set}_eye{}_TA_tex_txt", k + 1), data);
+    let names = symbols(set, layout);
+    let arrays = layout
+        .eyes
+        .iter()
+        .chain(&layout.mouths)
+        .chain([&layout.body]);
+    for (name, data) in names[1..].iter().zip(arrays) {
+        byte_array(&mut out, name, data);
     }
-    for (k, data) in layout.mouths.iter().enumerate() {
-        byte_array(&mut out, &format!("{set}_mouth{}_TA_tex_txt", k + 1), data);
-    }
-    byte_array(&mut out, &format!("{set}_tmem_txt"), &layout.body);
-    Ok(out)
+    out
 }
 
 /// One exported `Vtx`: a core vertex with the texel coordinates of one use.
@@ -663,20 +705,15 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
 }
 
 /// The `extern` declarations and the table entry for `npc_draw_data_tbl`.
-fn draw_data(model: &str, set: &str, layout: &Layout) -> (String, String) {
+fn draw_data(model: &str, set: &str, layout: &Layout, symbols: &[String]) -> (String, String) {
     let mut externs = String::new();
     let _ = writeln!(externs, "extern cKF_Skeleton_R_c cKF_bs_r_{model};");
-    let _ = writeln!(externs, "extern unsigned short {set}_pal[];");
-    let eyes: Vec<String> = (1..=layout.eyes.len())
-        .map(|k| format!("{set}_eye{k}_TA_tex_txt"))
-        .collect();
-    let mouths: Vec<String> = (1..=layout.mouths.len())
-        .map(|k| format!("{set}_mouth{k}_TA_tex_txt"))
-        .collect();
-    for n in eyes.iter().chain(&mouths) {
+    let _ = writeln!(externs, "extern unsigned short {}[];", symbols[0]);
+    for n in &symbols[1..] {
         let _ = writeln!(externs, "extern unsigned char {n}[];");
     }
-    let _ = writeln!(externs, "extern unsigned char {set}_tmem_txt[];");
+    let eyes = &symbols[1..=layout.eyes.len()];
+    let mouths = &symbols[1 + layout.eyes.len()..symbols.len() - 1];
     let list = |names: &[String], len: usize| {
         (0..len)
             .map(|i| names.get(i).map_or("NULL", String::as_str).to_owned())
@@ -691,19 +728,22 @@ fn draw_data(model: &str, set: &str, layout: &Layout) -> (String, String) {
         /* scale, talk type, ... */
     }},
 ",
-        list(&eyes, EYE_VARIANTS),
-        list(&mouths, MOUTH_VARIANTS)
+        list(eyes, EYE_VARIANTS),
+        list(mouths, MOUTH_VARIANTS)
     );
     (externs, entry)
 }
 
-/// Exports `project` as model `model` with texture set `texture_set`.
-pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Export, ExportError> {
-    if project.target().0 != TARGET {
-        return Err(ExportError::WrongTarget(project.target().0.clone()));
+/// Checks what the target can hold and lays out the textures.
+fn prepare(project: &Project, texture_set: &str) -> Result<Layout, ExportError> {
+    if project.target().id != TARGET {
+        return Err(ExportError::WrongTarget(project.target().id.clone()));
     }
-    check_name(model)?;
     check_name(texture_set)?;
+    let colors = project.palette().len();
+    if colors > PALETTE_LEN {
+        return Err(ExportError::PaletteTooLarge(colors));
+    }
     // Layout checks texture sizes, which the wrap check builds on. Only
     // materials that triangles use become texture loads.
     let layout = layout(project)?;
@@ -722,11 +762,47 @@ pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Expor
             source,
         })?;
     }
-    let (draw_data_externs, draw_data_entry) = draw_data(model, texture_set, &layout);
-    Ok(Export {
-        model_c: model_c(project, model, &layout)?,
-        texture_c: texture_c(project, texture_set, &layout)?,
+    Ok(layout)
+}
+
+fn texture_export(
+    project: &Project,
+    model: &str,
+    texture_set: &str,
+    layout: &Layout,
+) -> TextureExport {
+    let symbols = symbols(texture_set, layout);
+    let (draw_data_externs, draw_data_entry) = draw_data(model, texture_set, layout, &symbols);
+    TextureExport {
+        model: model.to_owned(),
+        texture_set: texture_set.to_owned(),
+        texture_c: texture_c(project, texture_set, layout),
+        symbols,
         draw_data_externs,
         draw_data_entry,
+    }
+}
+
+/// Exports `project` as a new model `model` with texture set `texture_set`.
+pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Export, ExportError> {
+    check_name(model)?;
+    let layout = prepare(project, texture_set)?;
+    Ok(Export {
+        model_c: model_c(project, model, &layout)?,
+        textures: texture_export(project, model, texture_set, &layout),
     })
+}
+
+/// Exports only the textures of `project`, as texture set `texture_set` for
+/// the unchanged model the project was imported from, named by its
+/// [`OPTION_MODEL`] target option.
+pub fn export_textures(project: &Project, texture_set: &str) -> Result<TextureExport, ExportError> {
+    let model = project
+        .target()
+        .options
+        .get(OPTION_MODEL)
+        .ok_or(ExportError::MissingOption(OPTION_MODEL))?;
+    check_name(model)?;
+    let layout = prepare(project, texture_set)?;
+    Ok(texture_export(project, model, texture_set, &layout))
 }

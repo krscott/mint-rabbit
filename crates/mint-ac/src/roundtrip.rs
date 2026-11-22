@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use mint_core::{Model, NodeId, Palette, Project, Rgba8, TargetId, TextureContent, Transform};
+use mint_core::{Model, NodeId, Palette, Project, Rgba8, TextureContent, Transform};
 
 use crate::c::CFile;
 use crate::import::{SPECIAL_NPC_MODELS, build_project, parse_villagers};
@@ -100,12 +100,12 @@ fn canonical(p: &Project) -> Canonical {
 fn reimport(project: &Project, pose_file: &CFile) -> Project {
     let out = export(project, "rt_1", "rt_1").unwrap();
     let model = CFile::parse_str(Path::new("rt_1.c"), &out.model_c).unwrap();
-    let tex = CFile::parse_str(Path::new("rt_1_tex.c"), &out.texture_c).unwrap();
+    let tex = CFile::parse_str(Path::new("rt_1_tex.c"), &out.textures.texture_c).unwrap();
     let table = CFile::parse_str(
         Path::new("table.c"),
         &format!(
             "aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};",
-            out.draw_data_entry
+            out.textures.draw_data_entry
         ),
     )
     .unwrap();
@@ -336,6 +336,79 @@ fn export_rasterizes_painted_layers() {
     assert_eq!(canonical(&p), canonical(&again));
 }
 
+/// A texture-only export replaces an existing texture set's source in a
+/// decomp, and only where the villager table will still link.
+#[test]
+fn texture_export_replaces_a_texture_set_in_the_decomp() {
+    use crate::{Decomp, WriteError, export_textures};
+    use mint_core::{PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
+
+    let (mut p, pose) = synthetic_project();
+    let dir = tempfile::tempdir().unwrap();
+    let write = |rel: &str, text: &str| {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    let original = export(&p, "t_1", "t_1").unwrap().textures;
+    write(
+        "src/data/npc/npc_draw_data.c",
+        &format!(
+            "aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};",
+            original.draw_data_entry
+        ),
+    );
+    write("src/data/npc/model/tex/t_1.c", &original.texture_c);
+    std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
+    let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
+
+    let r = VariantRef {
+        texture: TextureId(0),
+        variant: 0,
+    };
+    p.variant_mut(r).add_layer(0, "paint");
+    let size = p.texture(r.texture).size().as_vec2();
+    let dot = Shape::new(
+        shape::ellipse(size / 2.0, size / 4.0),
+        Style::Fill,
+        PaletteIndex(7),
+    );
+    p.insert_shape(r, 0, 0, dot.unwrap()).unwrap();
+    let painted = export_textures(&p, "t_1").unwrap();
+    assert_eq!(painted.model, "t_1");
+    let path = decomp.write_texture_set(&painted).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), painted.texture_c);
+
+    let model = CFile::parse_str(
+        Path::new("t_1.c"),
+        &export(&p, "t_1", "t_1").unwrap().model_c,
+    );
+    let v = decomp.villagers().unwrap().remove(0);
+    let tex = CFile::read(&path, &[]).unwrap();
+    let again = build_project(&model.unwrap(), &tex, &pose, &v).unwrap();
+    assert_eq!(again.variant(r).underlay(), &p.variant(r).rasterize());
+
+    let mut renamed = painted.clone();
+    renamed.texture_set = "t_2".into();
+    assert!(matches!(
+        decomp.write_texture_set(&renamed),
+        Err(WriteError::NotInTable(set)) if set == "t_2"
+    ));
+    let mut other = painted.clone();
+    other.model = "u_1".into();
+    assert!(matches!(
+        decomp.write_texture_set(&other),
+        Err(WriteError::OtherModel { .. })
+    ));
+    let mut fewer = painted.clone();
+    fewer.symbols.pop();
+    let Err(WriteError::Symbols { missing, extra, .. }) = decomp.write_texture_set(&fewer) else {
+        panic!("expected a symbol mismatch");
+    };
+    assert_eq!((missing, extra), (vec!["t_1_tmem_txt".to_owned()], vec![]));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), painted.texture_c);
+}
+
 /// Triangles keep their drawing order even when materials interleave: the
 /// game keeps the first of two coincident triangles.
 #[test]
@@ -358,7 +431,7 @@ fn export_keeps_triangle_order() {
 /// The synthetic project with some parts replaced.
 fn variant_of(p: &Project, target: &str, palette: Palette, model: Model) -> Project {
     Project::new(
-        TargetId(target.into()),
+        mint_core::ExportTarget::new(target),
         palette,
         model,
         p.textures().to_vec(),
@@ -548,12 +621,21 @@ fn every_built_villager_round_trips() {
                     "{}",
                     v.texture_set
                 );
+                let dir = tempfile::tempdir().unwrap();
+                mint_core::file::save(&p, dir.path()).unwrap();
+                let loaded = mint_core::file::load(dir.path()).unwrap();
+                assert!(loaded == p, "{} changed in save and load", v.texture_set);
+                // Its texture-only export could replace its own source.
+                let textures = crate::export_textures(&p, &v.texture_set).unwrap();
+                decomp
+                    .check_texture_set(&textures)
+                    .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));
                 ok += 1;
             }
             Err(e) => refused.push((v.model.clone(), format!("{}: {e}", v.texture_set))),
         }
     }
-    eprintln!("{ok} villagers round-trip");
+    eprintln!("{ok} villagers round-trip, save and load, and could be replaced");
     // Only these may fail: special NPC models the importer cannot represent,
     // and flg_12, whose 0x380-byte body texture is shorter than the 0x400
     // bytes the flg_1 model reads (the game reads past it).

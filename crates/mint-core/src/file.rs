@@ -1,0 +1,772 @@
+//! Saving and loading projects as a directory: `project.ron` holds
+//! everything except images, which sit beside it as PNG files.
+//!
+//! Underlays are 8-bit indexed PNGs whose pixel values are palette indices;
+//! their PNG palette is a copy of the project's for viewing and is ignored on
+//! load. External texture previews are RGBA PNGs. Loading goes through the
+//! same constructors as building a project in code, so a file can't produce
+//! a project that breaks their rules.
+
+use std::collections::BTreeMap;
+use std::io::{BufReader, BufWriter};
+use std::path::{Component, Path, PathBuf};
+
+use glam::{Quat, UVec2, Vec2, Vec3};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    AlphaMode, Anchor, Corner, ExportTarget, IndexedImage, Layer, Material, Mesh, Model, NodeId,
+    Palette, PaletteIndex, Pose, Project, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
+    TextureContent, TextureId, Transform, Triangle, Vertex, Wrap,
+};
+
+/// The project file inside a project directory.
+pub const PROJECT_FILE: &str = "project.ron";
+const IMAGE_DIR: &str = "textures";
+/// Version of the file layout this build reads and writes.
+const FORMAT: u32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SaveError {
+    #[error("{0}: {1}")]
+    Io(PathBuf, std::io::Error),
+    #[error("{0}: {1}")]
+    Png(PathBuf, png::EncodingError),
+    #[error("could not write the project file: {0}")]
+    Ron(#[from] ron::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("{0}: {1}")]
+    Io(PathBuf, std::io::Error),
+    #[error("{0}: {1}")]
+    Ron(PathBuf, Box<ron::error::SpannedError>),
+    #[error("{0}: {1}")]
+    Png(PathBuf, png::DecodingError),
+    #[error("project format {0} is not supported; this build reads format {FORMAT}")]
+    Format(u32),
+    #[error("{0}: {1}")]
+    Image(PathBuf, String),
+    #[error("image path {0:?} must be a relative path inside the project directory")]
+    ImagePath(String),
+    #[error("node {node} names parent {parent}, which is not an earlier node")]
+    Parent { node: usize, parent: u32 },
+    #[error("texture {texture:?} variant {variant:?}: {source}")]
+    Shape {
+        texture: String,
+        variant: String,
+        source: crate::ShapeError,
+    },
+    #[error(transparent)]
+    Texture(#[from] crate::TextureError),
+    #[error(transparent)]
+    Project(#[from] crate::ProjectError),
+}
+
+#[derive(Deserialize)]
+struct Version {
+    format: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProjectFile {
+    format: u32,
+    target: TargetFile,
+    palette: Vec<[u8; 4]>,
+    /// Parents before children; the first node is the root.
+    nodes: Vec<NodeFile>,
+    materials: Vec<MaterialFile>,
+    textures: Vec<TextureFile>,
+    /// Display rotations as quaternions (x, y, z, w), by node.
+    pose: BTreeMap<u32, [f32; 4]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TargetFile {
+    id: String,
+    options: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NodeFile {
+    name: String,
+    parent: Option<u32>,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: [f32; 3],
+    mesh: Option<MeshFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MeshFile {
+    vertices: Vec<VertexFile>,
+    triangles: Vec<TriangleFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VertexFile {
+    position: [f32; 3],
+    normal: [f32; 3],
+    follows: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TriangleFile {
+    material: u32,
+    /// Vertex index and UV of each corner.
+    corners: [(u32, [f32; 2]); 3],
+}
+
+#[derive(Serialize, Deserialize)]
+struct MaterialFile {
+    texture: u32,
+    wrap: [WrapFile; 2],
+    alpha: AlphaFile,
+    double_sided: bool,
+    tint: [u8; 4],
+}
+
+#[derive(Serialize, Deserialize)]
+enum WrapFile {
+    Clamp,
+    Repeat,
+    Mirror,
+}
+
+#[derive(Serialize, Deserialize)]
+enum AlphaFile {
+    Opaque,
+    Cutout,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TextureFile {
+    name: String,
+    slot: String,
+    size: [u32; 2],
+    content: ContentFile,
+}
+
+#[derive(Serialize, Deserialize)]
+enum ContentFile {
+    Painted(Vec<VariantFile>),
+    /// An RGBA PNG.
+    External {
+        preview: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct VariantFile {
+    name: String,
+    /// An 8-bit indexed PNG.
+    underlay: String,
+    layers: Vec<LayerFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LayerFile {
+    name: String,
+    visible: bool,
+    locked: bool,
+    opacity: f32,
+    shapes: Vec<ShapeFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShapeFile {
+    color: u8,
+    style: StyleFile,
+    /// Point, incoming handle, and outgoing handle of each anchor.
+    anchors: Vec<[[f32; 2]; 3]>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum StyleFile {
+    Fill,
+    Stroke { width: f32, closed: bool },
+}
+
+/// Writes `project` into directory `dir`, creating it if needed. Each file is
+/// written beside its destination and renamed into place, the project file
+/// last, so an interrupted save leaves the previous project file readable.
+pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
+    let images = dir.join(IMAGE_DIR);
+    std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    let mut textures = Vec::new();
+    for (t, texture) in project.textures().iter().enumerate() {
+        let content = match texture.content() {
+            TextureContent::Painted(variants) => {
+                let mut out = Vec::new();
+                for (v, variant) in variants.iter().enumerate() {
+                    let rel = format!("{IMAGE_DIR}/{t}-{v}.png");
+                    write_indexed(&dir.join(&rel), variant.underlay(), project.palette())?;
+                    out.push(VariantFile {
+                        name: variant.name.clone(),
+                        underlay: rel,
+                        layers: variant.layers().iter().map(layer_file).collect(),
+                    });
+                }
+                ContentFile::Painted(out)
+            }
+            TextureContent::External { preview } => {
+                let rel = format!("{IMAGE_DIR}/{t}-preview.png");
+                write_rgba(&dir.join(&rel), preview)?;
+                ContentFile::External { preview: rel }
+            }
+        };
+        textures.push(TextureFile {
+            name: texture.name.clone(),
+            slot: texture.slot.0.clone(),
+            size: texture.size().to_array(),
+            content,
+        });
+    }
+    let model = project.model();
+    let file = ProjectFile {
+        format: FORMAT,
+        target: TargetFile {
+            id: project.target().id.clone(),
+            options: project.target().options.clone(),
+        },
+        palette: project
+            .palette()
+            .colors()
+            .iter()
+            .map(|c| c.to_array())
+            .collect(),
+        nodes: model.ids().map(|id| node_file(model, id)).collect(),
+        materials: project.materials().iter().map(material_file).collect(),
+        textures,
+        pose: project
+            .pose()
+            .rotations()
+            .map(|(id, q)| (id.0, q.to_array()))
+            .collect(),
+    };
+    let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(4))?;
+    let path = dir.join(PROJECT_FILE);
+    write_atomic(&path, |w| {
+        std::io::Write::write_all(w, text.as_bytes()).map_err(|e| SaveError::Io(path.clone(), e))
+    })
+}
+
+/// Reads the project in directory `dir`.
+pub fn load(dir: &Path) -> Result<Project, LoadError> {
+    let path = dir.join(PROJECT_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|e| LoadError::Io(path.clone(), e))?;
+    // Read the version alone first, so a newer file reports its version
+    // rather than whatever field changed.
+    let version: Version =
+        ron::from_str(&text).map_err(|e| LoadError::Ron(path.clone(), Box::new(e)))?;
+    if version.format != FORMAT {
+        return Err(LoadError::Format(version.format));
+    }
+    let file: ProjectFile =
+        ron::from_str(&text).map_err(|e| LoadError::Ron(path.clone(), Box::new(e)))?;
+
+    let mut nodes = file.nodes.into_iter().enumerate();
+    let (_, root) = nodes
+        .next()
+        .ok_or(LoadError::Parent { node: 0, parent: 0 })?;
+    let mut model = Model::new(root.name.clone(), transform(&root));
+    model.node_mut(NodeId::ROOT).mesh = root.mesh.map(mesh);
+    for (i, n) in nodes {
+        let parent = match n.parent {
+            Some(p) if (p as usize) < i => NodeId(p),
+            p => {
+                return Err(LoadError::Parent {
+                    node: i,
+                    parent: p.unwrap_or(u32::MAX),
+                });
+            }
+        };
+        let id = model.add_child(parent, n.name.clone(), transform(&n));
+        model.node_mut(id).mesh = n.mesh.map(mesh);
+    }
+
+    let palette = Palette::from_colors(
+        file.palette
+            .iter()
+            .map(|&[r, g, b, a]| Rgba8::new(r, g, b, a)),
+    )
+    .map_err(|e| LoadError::Image(path.clone(), e.to_string()))?;
+    let mut textures = Vec::new();
+    for t in file.textures {
+        let size = UVec2::from_array(t.size);
+        let slot = Slot(t.slot);
+        let texture = match t.content {
+            ContentFile::Painted(variants) => {
+                let underlays = variants
+                    .iter()
+                    .map(|v| {
+                        Ok((
+                            v.name.clone(),
+                            read_indexed(&image_path(dir, &v.underlay)?)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, LoadError>>()?;
+                let mut texture = Texture::painted(t.name.clone(), slot, size, underlays)?;
+                for (variant, file) in texture.variants_mut().iter_mut().zip(variants) {
+                    for (i, l) in file.layers.into_iter().enumerate() {
+                        let layer = layer(l).map_err(|source| LoadError::Shape {
+                            texture: t.name.clone(),
+                            variant: file.name.clone(),
+                            source,
+                        })?;
+                        variant.insert_layer(i, layer);
+                    }
+                }
+                texture
+            }
+            ContentFile::External { preview } => {
+                let image = read_rgba(&image_path(dir, &preview)?)?;
+                if image.size != size {
+                    return Err(LoadError::Image(
+                        image_path(dir, &preview)?,
+                        format!("is {} but the texture is {size}", image.size),
+                    ));
+                }
+                Texture::external(t.name, slot, image)
+            }
+        };
+        textures.push(texture);
+    }
+    let mut pose = Pose::default();
+    for (node, q) in file.pose {
+        pose.set_rotation(NodeId(node), Quat::from_array(q));
+    }
+    Ok(Project::new(
+        ExportTarget {
+            id: file.target.id,
+            options: file.target.options,
+        },
+        palette,
+        model,
+        textures,
+        file.materials.into_iter().map(material).collect(),
+        pose,
+    )?)
+}
+
+fn node_file(model: &Model, id: NodeId) -> NodeFile {
+    let n = model.node(id);
+    NodeFile {
+        name: n.name.clone(),
+        parent: n.parent().map(|p| p.0),
+        translation: n.transform.translation.to_array(),
+        rotation: n.transform.rotation.to_array(),
+        scale: n.transform.scale.to_array(),
+        mesh: n.mesh.as_ref().map(|m| MeshFile {
+            vertices: m
+                .vertices
+                .iter()
+                .map(|v| VertexFile {
+                    position: v.position.to_array(),
+                    normal: v.normal.to_array(),
+                    follows: v.follows.map(|f| f.0),
+                })
+                .collect(),
+            triangles: m
+                .triangles
+                .iter()
+                .map(|t| TriangleFile {
+                    material: t.material.0,
+                    corners: t.corners.map(|c| (c.vertex, c.uv.to_array())),
+                })
+                .collect(),
+        }),
+    }
+}
+
+fn transform(n: &NodeFile) -> Transform {
+    Transform {
+        translation: Vec3::from_array(n.translation),
+        rotation: Quat::from_array(n.rotation),
+        scale: Vec3::from_array(n.scale),
+    }
+}
+
+fn mesh(m: MeshFile) -> Mesh {
+    Mesh {
+        vertices: m
+            .vertices
+            .into_iter()
+            .map(|v| Vertex {
+                position: Vec3::from_array(v.position),
+                normal: Vec3::from_array(v.normal),
+                follows: v.follows.map(NodeId),
+            })
+            .collect(),
+        triangles: m
+            .triangles
+            .into_iter()
+            .map(|t| Triangle {
+                corners: t.corners.map(|(vertex, uv)| Corner {
+                    vertex,
+                    uv: Vec2::from_array(uv),
+                }),
+                material: crate::MaterialId(t.material),
+            })
+            .collect(),
+    }
+}
+
+fn material_file(m: &Material) -> MaterialFile {
+    MaterialFile {
+        texture: m.texture.0,
+        wrap: m.wrap.map(|w| match w {
+            Wrap::Clamp => WrapFile::Clamp,
+            Wrap::Repeat => WrapFile::Repeat,
+            Wrap::Mirror => WrapFile::Mirror,
+        }),
+        alpha: match m.alpha {
+            AlphaMode::Opaque => AlphaFile::Opaque,
+            AlphaMode::Cutout => AlphaFile::Cutout,
+        },
+        double_sided: m.double_sided,
+        tint: m.tint.to_array(),
+    }
+}
+
+fn material(m: MaterialFile) -> Material {
+    let [r, g, b, a] = m.tint;
+    Material {
+        texture: TextureId(m.texture),
+        wrap: m.wrap.map(|w| match w {
+            WrapFile::Clamp => Wrap::Clamp,
+            WrapFile::Repeat => Wrap::Repeat,
+            WrapFile::Mirror => Wrap::Mirror,
+        }),
+        alpha: match m.alpha {
+            AlphaFile::Opaque => AlphaMode::Opaque,
+            AlphaFile::Cutout => AlphaMode::Cutout,
+        },
+        double_sided: m.double_sided,
+        tint: Rgba8::new(r, g, b, a),
+    }
+}
+
+fn layer_file(l: &Layer) -> LayerFile {
+    LayerFile {
+        name: l.name.clone(),
+        visible: l.visible,
+        locked: l.locked,
+        opacity: l.opacity,
+        shapes: l
+            .shapes()
+            .iter()
+            .map(|s| ShapeFile {
+                color: s.color().0,
+                style: match s.style() {
+                    Style::Fill => StyleFile::Fill,
+                    Style::Stroke { width, closed } => StyleFile::Stroke { width, closed },
+                },
+                anchors: s
+                    .anchors()
+                    .iter()
+                    .map(|a| {
+                        [
+                            a.point.to_array(),
+                            a.handle_in.to_array(),
+                            a.handle_out.to_array(),
+                        ]
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn layer(l: LayerFile) -> Result<Layer, crate::ShapeError> {
+    let mut layer = Layer::new(l.name);
+    layer.visible = l.visible;
+    layer.locked = l.locked;
+    layer.opacity = l.opacity;
+    for (i, s) in l.shapes.into_iter().enumerate() {
+        let style = match s.style {
+            StyleFile::Fill => Style::Fill,
+            StyleFile::Stroke { width, closed } => Style::Stroke { width, closed },
+        };
+        let anchors = s
+            .anchors
+            .into_iter()
+            .map(|[p, i, o]| Anchor {
+                point: Vec2::from_array(p),
+                handle_in: Vec2::from_array(i),
+                handle_out: Vec2::from_array(o),
+            })
+            .collect();
+        layer.insert_shape(i, Shape::new(anchors, style, PaletteIndex(s.color))?);
+    }
+    Ok(layer)
+}
+
+/// Resolves an image path from the project file, which must stay inside
+/// the project directory.
+fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
+    let path = Path::new(rel);
+    if path.components().all(|c| matches!(c, Component::Normal(_))) {
+        Ok(dir.join(path))
+    } else {
+        Err(LoadError::ImagePath(rel.to_owned()))
+    }
+}
+
+fn write_atomic(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<std::fs::File>) -> Result<(), SaveError>,
+) -> Result<(), SaveError> {
+    let io = |e| SaveError::Io(path.to_owned(), e);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut w = BufWriter::new(std::fs::File::create(&tmp).map_err(io)?);
+    write(&mut w)?;
+    w.into_inner()
+        .map_err(|e| io(e.into_error()))?
+        .sync_all()
+        .map_err(io)?;
+    std::fs::rename(&tmp, path).map_err(io)
+}
+
+fn write_indexed(path: &Path, image: &IndexedImage, palette: &Palette) -> Result<(), SaveError> {
+    write_atomic(path, |w| {
+        let png_err = |e| SaveError::Png(path.to_owned(), e);
+        let mut enc = png::Encoder::new(w, image.size().x, image.size().y);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut colors = palette.colors().to_vec();
+        if colors.is_empty() {
+            // PNG needs a palette entry; an image over an empty palette has
+            // no pixels to use it.
+            colors.push(Rgba8::new(0, 0, 0, 255));
+        }
+        enc.set_palette(
+            colors
+                .iter()
+                .flat_map(|c| [c.r, c.g, c.b])
+                .collect::<Vec<_>>(),
+        );
+        enc.set_trns(colors.iter().map(|c| c.a).collect::<Vec<_>>());
+        let pixels: Vec<u8> = image.pixels().iter().map(|i| i.0).collect();
+        enc.write_header()
+            .and_then(|mut w| w.write_image_data(&pixels))
+            .map_err(png_err)
+    })
+}
+
+fn write_rgba(path: &Path, image: &RgbaImage) -> Result<(), SaveError> {
+    write_atomic(path, |w| {
+        let mut enc = png::Encoder::new(w, image.size.x, image.size.y);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let pixels: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+        enc.write_header()
+            .and_then(|mut w| w.write_image_data(&pixels))
+            .map_err(|e| SaveError::Png(path.to_owned(), e))
+    })
+}
+
+/// Decodes a PNG with no color conversion, returning its size, color type,
+/// and pixel bytes.
+fn read_png(path: &Path) -> Result<(UVec2, png::ColorType, png::BitDepth, Vec<u8>), LoadError> {
+    let file = std::fs::File::open(path).map_err(|e| LoadError::Io(path.to_owned(), e))?;
+    let png_err = |e| LoadError::Png(path.to_owned(), e);
+    let mut dec = png::Decoder::new(BufReader::new(file));
+    dec.set_transformations(png::Transformations::IDENTITY);
+    let mut reader = dec.read_info().map_err(png_err)?;
+    let mut buf = vec![
+        0;
+        reader.output_buffer_size().ok_or_else(|| LoadError::Image(
+            path.to_owned(),
+            "is too large".into()
+        ))?
+    ];
+    let info = reader.next_frame(&mut buf).map_err(png_err)?;
+    buf.truncate(info.buffer_size());
+    Ok((
+        UVec2::new(info.width, info.height),
+        info.color_type,
+        info.bit_depth,
+        buf,
+    ))
+}
+
+fn read_indexed(path: &Path) -> Result<IndexedImage, LoadError> {
+    let (size, color, depth, pixels) = read_png(path)?;
+    if (color, depth) != (png::ColorType::Indexed, png::BitDepth::Eight) {
+        return Err(LoadError::Image(
+            path.to_owned(),
+            "must be an 8-bit indexed PNG".into(),
+        ));
+    }
+    IndexedImage::new(size, pixels.into_iter().map(PaletteIndex).collect())
+        .map_err(|e| LoadError::Image(path.to_owned(), e.to_string()))
+}
+
+fn read_rgba(path: &Path) -> Result<RgbaImage, LoadError> {
+    let (size, color, depth, pixels) = read_png(path)?;
+    if (color, depth) != (png::ColorType::Rgba, png::BitDepth::Eight) {
+        return Err(LoadError::Image(
+            path.to_owned(),
+            "must be an 8-bit RGBA PNG".into(),
+        ));
+    }
+    let pixels = pixels
+        .chunks_exact(4)
+        .map(|p| Rgba8::new(p[0], p[1], p[2], p[3]))
+        .collect();
+    Ok(RgbaImage { size, pixels })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{VariantRef, shape};
+
+    fn sample() -> Project {
+        let palette =
+            Palette::from_colors([Rgba8::new(1, 2, 3, 255), Rgba8::new(200, 100, 0, 128)]).unwrap();
+        let mut model = Model::new("root", Transform::from_translation(Vec3::X));
+        let child = model.add_child(NodeId::ROOT, "head", Transform::default());
+        model.node_mut(child).mesh = Some(Mesh {
+            vertices: vec![
+                Vertex {
+                    position: Vec3::ZERO,
+                    normal: Vec3::Y,
+                    follows: Some(NodeId::ROOT),
+                },
+                Vertex {
+                    position: Vec3::X,
+                    normal: Vec3::Y,
+                    follows: None,
+                },
+                Vertex {
+                    position: Vec3::Z,
+                    normal: Vec3::Y,
+                    follows: None,
+                },
+            ],
+            triangles: vec![Triangle {
+                corners: [0, 1, 2].map(|vertex| Corner {
+                    vertex,
+                    uv: Vec2::new(0.25, 0.5),
+                }),
+                material: crate::MaterialId(0),
+            }],
+        });
+        let underlay = IndexedImage::new(
+            UVec2::new(4, 2),
+            [0, 1, 1, 0, 1, 0, 0, 1].map(PaletteIndex).to_vec(),
+        )
+        .unwrap();
+        let painted = Texture::painted(
+            "eyes",
+            Slot("eyes".into()),
+            UVec2::new(4, 2),
+            [
+                ("1".to_owned(), underlay.clone()),
+                ("2".to_owned(), underlay),
+            ],
+        )
+        .unwrap();
+        let mut preview = RgbaImage::filled(UVec2::new(2, 2), Rgba8::new(9, 8, 7, 6));
+        preview.pixels[3] = Rgba8::new(1, 1, 1, 1);
+        let external = Texture::external("shirt", Slot("clothing".into()), preview);
+        let mut pose = Pose::default();
+        pose.set_rotation(child, Quat::from_rotation_z(0.5));
+        let mut target = ExportTarget::new("test");
+        target.options.insert("model".into(), "cat_1".into());
+        let mut p = Project::new(
+            target,
+            palette,
+            model,
+            vec![painted, external],
+            vec![Material {
+                texture: TextureId(0),
+                wrap: [Wrap::Mirror, Wrap::Clamp],
+                alpha: AlphaMode::Cutout,
+                double_sided: true,
+                tint: Rgba8::new(255, 250, 240, 255),
+            }],
+            pose,
+        )
+        .unwrap();
+        let r = VariantRef {
+            texture: TextureId(0),
+            variant: 1,
+        };
+        p.variant_mut(r).add_layer(0, "low");
+        p.variant_mut(r).add_layer(1, "high");
+        p.variant_mut(r).layer_mut(1).opacity = 0.5;
+        p.variant_mut(r).layer_mut(1).locked = true;
+        let stroke = Style::Stroke {
+            width: 1.5,
+            closed: true,
+        };
+        let shapes = [
+            (
+                1,
+                Shape::new(
+                    shape::ellipse(Vec2::splat(2.0), Vec2::ONE),
+                    stroke,
+                    PaletteIndex(1),
+                ),
+            ),
+            (
+                0,
+                Shape::new(
+                    shape::rectangle(Vec2::ZERO, Vec2::ONE),
+                    Style::Fill,
+                    PaletteIndex(0),
+                ),
+            ),
+        ];
+        for (layer, s) in shapes {
+            p.insert_shape(r, layer, 0, s.unwrap()).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn save_then_load_gives_the_same_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sample();
+        save(&p, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), p);
+        // Saving again over the same directory works too.
+        save(&p, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), p);
+    }
+
+    #[test]
+    fn load_refuses_other_formats_and_escaping_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        save(&sample(), dir.path()).unwrap();
+        let path = dir.path().join(PROJECT_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::write(&path, text.replace("format: 1", "format: 2")).unwrap();
+        assert!(matches!(load(dir.path()), Err(LoadError::Format(2))));
+
+        std::fs::write(
+            &path,
+            text.replace("\"textures/0-0.png\"", "\"../0-0.png\""),
+        )
+        .unwrap();
+        assert!(matches!(load(dir.path()), Err(LoadError::ImagePath(p)) if p == "../0-0.png"));
+
+        // An underlay pixel past the palette's end fails as a project would.
+        let one_color = text.replace("(200, 100, 0, 128),", "");
+        assert_ne!(one_color, text);
+        std::fs::write(&path, one_color).unwrap();
+        assert!(matches!(
+            load(dir.path()),
+            Err(LoadError::Project(
+                crate::ProjectError::MissingPaletteEntry { index: 1, .. }
+            ))
+        ));
+    }
+}
