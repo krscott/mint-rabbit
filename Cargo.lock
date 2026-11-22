@@ -1248,6 +1248,8 @@ dependencies = [
  "glam",
  "mint-ac",
  "mint-core",
+ "png",
+ "pollster",
 ]
 
 [[package]]

@@ -12,3 +12,7 @@ mint-core = { version = "0.1.0", path = "../mint-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+png = "0.18.1"
+pollster = "1.0.3"

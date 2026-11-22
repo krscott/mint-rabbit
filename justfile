@@ -14,7 +14,24 @@ test:
 
 # Run tests that read an ac-decomp checkout (DECOMP defaults to .multi/repos/ac-decomp).
 test-decomp decomp=".multi/repos/ac-decomp":
-    MINT_AC_DECOMP="$(realpath {{ decomp }})" cargo test --locked --workspace -- --include-ignored
+    MINT_AC_DECOMP="$(realpath {{ decomp }})" cargo test --locked -p mint-ac -- --include-ignored
+
+# Write a generated demo villager as a decomp-shaped directory and open it.
+demo dir="target/demo-decomp":
+    cargo run --locked -q -p mint-ac --example demo_decomp -- {{ dir }}
+    cargo run --locked -p mint-rabbit -- --decomp {{ dir }}
+
+# Render the first villager of DECOMP (default: the demo) to target/model-view.png; needs a GPU.
+snapshot decomp="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    decomp='{{ decomp }}'
+    if [[ -z "$decomp" ]]; then
+        decomp=target/demo-decomp
+        cargo run --locked -q -p mint-ac --example demo_decomp -- "$decomp"
+    fi
+    MINT_AC_DECOMP="$(realpath "$decomp")" MINT_SNAPSHOT="$PWD/target/model-view.png" \
+        cargo test --locked -p mint-rabbit -- --ignored model_view_snapshot
 
 clippy:
     cargo clippy --locked --workspace --all-targets -- -D warnings
