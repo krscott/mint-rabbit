@@ -346,8 +346,8 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
         .to_vec()
 }
 
-/// Smooth anchors through a freehand stroke: the points are simplified to
-/// those within `tolerance` texels of the stroke, then joined by
+/// Smooth anchors through a freehand stroke: the points are simplified to a
+/// polyline within `tolerance` texels of the stroke, then joined by
 /// Catmull-Rom curves. Ends and turns sharper than a right angle stay
 /// corners. Each handle keeps its Catmull-Rom direction but is at most a
 /// third of the segment it shapes and strays at most 4/3 `tolerance` to the
@@ -356,6 +356,8 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 /// points.
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
+    // A negative or NaN tolerance means none.
+    let tolerance = if tolerance >= 0.0 { tolerance } else { 0.0 };
     let mut kept = Vec::new();
     if let Some(&first) = points.first() {
         kept.push(first);
@@ -372,7 +374,7 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
             // chord.
             let bound = |h: Vec2, segment: Vec2| {
                 let side = segment.normalize_or_zero().perp_dot(h).abs();
-                let max_side = tolerance.max(0.0) * 4.0 / 3.0;
+                let max_side = tolerance * 4.0 / 3.0;
                 let h = if side > max_side {
                     h * (max_side / side)
                 } else {
@@ -619,7 +621,8 @@ mod tests {
         let out = anchors[1].handle_out;
         assert!(out.y == 0.0 && out.x > 0.0 && out.x < 10.0 / 6.0, "{out}");
         assert_eq!(anchors[1].handle_in, -out);
-        // A right-angle stroke stays within twice the tolerance of itself.
+        // A right-angle stroke stays within the tolerance of its simplified
+        // line, here the stroke itself.
         let mut ell: Vec<Vec2> = (0..=30).map(|x| Vec2::new(x as f32, 0.0)).collect();
         ell.extend((1..=30).map(|y| Vec2::new(30.0, y as f32)));
         let stroke = Style::Stroke {
@@ -639,7 +642,7 @@ mod tests {
         .unwrap()
         .outline();
         for &p in o.points() {
-            assert!(drawn.distance(p) <= 1.0 + 1e-4, "{p}");
+            assert!(drawn.distance(p) <= 0.5 + 1e-4, "{p}");
         }
         // A stroke that doubles back keeps its far end, as a corner.
         let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
