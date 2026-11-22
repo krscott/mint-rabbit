@@ -111,7 +111,7 @@ fn reimport(project: &Project, pose_file: &CFile) -> Project {
     let out = export(project, "rt_1", "rt_1").unwrap();
     let model = CFile::parse_str(Path::new("rt_1.c"), &out.model_c).unwrap();
     let tex = CFile::parse_str(Path::new("rt_1_tex.c"), &out.textures.texture_c).unwrap();
-    let v = table_row(&out.textures.table_entry(None));
+    let v = table_row(&out.textures.table_entry(None).unwrap());
     build_project(&model, &tex, pose_file, &v).unwrap()
 }
 
@@ -398,7 +398,7 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
     assert_eq!(again.variant(r).underlay(), &p.variant(r).rasterize());
 
     // A new villager's entry copies the base's settings.
-    let entry = painted.table_entry(Some(&v));
+    let entry = painted.table_entry(Some(&v)).unwrap();
     assert!(entry.contains("1, TEXTURE_BANK"), "{entry}");
     assert!(entry.contains("0, 32, 128 }"), "{entry}");
     assert!(entry.contains("0.009, 0"), "{entry}");
@@ -416,10 +416,10 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
         Err(WriteError::OtherModel { .. })
     ));
     let mut resized = painted.clone();
-    resized.layout[0].1 /= 2;
+    resized.texture_sizes[0].1 /= 2;
     assert!(matches!(
         decomp.write_texture_set(&resized),
-        Err(WriteError::Layout { .. })
+        Err(WriteError::TextureSizes { .. })
     ));
     let mut swapped = painted.clone();
     swapped.symbols.eyes.swap(1, 2);
@@ -665,7 +665,7 @@ fn every_built_villager_round_trips() {
                 // Its texture-only export could replace its own source, and
                 // a table entry based on it parses back to the same row.
                 let textures = crate::export_textures(&p, &v.texture_set).unwrap();
-                let mut row = table_row(&textures.table_entry(Some(&v)));
+                let mut row = table_row(&textures.table_entry(Some(&v)).unwrap());
                 row.index = v.index;
                 assert_eq!(row, v, "{}", v.texture_set);
                 decomp

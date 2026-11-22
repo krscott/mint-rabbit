@@ -9,8 +9,8 @@ mod gx;
 mod import;
 
 pub use export::{
-    Export, ExportError, TextureExport, VILLAGER_JOINT_CHILDREN, export, export_textures,
-    imported_from,
+    Export, ExportError, ImportedFrom, TextureExport, VILLAGER_JOINT_CHILDREN, export,
+    export_textures, imported_from,
 };
 /// The color the game shows for a palette entry.
 pub use gx::quantize_rgb5a3 as quantize_color;

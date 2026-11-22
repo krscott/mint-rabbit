@@ -222,9 +222,8 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     let mut image = |stem: String, png: Vec<u8>| -> Result<String, SaveError> {
         let rel = format!("{IMAGE_DIR}/{stem}-{:016x}.png", fnv1a(&png));
         let path = dir.join(&rel);
-        if !path.is_file() {
-            write_atomic(&path, &png).map_err(|e| SaveError::Io(path.clone(), e))?;
-        }
+        // Written even when present, in case the file was changed since.
+        write_atomic(&path, &png).map_err(|e| SaveError::Io(path.clone(), e))?;
         written.push(path);
         Ok(rel)
     };
@@ -606,14 +605,22 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
 /// Replaces the file at `path` with `bytes` all at once: they are written
 /// to a new, uniquely named file beside it (never one already there, such as
 /// a planted link), synced, and renamed over it, and the directory is synced
-/// so the rename survives a power loss. A failed write removes the new file
-/// and leaves the old one.
+/// so the rename survives a power loss. The file keeps the permissions of
+/// the one it replaces, and a new file gets the usual ones for the umask. A
+/// failed write removes the new file and leaves the old one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let permissions = std::fs::metadata(path).map_or_else(
+        |_| std::fs::Permissions::from_mode(0o666),
+        |m| m.permissions(),
+    );
+    let mut tmp = tempfile::Builder::new()
+        .permissions(permissions)
+        .tempfile_in(dir)?;
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -861,6 +868,21 @@ mod tests {
                 .iter()
                 .all(|f| !first.contains(f) || f.to_string_lossy().contains("preview"))
         );
+    }
+
+    #[test]
+    fn writes_keep_the_replaced_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.c");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

@@ -74,11 +74,11 @@ pub enum WriteError {
     #[error(
         "the textures differ in slot or size from those model {model} reads for {texture_set}: it reads {expected:?}, the export has {actual:?}"
     )]
-    Layout {
+    TextureSizes {
         model: String,
         texture_set: String,
-        expected: Vec<(String, UVec2)>,
-        actual: Vec<(String, UVec2)>,
+        expected: Vec<(Slot, UVec2)>,
+        actual: Vec<(Slot, UVec2)>,
     },
     #[error(
         "the villager table lists {texture_set}'s arrays as {table:?}, but the export names them {export:?}"
@@ -176,6 +176,14 @@ impl Decomp {
         parse_villagers(&file)
     }
 
+    /// The villager table entry for texture set `texture_set`.
+    pub fn villager(&self, texture_set: &str) -> Result<VillagerRef, WriteError> {
+        self.villagers()?
+            .into_iter()
+            .find(|v| v.texture_set == texture_set)
+            .ok_or_else(|| WriteError::NotInTable(texture_set.to_owned()))
+    }
+
     fn texture_path(texture_set: &str) -> String {
         format!("src/data/npc/model/tex/{texture_set}.c")
     }
@@ -187,11 +195,7 @@ impl Decomp {
     /// arrays, so the table still links. Returns the path of that file.
     pub fn check_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
         let set = &export.texture_set;
-        let v = self
-            .villagers()?
-            .into_iter()
-            .find(|v| &v.texture_set == set)
-            .ok_or_else(|| WriteError::NotInTable(set.clone()))?;
+        let v = self.villager(set)?;
         if v.model != export.model {
             return Err(WriteError::OtherModel {
                 texture_set: set.clone(),
@@ -214,13 +218,13 @@ impl Decomp {
                 export: ours,
             });
         }
-        let expected = crate::export::texture_layout(&self.import(&v)?);
-        if expected != export.layout {
-            return Err(WriteError::Layout {
+        let expected = crate::export::texture_sizes(&self.import(&v)?);
+        if expected != export.texture_sizes {
+            return Err(WriteError::TextureSizes {
                 model: v.model,
                 texture_set: set.clone(),
                 expected,
-                actual: export.layout.clone(),
+                actual: export.texture_sizes.clone(),
             });
         }
         let rel = Self::texture_path(set);

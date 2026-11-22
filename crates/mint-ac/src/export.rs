@@ -5,7 +5,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use mint_core::{AlphaMode, MaterialId, NodeId, Project, Texture, TextureContent, TextureId, Wrap};
+use mint_core::{
+    AlphaMode, MaterialId, NodeId, Project, Slot, Texture, TextureContent, TextureId, Wrap,
+};
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
@@ -88,7 +90,7 @@ pub struct TextureExport {
     pub(crate) symbols: TextureSymbols,
     /// Slot and size of each of the project's textures, in order, which
     /// together set where the model finds each one.
-    pub(crate) layout: Vec<(String, glam::UVec2)>,
+    pub(crate) texture_sizes: Vec<(Slot, glam::UVec2)>,
 }
 
 /// Names of the arrays a texture set defines.
@@ -160,9 +162,14 @@ impl TextureExport {
     /// on the same model, or leaves `MODEL_BANK` and comments to fill in
     /// without one. `TEXTURE_BANK` is always left to replace with the new
     /// texture set's object bank.
-    #[must_use]
-    pub fn table_entry(&self, base: Option<&VillagerRef>) -> String {
-        let base = base.filter(|b| b.model == self.model);
+    pub fn table_entry(&self, base: Option<&VillagerRef>) -> Result<String, crate::WriteError> {
+        if let Some(b) = base.filter(|b| b.model != self.model) {
+            return Err(crate::WriteError::OtherModel {
+                texture_set: b.texture_set.clone(),
+                actual: b.model.clone(),
+                expected: self.model.clone(),
+            });
+        }
         let list = |names: &[String], len: usize| {
             (0..len)
                 .map(|i| names.get(i).map_or("NULL", String::as_str).to_owned())
@@ -182,7 +189,7 @@ impl TextureExport {
             ),
         };
         let s = &self.symbols;
-        format!(
+        Ok(format!(
             "    {{
         {model_bank}, TEXTURE_BANK,
         &cKF_bs_r_{},
@@ -195,7 +202,7 @@ impl TextureExport {
             s.palette,
             list(&s.eyes, EYE_VARIANTS),
             list(&s.mouths, MOUTH_VARIANTS),
-        )
+        ))
     }
 
     /// Writes `<texture_set>.c`, and `<texture_set>_draw_data.txt` with the
@@ -214,6 +221,7 @@ impl TextureExport {
         std::fs::create_dir_all(dir).map_err(io(dir))?;
         let c = dir.join(format!("{set}.c"));
         let table = dir.join(format!("{set}_draw_data.txt"));
+        let entry = self.table_entry(base)?;
         let notes = format!(
             "// To add texture set {set} to the decomp:
 // 1. Copy {set}.c to src/data/npc/model/tex/{set}.c.
@@ -232,9 +240,9 @@ impl TextureExport {
             if base.is_some() {
                 ""
             } else {
-                " and filling in the commented fields"
+                ", MODEL_BANK with the model's, and the commented fields with the base villager's"
             },
-            self.table_entry(base)
+            entry
         );
         mint_core::file::write_atomic(&c, self.texture_c.as_bytes()).map_err(io(&c))?;
         mint_core::file::write_atomic(&table, notes.as_bytes()).map_err(io(&table))?;
@@ -858,11 +866,11 @@ fn prepare(project: &Project, texture_set: &str) -> Result<Layout, ExportError> 
 }
 
 /// Slot and size of each texture, in order.
-pub(crate) fn texture_layout(project: &Project) -> Vec<(String, glam::UVec2)> {
+pub(crate) fn texture_sizes(project: &Project) -> Vec<(Slot, glam::UVec2)> {
     project
         .textures()
         .iter()
-        .map(|t| (t.slot.0.clone(), t.size()))
+        .map(|t| (t.slot.clone(), t.size()))
         .collect()
 }
 
@@ -877,7 +885,7 @@ fn texture_export(
         texture_set: texture_set.to_owned(),
         texture_c: texture_c(project, texture_set, layout),
         symbols: TextureSymbols::new(texture_set, layout),
-        layout: texture_layout(project),
+        texture_sizes: texture_sizes(project),
     }
 }
 
@@ -891,9 +899,18 @@ pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Expor
     })
 }
 
+/// Where an AC project was imported from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedFrom<'a> {
+    /// The model, such as `cat_1`.
+    pub model: &'a str,
+    /// The texture set, such as `cat_2`.
+    pub texture_set: &'a str,
+}
+
 /// The model and texture set an AC project was imported from, as recorded in
 /// its [`OPTION_MODEL`] and [`OPTION_TEXTURE_SET`] target options.
-pub fn imported_from(project: &Project) -> Result<(&str, &str), ExportError> {
+pub fn imported_from(project: &Project) -> Result<ImportedFrom<'_>, ExportError> {
     let option = |key: &'static str| {
         project
             .target()
@@ -902,13 +919,16 @@ pub fn imported_from(project: &Project) -> Result<(&str, &str), ExportError> {
             .map(String::as_str)
             .ok_or(ExportError::MissingOption(key))
     };
-    Ok((option(OPTION_MODEL)?, option(OPTION_TEXTURE_SET)?))
+    Ok(ImportedFrom {
+        model: option(OPTION_MODEL)?,
+        texture_set: option(OPTION_TEXTURE_SET)?,
+    })
 }
 
 /// Exports only the textures of `project`, as texture set `texture_set` for
 /// the unchanged model it was imported from (see [`imported_from`]).
 pub fn export_textures(project: &Project, texture_set: &str) -> Result<TextureExport, ExportError> {
-    let (model, _) = imported_from(project)?;
+    let model = imported_from(project)?.model;
     check_name(model)?;
     let layout = prepare(project, texture_set)?;
     Ok(texture_export(project, model, texture_set, &layout))
