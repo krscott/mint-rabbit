@@ -230,6 +230,17 @@ impl TextureView {
         self.pen.clear();
     }
 
+    /// Cancels a drag in progress: a drawing is dropped, the pen's path
+    /// with it, and a transform's edits are rolled back.
+    fn cancel_drag(&mut self, editor: &mut Editor) {
+        match self.drag.take() {
+            Some(Drag::PenHandle) => self.pen.clear(),
+            Some(_) => {}
+            None => return,
+        }
+        editor.revert_gesture(CANVAS_DRAG);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, f: Frame<'_>) {
         if self.zoom == 0.0 {
             self.zoom = 1.0;
@@ -292,7 +303,8 @@ impl TextureView {
         if f.input {
             self.interact(ui, &response, at, f, r);
         } else {
-            self.cancel();
+            self.cancel_drag(f.editor);
+            self.pen.clear();
             self.overlay(ui, f.editor.project(), r, f.selection, at, None, f.tool);
         }
     }
@@ -388,6 +400,8 @@ impl TextureView {
                 .input(|i| i.pointer.press_origin())
                 .map(|p| at.to_texture(p))
         {
+            // A canvas drag ends any other control's open edit.
+            editor.end_gesture();
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
             self.targets = (selection.layer, selection.shapes.clone());
         } else if response.clicked()
@@ -446,21 +460,18 @@ impl TextureView {
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
         let cancelled = escape && self.drag.is_some();
         if cancelled {
-            // A drawing is dropped, the pen's path with it, and a
-            // transform's edits are rolled back.
-            if matches!(self.drag.take(), Some(Drag::PenHandle)) {
-                self.pen.clear();
-            }
-            editor.revert_gesture(CANVAS_DRAG);
+            self.cancel_drag(editor);
         } else if response.drag_stopped() {
-            // Only the primary button's release finishes a drawing.
-            let drag = self.drag.take();
-            if let Some(drag) = drag
-                && response.drag_stopped_by(PointerButton::Primary)
-            {
-                finish_drag(editor, drag, selection, r, paint, message);
+            // Only the primary button's release finishes a drag; any other
+            // end cancels it.
+            if response.drag_stopped_by(PointerButton::Primary) {
+                if let Some(drag) = self.drag.take() {
+                    finish_drag(editor, drag, selection, r, paint, message);
+                }
+                editor.end_gesture();
+            } else {
+                self.cancel_drag(editor);
             }
-            editor.end_gesture();
         }
 
         // Keys, while the view has the pointer.
