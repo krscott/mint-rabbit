@@ -821,9 +821,14 @@ fn replace_picked(editor: &mut Editor, r: VariantRef, selection: &Selection, sha
     let (layer, picked) = (selection.layer, selection.shapes.clone());
     // A drag's edits undo as one step.
     let _ = editor.edit_variant_continuous("canvas drag", r, |v| {
-        let slots = v.layers_mut()[layer].shapes_mut();
+        let Some(l) = v.layers_mut().get_mut(layer) else {
+            return;
+        };
+        let slots = l.shapes_mut();
         for (&i, s) in picked.iter().zip(shapes) {
-            slots[i] = s;
+            if let Some(slot) = slots.get_mut(i) {
+                *slot = s;
+            }
         }
     });
 }

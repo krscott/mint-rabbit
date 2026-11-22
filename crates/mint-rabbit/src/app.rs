@@ -70,6 +70,20 @@ impl Doc {
         })
     }
 
+    /// Undoes the last step. Picks are dropped, since shapes may have moved
+    /// between the indices they name.
+    fn undo(&mut self) {
+        self.editor.undo();
+        self.selection.shapes.clear();
+        self.selection.anchor = None;
+    }
+
+    fn redo(&mut self) {
+        self.editor.redo();
+        self.selection.shapes.clear();
+        self.selection.anchor = None;
+    }
+
     fn name(&self) -> String {
         if let Some(p) = self.editor.path() {
             return p.file_name().map_or_else(
@@ -448,13 +462,13 @@ impl App {
                 .add_enabled(doc.editor.can_undo(), egui::Button::new("Undo"))
                 .clicked()
             {
-                doc.editor.undo();
+                doc.undo();
             }
             if ui
                 .add_enabled(doc.editor.can_redo(), egui::Button::new("Redo"))
                 .clicked()
             {
-                doc.editor.redo();
+                doc.redo();
             }
         });
         // Undo, redo, and deletes can leave picks that no longer exist.
@@ -681,13 +695,13 @@ impl App {
         let held = ctx.input(|i| i.pointer.any_down());
         if !held && (pressed(shift_command(Key::Z)) || pressed(command(Key::Y))) {
             if let Some(d) = &mut self.doc {
-                d.editor.redo();
+                d.redo();
             }
         } else if !held
             && pressed(command(Key::Z))
             && let Some(d) = &mut self.doc
         {
-            d.editor.undo();
+            d.undo();
         }
         if pressed(command(Key::S)) && self.doc.is_some() {
             self.save();
