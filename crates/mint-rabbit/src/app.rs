@@ -824,7 +824,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Discard(Replace::Quit));
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        // Controls wait while a canvas drag is in progress, so nothing (an
+        // export, a save) acts on a drag that may still be cancelled.
+        let idle = !self.texture_view.dragging();
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_enabled_ui(idle, |ui| self.top_bar(ui));
+        });
         egui::Panel::bottom("status").show(ui, |ui| match &self.status {
             Some(Status::Error(e)) => {
                 ui.colored_label(Color32::from_rgb(255, 110, 110), e);
@@ -840,7 +845,9 @@ impl eframe::App for App {
             .default_size(300.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
-                    .show(ui, |ui| self.side_panel(ui))
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(idle, |ui| self.side_panel(ui)).inner
+                    })
                     .inner
             })
             .inner;

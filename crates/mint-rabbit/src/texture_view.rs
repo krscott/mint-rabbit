@@ -225,6 +225,12 @@ impl Placement {
 
 impl TextureView {
     /// Cancels any drawing in progress, as when the tool or texture changes.
+    /// Whether a drag is in progress, during which nothing else should
+    /// change the project.
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
     pub fn cancel(&mut self) {
         self.drag = None;
         self.pen.clear();
@@ -463,8 +469,18 @@ impl TextureView {
             self.cancel_drag(editor);
         } else if response.drag_stopped() {
             // Only the primary button's release finishes a drag; any other
-            // end cancels it.
-            if response.drag_stopped_by(PointerButton::Primary) {
+            // end cancels it, decided by the frame's first release.
+            let first_release = ui.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: false,
+                        ..
+                    } => Some(*button),
+                    _ => None,
+                })
+            });
+            if first_release == Some(PointerButton::Primary) {
                 if let Some(drag) = self.drag.take() {
                     finish_drag(editor, drag, selection, r, paint, message);
                 }
