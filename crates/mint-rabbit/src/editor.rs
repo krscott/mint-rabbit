@@ -27,6 +27,9 @@ pub struct Editor {
     path: Option<PathBuf>,
     undo: Vec<Project>,
     redo: Vec<Project>,
+    /// What could be redone before the open continuous edit cleared it,
+    /// restored if that edit is reverted.
+    gesture_redo: Vec<Project>,
     gesture: Gesture,
     /// Whether there are changes since the last open or save.
     dirty: bool,
@@ -41,6 +44,7 @@ impl Editor {
             path,
             undo: Vec::new(),
             redo: Vec::new(),
+            gesture_redo: Vec::new(),
             gesture: Gesture::None,
             dirty: false,
             generation: 0,
@@ -130,7 +134,9 @@ impl Editor {
                 Gesture::Open { recorded: true, .. } => {}
                 Gesture::Open { recorded, .. } => {
                     *recorded = true;
+                    let redo = std::mem::take(&mut self.redo);
                     self.push_undo(before);
+                    self.gesture_redo = redo;
                 }
                 Gesture::None => self.push_undo(before),
             }
@@ -147,6 +153,9 @@ impl Editor {
             && let Some(before) = self.undo.pop()
         {
             self.project = before;
+            self.redo = std::mem::take(&mut self.gesture_redo);
+            // Saved mid-edit, the file may hold what was reverted.
+            self.dirty = true;
             self.generation += 1;
         }
         self.end_gesture();
@@ -155,6 +164,7 @@ impl Editor {
     /// Ends a continuous edit, so the next edit is a step of its own.
     pub fn end_gesture(&mut self) {
         self.gesture = Gesture::None;
+        self.gesture_redo.clear();
     }
 
     fn push_undo(&mut self, before: Project) {
@@ -282,6 +292,16 @@ mod tests {
         e.undo();
         assert_eq!(current(&e), 0);
         assert!(!e.can_undo());
+
+        // What could be redone before it still can be.
+        e.edit_continuous("drag", |p| {
+            p.set_palette_color(PaletteIndex(0), Rgba8::new(9, 0, 0, 255))
+        })
+        .unwrap();
+        assert!(!e.can_redo());
+        e.revert_gesture();
+        e.redo();
+        assert_eq!(current(&e), 1);
     }
 
     #[test]

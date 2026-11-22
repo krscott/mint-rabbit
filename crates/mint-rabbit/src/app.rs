@@ -690,17 +690,16 @@ impl App {
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
         // Text fields keep their own undo, and nothing changes the project
         // under an open confirmation.
-        if ctx.text_edit_focused() || self.confirm.is_some() {
+        // Nor mid-drag, which would keep editing behind them.
+        if ctx.text_edit_focused() || self.confirm.is_some() || ctx.input(|i| i.pointer.any_down())
+        {
             return;
         }
-        // Not mid-drag, which would keep editing the restored project.
-        let held = ctx.input(|i| i.pointer.any_down());
-        if !held && (pressed(shift_command(Key::Z)) || pressed(command(Key::Y))) {
+        if pressed(shift_command(Key::Z)) || pressed(command(Key::Y)) {
             if let Some(d) = &mut self.doc {
                 d.redo();
             }
-        } else if !held
-            && pressed(command(Key::Z))
+        } else if pressed(command(Key::Z))
             && let Some(d) = &mut self.doc
         {
             d.undo();
@@ -708,8 +707,7 @@ impl App {
         if pressed(command(Key::S)) && self.doc.is_some() {
             self.save();
         }
-        if !held
-            && pressed(command(Key::D))
+        if pressed(command(Key::D))
             && let Some(d) = &mut self.doc
             && let Some(r) = d.variant()
         {
@@ -826,7 +824,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::Discard(Replace::Quit));
         }
-        self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| match &self.status {
             Some(Status::Error(e)) => {
@@ -865,6 +862,8 @@ impl eframe::App for App {
                 self.texture_view(ui);
             });
         });
+        // After the views, so a drag released this frame is finished first.
+        self.shortcuts(&ctx);
         self.confirm_dialog(&ctx);
         if let Some(refusal) = self.refusal.take() {
             self.fail(refusal);

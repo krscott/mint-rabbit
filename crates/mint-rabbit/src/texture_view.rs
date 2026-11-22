@@ -405,7 +405,7 @@ impl TextureView {
                     );
                 }
                 Tool::Select => {
-                    // A click on the picked shape's anchor picks the anchor.
+                    // A click on the picked shape's anchor picks the nearest.
                     let anchor = selection.single().and_then(|s| {
                         let shapes = editor
                             .project()
@@ -416,7 +416,11 @@ impl TextureView {
                         shapes[s]
                             .anchors()
                             .iter()
-                            .position(|a| a.point.distance(p) <= at.hit())
+                            .enumerate()
+                            .map(|(k, a)| (k, a.point.distance(p)))
+                            .filter(|&(_, d)| d <= at.hit())
+                            .min_by(|a, b| a.1.total_cmp(&b.1))
+                            .map(|(k, _)| k)
                     });
                     match anchor {
                         Some(k) if !shift => selection.anchor = Some(k),
@@ -440,8 +444,11 @@ impl TextureView {
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
         let cancelled = escape && self.drag.is_some();
         if cancelled {
-            // A drawing is dropped, and a transform's edits are rolled back.
-            self.drag = None;
+            // A drawing is dropped, the pen's path with it, and a
+            // transform's edits are rolled back.
+            if matches!(self.drag.take(), Some(Drag::PenHandle)) {
+                self.pen.clear();
+            }
             editor.revert_gesture();
         } else if response.drag_stopped() {
             // Only the primary button's release finishes a drawing.
@@ -825,22 +832,30 @@ fn start_select(
         .map(|&i| layer.shapes()[i].clone())
         .collect();
     if let [s] = &picked[..] {
-        for (k, a) in s.anchors().iter().enumerate() {
-            let parts = [
-                (Part::Point, a.point),
-                (Part::In, a.point + a.handle_in),
-                (Part::Out, a.point + a.handle_out),
-            ];
-            for (part, q) in parts {
-                if (part == Part::Point || q != a.point) && q.distance(p) <= at.hit() {
-                    selection.anchor = Some(k);
-                    return Some(Drag::Anchor {
-                        anchor: k,
-                        part,
-                        original: s.clone(),
-                    });
-                }
-            }
+        // The nearest anchor or handle within reach.
+        let nearest = s
+            .anchors()
+            .iter()
+            .enumerate()
+            .flat_map(|(k, a)| {
+                [
+                    (k, Part::Point, a.point),
+                    (k, Part::In, a.point + a.handle_in),
+                    (k, Part::Out, a.point + a.handle_out),
+                ]
+                .into_iter()
+                .filter(move |&(_, part, q)| part == Part::Point || q != a.point)
+            })
+            .map(|(k, part, q)| (k, part, q.distance(p)))
+            .filter(|&(_, _, d)| d <= at.hit())
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        if let Some((k, part, _)) = nearest {
+            selection.anchor = Some(k);
+            return Some(Drag::Anchor {
+                anchor: k,
+                part,
+                original: s.clone(),
+            });
         }
     }
     if let Some((min, max)) = bounds(picked.iter()) {
