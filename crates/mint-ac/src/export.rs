@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use mint_core::{AlphaMode, NodeId, Project, Texture, TextureContent, TextureId, Wrap};
+use mint_core::{AlphaMode, MaterialId, NodeId, Project, Texture, TextureContent, TextureId, Wrap};
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
@@ -688,9 +688,17 @@ pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Expor
     }
     check_name(model)?;
     check_name(texture_set)?;
-    // Layout checks texture sizes, which the wrap check builds on.
+    // Layout checks texture sizes, which the wrap check builds on. Only
+    // materials that triangles use become texture loads.
     let layout = layout(project)?;
-    for m in project.materials() {
+    let used: HashSet<MaterialId> = project
+        .model()
+        .nodes()
+        .iter()
+        .filter_map(|n| n.mesh.as_ref())
+        .flat_map(|m| m.triangles.iter().map(|t| t.material))
+        .collect();
+    for m in used.iter().map(|&id| project.material(id)) {
         let texture = project.texture(m.texture);
         let size = texture.size();
         gx::check_wrap(size.x, size.y, m.wrap).map_err(|source| ExportError::Gx {
