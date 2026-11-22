@@ -90,6 +90,8 @@ enum Confirm {
     ReplaceInDecomp(mint_ac::TextureExport, PathBuf),
     /// Save into a folder that holds another project.
     SaveOver(PathBuf),
+    /// Export a texture set over files already in a folder.
+    OverwriteFolder(PathBuf),
 }
 
 /// An export the side panel asks for, run once its borrows end.
@@ -102,6 +104,8 @@ enum Request {
 enum Replace {
     Import,
     Open(PathBuf),
+    /// Close the window.
+    Quit,
 }
 
 pub struct App {
@@ -127,6 +131,8 @@ pub struct App {
     folder_set: String,
     /// The window title last set.
     title: String,
+    /// Closing was confirmed, so unsaved changes no longer stop it.
+    quitting: bool,
 }
 
 impl App {
@@ -161,6 +167,7 @@ impl App {
             },
             folder_set: String::new(),
             title: String::new(),
+            quitting: false,
         };
         if options.decomp.is_some() {
             app.open_decomp();
@@ -206,18 +213,22 @@ impl App {
     }
 
     /// Runs `replace` now, or asks first when it would lose changes.
-    fn replace(&mut self, replace: Replace) {
+    fn replace(&mut self, replace: Replace, ctx: &egui::Context) {
         if self.dirty() {
             self.confirm = Some(Confirm::Discard(replace));
         } else {
-            self.do_replace(replace);
+            self.do_replace(replace, ctx);
         }
     }
 
-    fn do_replace(&mut self, replace: Replace) {
+    fn do_replace(&mut self, replace: Replace, ctx: &egui::Context) {
         match replace {
             Replace::Import => self.import(),
             Replace::Open(dir) => self.open_project(&dir),
+            Replace::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -301,15 +312,29 @@ impl App {
         }
     }
 
+    /// Asks for a folder to export a new texture set to, and whether to
+    /// overwrite an earlier export there.
     fn export_to_folder(&mut self) {
-        self.error = None;
-        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
-            return;
-        };
         let Some(dir) = rfd::FileDialog::new()
             .set_title("Export texture set to folder")
             .pick_folder()
         else {
+            return;
+        };
+        let set = self.folder_set.trim();
+        let taken = [format!("{set}.c"), format!("{set}_draw_data.txt")]
+            .iter()
+            .any(|f| dir.join(f).exists());
+        if taken {
+            self.confirm = Some(Confirm::OverwriteFolder(dir));
+        } else {
+            self.write_folder(&dir);
+        }
+    }
+
+    fn write_folder(&mut self, dir: &Path) {
+        self.error = None;
+        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
             return;
         };
         let project = doc.editor.project();
@@ -321,7 +346,7 @@ impl App {
             .map_err(|e| e.to_string())
             .and_then(|(base, e)| {
                 decomp
-                    .write_texture_folder(&e, &base, &dir)
+                    .write_texture_folder(&e, &base, dir)
                     .map_err(|e| e.to_string())
             });
         match result {
@@ -343,7 +368,7 @@ impl App {
                     .set_title("Open project folder")
                     .pick_folder()
             {
-                self.replace(Replace::Open(dir));
+                self.replace(Replace::Open(dir), ui.ctx());
             }
             let has_doc = self.doc.is_some();
             if ui.add_enabled(has_doc, egui::Button::new("Save")).clicked() {
@@ -380,7 +405,7 @@ impl App {
                         }
                     });
                 if ui.button("Import").clicked() {
-                    self.replace(Replace::Import);
+                    self.replace(Replace::Import, ui.ctx());
                 }
             }
         });
@@ -406,6 +431,10 @@ impl App {
                 doc.editor.redo();
             }
         });
+        // Undo, redo, and deletes can leave picks that no longer exist.
+        if let Some(r) = doc.variant() {
+            doc.selection.fit(doc.editor.project(), r);
+        }
 
         egui::CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
             let generation = doc.editor.generation();
@@ -615,6 +644,11 @@ impl App {
         let command = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
         let shift_command = |key| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key);
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
+        // Text fields keep their own undo, and nothing changes the project
+        // under an open confirmation.
+        if ctx.egui_wants_keyboard_input() || self.confirm.is_some() {
+            return;
+        }
         if pressed(shift_command(Key::Z)) || pressed(command(Key::Y)) {
             if let Some(d) = &mut self.doc {
                 d.editor.redo();
@@ -626,9 +660,6 @@ impl App {
         }
         if pressed(command(Key::S)) && self.doc.is_some() {
             self.save();
-        }
-        if ctx.egui_wants_keyboard_input() {
-            return;
         }
         if pressed(command(Key::D))
             && let Some(d) = &mut self.doc
@@ -675,6 +706,15 @@ impl App {
                 ),
                 "Replace",
             ),
+            Confirm::OverwriteFolder(dir) => (
+                "Replace export?",
+                format!(
+                    "{} already holds files for texture set {}, which this replaces.",
+                    dir.display(),
+                    self.folder_set.trim()
+                ),
+                "Replace",
+            ),
         };
         let mut choice = None;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -691,7 +731,7 @@ impl App {
         });
         match choice {
             Some(true) => match self.confirm.take() {
-                Some(Confirm::Discard(r)) => self.do_replace(r),
+                Some(Confirm::Discard(r)) => self.do_replace(r, ctx),
                 Some(Confirm::ReplaceInDecomp(export, _)) => {
                     let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
                     match result {
@@ -706,6 +746,7 @@ impl App {
                     }
                 }
                 Some(Confirm::SaveOver(dir)) => self.save_to(dir),
+                Some(Confirm::OverwriteFolder(dir)) => self.write_folder(&dir),
                 None => {}
             },
             Some(false) => self.confirm = None,
@@ -728,6 +769,11 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Closing the window with unsaved changes asks first.
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Discard(Replace::Quit));
+        }
         self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| {

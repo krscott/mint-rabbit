@@ -44,18 +44,31 @@ pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> V
     }
 }
 
-/// `over` drawn on `under` at `opacity`, channel by channel.
+/// `over` drawn on `under` at `opacity`, mixing premultiplied colors so a
+/// transparent pixel's color doesn't tint what fades in over it.
 fn blend(under: Rgba8, over: Rgba8, opacity: f32) -> Rgba8 {
     if opacity >= 1.0 {
         return over;
     }
-    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * opacity).round() as u8;
-    Rgba8::new(
-        mix(under.r, over.r),
-        mix(under.g, over.g),
-        mix(under.b, over.b),
-        mix(under.a, over.a),
-    )
+    let premultiplied = |c: Rgba8| {
+        let a = f32::from(c.a) / 255.0;
+        [
+            f32::from(c.r) * a,
+            f32::from(c.g) * a,
+            f32::from(c.b) * a,
+            f32::from(c.a),
+        ]
+    };
+    let (u, o) = (premultiplied(under), premultiplied(over));
+    let [r, g, b, a]: [f32; 4] = std::array::from_fn(|i| u[i] + (o[i] - u[i]) * opacity);
+    let straight = |v: f32| {
+        if a > 0.0 {
+            (v * 255.0 / a).round() as u8
+        } else {
+            0
+        }
+    };
+    Rgba8::new(straight(r), straight(g), straight(b), a.round() as u8)
 }
 
 #[repr(C)]

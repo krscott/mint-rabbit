@@ -1,5 +1,6 @@
 //! The open project with its undo history.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 use mint_core::Project;
@@ -11,8 +12,9 @@ const UNDO_LIMIT: usize = 200;
 enum Gesture {
     None,
     /// Edits until the gesture ends undo as one step; `recorded` once that
-    /// step is on the undo stack.
+    /// step is on the undo stack. `key` names the control making them.
     Open {
+        key: u64,
         recorded: bool,
     },
 }
@@ -81,8 +83,8 @@ impl Editor {
         };
         if self.project != before {
             match &mut self.gesture {
-                Gesture::Open { recorded: true } => {}
-                Gesture::Open { recorded } => {
+                Gesture::Open { recorded: true, .. } => {}
+                Gesture::Open { recorded, .. } => {
                     *recorded = true;
                     self.push_undo(before);
                 }
@@ -94,11 +96,18 @@ impl Editor {
         Ok(out)
     }
 
-    /// Opens a gesture, such as a drag: its edits until
-    /// [`Self::end_gesture`] undo as one step.
-    pub fn begin_gesture(&mut self) {
-        if self.gesture == Gesture::None {
-            self.gesture = Gesture::Open { recorded: false };
+    /// Opens a gesture by the control named `key`, such as a drag or a
+    /// slider: its edits until [`Self::end_gesture`] undo as one step. A
+    /// gesture by another control ends the open one.
+    pub fn begin_gesture(&mut self, key: impl Hash) {
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        let key = h.finish();
+        if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
+            self.gesture = Gesture::Open {
+                key,
+                recorded: false,
+            };
         }
     }
 
@@ -190,14 +199,24 @@ mod tests {
     #[test]
     fn a_gesture_undoes_as_one_step() {
         let mut e = editor();
-        e.begin_gesture();
+        e.begin_gesture("picker");
         for r in 1..=10 {
+            e.begin_gesture("picker");
             red(&mut e, r);
         }
         e.end_gesture();
         e.undo();
         assert_eq!(current(&e), 0);
         assert!(!e.can_undo());
+
+        // Another control's gesture is a step of its own.
+        e.redo();
+        e.begin_gesture("picker");
+        red(&mut e, 20);
+        e.begin_gesture("slider");
+        red(&mut e, 30);
+        e.undo();
+        assert_eq!(current(&e), 20);
     }
 
     #[test]

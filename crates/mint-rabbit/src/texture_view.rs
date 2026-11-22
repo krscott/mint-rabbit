@@ -356,17 +356,16 @@ impl TextureView {
             .map(|p| at.to_texture(p));
         let shift = ui.input(|i| i.modifiers.shift);
 
-        // A drag starts where the button went down.
-        let primary = !response.dragged_by(PointerButton::Middle);
-        if response.drag_started()
-            && primary
+        // A drag, by the primary button only, starts where the button went
+        // down.
+        if response.drag_started_by(PointerButton::Primary)
             && let Some(origin) = ui
                 .input(|i| i.pointer.press_origin())
                 .map(|p| at.to_texture(p))
         {
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
             if self.drag.is_some() {
-                editor.begin_gesture();
+                editor.begin_gesture("canvas drag");
             }
         } else if response.clicked()
             && let Some(p) = pointer
@@ -398,7 +397,12 @@ impl TextureView {
         if let (Some(drag), Some(p)) = (&mut self.drag, pointer) {
             continue_drag(editor, drag, selection, r, p, &mut self.pen, shift);
         }
-        if response.drag_stopped() {
+        let escape = ui.input(|i| i.key_pressed(Key::Escape));
+        if escape && self.drag.is_some() {
+            // Drawing is dropped; edits a drag already made stay one step.
+            self.drag = None;
+            editor.end_gesture();
+        } else if response.drag_stopped_by(PointerButton::Primary) {
             if let Some(drag) = self.drag.take() {
                 finish_drag(editor, drag, selection, r, paint, message);
             }
@@ -407,22 +411,22 @@ impl TextureView {
 
         // Keys, while the view has the pointer.
         if response.hovered() || !self.pen.is_empty() {
-            let (enter, escape, delete) = ui.input(|i| {
+            let (enter, delete) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),
-                    i.key_pressed(Key::Escape),
                     i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
                 )
             });
             if enter && !self.pen.is_empty() {
+                // Enter finishes an open path; clicking the first anchor
+                // closes one.
                 let anchors = std::mem::take(&mut self.pen);
-                let closed = paint.fill;
                 add_shape(
                     editor,
                     selection,
                     r,
                     anchors,
-                    paint.style(closed),
+                    paint.style(false),
                     paint.color,
                     message,
                 );
@@ -551,9 +555,9 @@ impl TextureView {
                     Stroke::new(1.0, Color32::from_gray(160)),
                     egui::StrokeKind::Outside,
                 );
-                for c in corners(min, max) {
+                for c in scale_handles(min, max, at) {
                     painter.rect_filled(
-                        Rect::from_center_size(at.to_screen(c), vec2(7.0, 7.0)),
+                        Rect::from_center_size(c, vec2(7.0, 7.0)),
                         0.0,
                         Color32::WHITE,
                     );
@@ -653,6 +657,19 @@ fn bounds<'a>(shapes: impl Iterator<Item = &'a Shape>) -> Option<(Vec2, Vec2)> {
 
 fn corners(min: Vec2, max: Vec2) -> [Vec2; 4] {
     [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
+}
+
+/// Screen positions of the scale handles, just outside the selection's
+/// corners so they don't cover anchors there.
+fn scale_handles(min: Vec2, max: Vec2, at: Placement) -> [Pos2; 4] {
+    let out = [
+        vec2(-1.0, -1.0),
+        vec2(1.0, -1.0),
+        vec2(1.0, 1.0),
+        vec2(-1.0, 1.0),
+    ];
+    let c = corners(min, max);
+    std::array::from_fn(|k| at.to_screen(c[k]) + out[k] * 8.0)
 }
 
 /// The rotation handle, a little above the selection's top edge.
@@ -770,7 +787,8 @@ fn start_select(
             });
         }
         let c = corners(min, max);
-        if let Some(k) = (0..4).find(|&k| at.to_screen(c[k]).distance(screen) <= HIT) {
+        let handles = scale_handles(min, max, at);
+        if let Some(k) = (0..4).find(|&k| handles[k].distance(screen) <= HIT) {
             return Some(Drag::Scale {
                 pivot: c[(k + 2) % 4],
                 start: c[k],
@@ -875,20 +893,23 @@ fn continue_drag(
             original,
         } => {
             let mut s = original.clone();
+            // A smooth anchor, judged as it was, stays smooth unless Shift
+            // is held.
+            let was = original.anchors()[*anchor];
+            let smooth = !shift && is_smooth(was);
             let a = &mut s.anchors_mut()[*anchor];
             match part {
                 Part::Point => a.point = p,
                 Part::Out => {
                     a.handle_out = p - a.point;
-                    if !shift {
-                        // Keep a smooth anchor smooth.
-                        mirror(&mut a.handle_in, a.handle_out);
+                    if smooth {
+                        a.handle_in = opposite(a.handle_out, was.handle_in.length());
                     }
                 }
                 Part::In => {
                     a.handle_in = p - a.point;
-                    if !shift {
-                        mirror(&mut a.handle_out, a.handle_in);
+                    if smooth {
+                        a.handle_out = opposite(a.handle_in, was.handle_out.length());
                     }
                 }
             }
@@ -909,13 +930,16 @@ fn continue_drag(
     }
 }
 
-/// Points `other` opposite `handle`, keeping its length, when the two
-/// already point opposite ways: a smooth anchor stays smooth.
-fn mirror(other: &mut Vec2, handle: Vec2) {
-    let len = other.length();
-    if len > 0.0 && handle != Vec2::ZERO && other.normalize().dot(handle.normalize()) < -0.99 {
-        *other = -handle.normalize() * len;
-    }
+/// Whether an anchor's handles point opposite ways.
+fn is_smooth(a: Anchor) -> bool {
+    a.handle_in != Vec2::ZERO
+        && a.handle_out != Vec2::ZERO
+        && a.handle_in.normalize().dot(a.handle_out.normalize()) < -0.99
+}
+
+/// A handle `len` long pointing opposite `handle`.
+fn opposite(handle: Vec2, len: f32) -> Vec2 {
+    -handle.normalize_or_zero() * len
 }
 
 fn finish_drag(
@@ -1009,16 +1033,30 @@ pub fn add_shape(
 /// takes the shape with it.
 fn delete_selected(editor: &mut Editor, r: VariantRef, selection: &mut Selection) {
     let layer = selection.layer;
+    if editor
+        .project()
+        .variant(r)
+        .layers()
+        .get(layer)
+        .is_none_or(|l| l.locked)
+    {
+        return;
+    }
     if let (Some(s), Some(a)) = (selection.single(), selection.anchor) {
-        let _ = editor.edit(|p| {
+        let removed = editor.edit(|p| {
             p.edit_variant(r, |v| {
                 let l = &mut v.layers_mut()[layer];
-                if l.shapes_mut()[s].remove_anchor(a).is_err() {
+                let last = l.shapes_mut()[s].remove_anchor(a).is_err();
+                if last {
                     l.remove_shape(s);
                 }
+                last
             })
         });
         selection.anchor = None;
+        if removed == Ok(true) {
+            selection.shapes.clear();
+        }
         return;
     }
     let mut picked = selection.shapes.clone();

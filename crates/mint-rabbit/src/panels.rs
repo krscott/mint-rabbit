@@ -87,7 +87,7 @@ pub fn palette(
         if changed {
             // One undo step while the picker is held; the app ends it.
             let [r, g, b, a] = rgba;
-            editor.begin_gesture();
+            editor.begin_gesture(("palette color", paint.color.0));
             if let Err(e) =
                 editor.edit(|p| p.set_palette_color(paint.color, Rgba8::new(r, g, b, a)))
             {
@@ -184,7 +184,7 @@ pub fn layers(
                     .clamping(egui::SliderClamping::Always),
             );
             if slider.changed() {
-                editor.begin_gesture();
+                editor.begin_gesture(("layer opacity", r, i));
                 edit_variant(editor, r, message, |v| v.layers_mut()[i].opacity = opacity);
             }
             slider.on_hover_text("Opacity in the views; export ignores it");
@@ -245,7 +245,7 @@ pub fn layers(
         ui.horizontal(|ui| {
             ui.label("Name");
             if ui.text_edit_singleline(&mut name).changed() {
-                editor.begin_gesture();
+                editor.begin_gesture(("layer name", r, i));
                 edit_variant(editor, r, message, |v| v.layers_mut()[i].name = name);
             }
         });
@@ -324,6 +324,10 @@ pub fn shapes(
         ui.label("Pick shapes with the Select tool.");
         return;
     };
+    if editor.project().variant(r).layers()[layer].locked {
+        ui.label("The picked shapes' layer is locked.");
+        return;
+    }
     let style = editor.project().variant(r).layers()[layer].shapes()[first].style();
     ui.horizontal_wrapped(|ui| {
         if ui.button("Use paint color").clicked() {
@@ -336,45 +340,39 @@ pub fn shapes(
         }
         let mut fill = style == Style::Fill;
         if ui.checkbox(&mut fill, "Filled").changed() {
-            let to = if fill {
-                Style::Fill
-            } else {
-                Style::Stroke {
-                    width: paint.width,
+            let width = paint.width;
+            set_style(editor, r, layer, &picked, message, |s| match s {
+                Style::Fill => Style::Stroke {
+                    width,
                     closed: true,
-                }
-            };
-            set_style(editor, r, layer, &picked, to, message);
+                },
+                Style::Stroke { .. } => Style::Fill,
+            });
         }
+        // Width and closing apply to each picked stroke, keeping its other
+        // settings; the first picked shape shows the values.
         if let Style::Stroke { width, closed } = style {
             let mut w = width;
             let drag = ui.add(
                 egui::DragValue::new(&mut w)
                     .range(0.1..=64.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.05)
                     .suffix(" px"),
             );
             if drag.changed() {
-                editor.begin_gesture();
-                set_style(
-                    editor,
-                    r,
-                    layer,
-                    &picked,
-                    Style::Stroke { width: w, closed },
-                    message,
-                );
+                editor.begin_gesture(("stroke width", r, layer));
+                set_style(editor, r, layer, &picked, message, |s| match s {
+                    Style::Stroke { closed, .. } => Style::Stroke { width: w, closed },
+                    Style::Fill => Style::Fill,
+                });
             }
             let mut c = closed;
             if ui.checkbox(&mut c, "Closed").changed() {
-                set_style(
-                    editor,
-                    r,
-                    layer,
-                    &picked,
-                    Style::Stroke { width, closed: c },
-                    message,
-                );
+                set_style(editor, r, layer, &picked, message, |s| match s {
+                    Style::Stroke { width, .. } => Style::Stroke { width, closed: c },
+                    Style::Fill => Style::Fill,
+                });
             }
         }
     });
@@ -409,8 +407,19 @@ pub fn shapes(
             .map(|l| l.name.clone())
             .collect();
         ui.menu_button("To layer", |ui| {
+            let locked: Vec<bool> = editor
+                .project()
+                .variant(r)
+                .layers()
+                .iter()
+                .map(|l| l.locked)
+                .collect();
             for (k, name) in names.iter().enumerate() {
-                if k != layer && ui.button(name).clicked() {
+                if k != layer
+                    && ui
+                        .add_enabled(!locked[k], egui::Button::new(name))
+                        .clicked()
+                {
                     let moved = edit_variant(editor, r, message, |v| {
                         let mut shapes = Vec::new();
                         for &s in sorted.iter().rev() {
@@ -437,19 +446,21 @@ pub fn shapes(
     });
 }
 
+/// Restyles each picked shape with `restyle` of its own style.
 fn set_style(
     editor: &mut Editor,
     r: VariantRef,
     layer: usize,
     picked: &[usize],
-    style: Style,
     message: &mut Option<String>,
+    restyle: impl Fn(Style) -> Style,
 ) {
     let result = editor.edit(|p| {
         let mut err = None;
         p.edit_variant(r, |v| {
             for &s in picked {
-                if let Err(e) = v.layers_mut()[layer].shapes_mut()[s].set_style(style) {
+                let shape = &mut v.layers_mut()[layer].shapes_mut()[s];
+                if let Err(e) = shape.set_style(restyle(shape.style())) {
                     err = Some(e);
                 }
             }
@@ -472,7 +483,7 @@ pub fn duplicate(
     let layer = selection.layer;
     let mut picked = selection.shapes.clone();
     picked.sort_unstable();
-    if picked.is_empty() {
+    if picked.is_empty() || editor.project().variant(r).layers()[layer].locked {
         return;
     }
     let start = edit_variant(editor, r, message, |v| {
