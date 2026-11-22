@@ -206,19 +206,36 @@ impl Shape {
 /// Appends points along a cubic, excluding its start, enough of them that
 /// the lines between stay within [`TOLERANCE`] (Wang's formula). A straight
 /// segment is appended exactly, as its end alone.
-fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
+///
+/// The cubic is always evaluated from the same one of its ends, whichever
+/// way the path runs, so two shapes sharing a curve in opposite directions
+/// get exactly the same points and agree on which pixels it covers.
+fn flatten_cubic(segment: [Vec2; 4], out: &mut Vec<Vec2>) {
+    let end = segment[3];
+    let reversed = (end.x, end.y) < (segment[0].x, segment[0].y);
+    let [p0, p1, p2, p3] = if reversed {
+        [segment[3], segment[2], segment[1], segment[0]]
+    } else {
+        segment
+    };
     if is_straight([p0, p1, p2, p3]) {
-        out.push(p3);
+        out.push(end);
         return;
     }
     let d = (p0 - 2.0 * p1 + p2)
         .length()
         .max((p1 - 2.0 * p2 + p3).length());
     let n = ((0.75 * d / TOLERANCE).sqrt().ceil() as usize).clamp(1, 1024);
-    for i in 1..=n {
+    let at = |i: usize| {
         let t = i as f32 / n as f32;
         let u = 1.0 - t;
-        out.push(u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3);
+        u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
+    };
+    if reversed {
+        // Points n-1 down to 0, the last being `end`.
+        out.extend((0..n).rev().map(at));
+    } else {
+        out.extend((1..=n).map(at));
     }
 }
 
@@ -309,8 +326,9 @@ impl Outline {
 
     /// Winding number of the closed outline around `p`. Edges include their
     /// lower end and exclude their upper one, and the side of an edge is
-    /// always computed from its lower end, so two outlines sharing an edge in
-    /// opposite directions agree on every point and one of them covers it.
+    /// always computed from its lower end, so outlines sharing an edge, in
+    /// either direction, decide each point on it the same way, and of two on
+    /// opposite sides exactly one covers it.
     fn winding(&self, p: Vec2) -> i32 {
         let mut w = 0;
         let n = self.points.len();
@@ -517,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn straight_edges_on_pixel_centers_cover_consistently() {
+    fn shared_and_straight_edges_cover_consistently() {
         // The top edge runs through the centers of row 0, which belong to
         // the fill along the whole edge.
         let o = fill(rectangle(Vec2::splat(0.5), Vec2::new(8.5, 4.5))).outline();
@@ -543,6 +561,50 @@ mod tests {
         .map(|s| s.outline());
         for p in [Vec2::splat(0.5), Vec2::new(1.5, 1.5), Vec2::new(2.0, 1.7)] {
             assert_eq!(halves.iter().filter(|o| o.covers(p)).count(), 1, "{p}");
+        }
+
+        // Two fills sharing a curve in opposite directions cover each pixel
+        // center beside it exactly once.
+        let curve = [
+            Vec2::new(6.0, 0.0),
+            Vec2::new(1.0, 2.0),
+            Vec2::new(16.0, 13.0),
+            Vec2::new(11.0, 15.0),
+        ];
+        let left = vec![
+            Anchor {
+                point: curve[0],
+                handle_in: Vec2::ZERO,
+                handle_out: curve[1] - curve[0],
+            },
+            Anchor {
+                point: curve[3],
+                handle_in: curve[2] - curve[3],
+                handle_out: Vec2::ZERO,
+            },
+            Anchor::corner(Vec2::new(0.0, 15.0)),
+            Anchor::corner(Vec2::ZERO),
+        ];
+        let right = vec![
+            Anchor {
+                point: curve[3],
+                handle_in: Vec2::ZERO,
+                handle_out: curve[2] - curve[3],
+            },
+            Anchor {
+                point: curve[0],
+                handle_in: curve[1] - curve[0],
+                handle_out: Vec2::ZERO,
+            },
+            Anchor::corner(Vec2::new(17.0, 0.0)),
+            Anchor::corner(Vec2::new(17.0, 15.0)),
+        ];
+        let halves = [fill(left).outline(), fill(right).outline()];
+        for y in 0..15 {
+            for x in 0..17 {
+                let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                assert_eq!(halves.iter().filter(|o| o.covers(p)).count(), 1, "{p}");
+            }
         }
 
         // Corner-only edges stay exact at any angle, so two triangles that
@@ -666,7 +728,12 @@ mod tests {
         let zigzag: Vec<Vec2> = (0..12_000)
             .map(|i| [Vec2::ZERO, Vec2::new(8.0, 0.0), Vec2::new(0.0, 8.0)][i % 3])
             .collect();
-        assert!(freehand(&zigzag, 0.5).len() > 3);
+        assert!(
+            freehand(&zigzag, 0.5)
+                .iter()
+                .map(|a| a.point)
+                .eq(zigzag.iter().copied())
+        );
         assert!(freehand(&[], 0.5).is_empty());
         assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
     }
