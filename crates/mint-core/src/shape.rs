@@ -212,6 +212,13 @@ impl Shape {
 /// get exactly the same points and agree on which pixels it covers.
 fn flatten_cubic(segment: [Vec2; 4], out: &mut Vec<Vec2>) {
     let end = segment[3];
+    if segment[0] == end && segment[1] == segment[2] {
+        // The same curve both ways: a straight spike to 3/4 of the way to
+        // its control and back, drawn exactly so the two halves cancel.
+        out.push(end + 0.75 * (segment[1] - end));
+        out.push(end);
+        return;
+    }
     // By the ends, then the controls, so a loop back to its start has a
     // fixed direction too.
     let key = |a: Vec2, b: Vec2| (a.x, a.y, b.x, b.y);
@@ -608,6 +615,19 @@ mod tests {
                 .unwrap()
                 .outline();
             assert!(o.covers(Vec2::new(1.5, 0.5)));
+        }
+
+        // A spike out and back along one line covers no area.
+        let spike = fill(vec![Anchor {
+            point: Vec2::new(0.0, 11.0),
+            handle_in: Vec2::splat(-10.0),
+            handle_out: Vec2::splat(-10.0),
+        }])
+        .outline();
+        for y in 0..12 {
+            for x in -10..2 {
+                assert!(!spike.covers(Vec2::new(x as f32 + 0.5, y as f32 + 0.5)));
+            }
         }
 
         // A loop back to its own anchor flattens to the same points in
