@@ -410,6 +410,10 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
             .unwrap()
             .contains("t_9_tmem_txt")
     );
+    assert!(matches!(
+        decomp.write_texture_folder(&painted, "t_1", folder.path()),
+        Err(WriteError::Exists(set, _)) if set == "t_1"
+    ));
     let mut shrunk = new_set.clone();
     shrunk.texture_sizes[0].1 /= 2;
     assert!(matches!(

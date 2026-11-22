@@ -59,10 +59,12 @@ pub enum ImportError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-    #[error(
-        "{0} is not in the villager table; a new texture set also needs build changes, so export it to a folder instead"
-    )]
+    #[error("texture set {0} is not in the villager table")]
     NotInTable(String),
+    #[error(
+        "texture set {0} already exists at {1}; replace it in place with write_texture_set, or choose a new name"
+    )]
+    Exists(String, PathBuf),
     #[error(
         "texture set {texture_set} is drawn on model {actual}, but the project's model is {expected}"
     )]
@@ -252,7 +254,8 @@ impl Decomp {
 
     /// Writes `export` as a new texture set into folder `dir`, with the table
     /// entry and steps for adding it to the decomp, based on the row of
-    /// texture set `base` (the villager it replaces). The base must be on
+    /// texture set `base` (the villager it replaces). The export's name must
+    /// not already be a texture set in the decomp, and the base must be on
     /// the export's model, whose loads the textures must match. Returns the
     /// paths written.
     pub fn write_texture_folder(
@@ -261,6 +264,10 @@ impl Decomp {
         base: &str,
         dir: &Path,
     ) -> Result<[PathBuf; 2], WriteError> {
+        let existing = self.root.join(Self::texture_path(&export.texture_set));
+        if existing.exists() {
+            return Err(WriteError::Exists(export.texture_set.clone(), existing));
+        }
         let v = self.villager(base)?;
         if v.model != export.model {
             return Err(WriteError::OtherModel {
