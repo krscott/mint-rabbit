@@ -11,8 +11,6 @@ use crate::gbi::VERTEX_CACHE;
 use crate::gx;
 use crate::{SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
 
-/// Bytes in the body texture buffer the game reserves per villager.
-pub const BODY_BUFFER: usize = 0x800;
 /// Most triangles one `gsSPNTrianglesInit_5b` group can count.
 const MAX_GROUP_TRIANGLES: usize = 128;
 const EYE_VARIANTS: usize = 8;
@@ -57,8 +55,6 @@ pub enum ExportError {
         texture: String,
         source: gx::GxError,
     },
-    #[error("body textures take {0:#x} bytes; the body buffer holds {BODY_BUFFER:#x}")]
-    BodyBufferFull(usize),
     #[error(
         "the {slot} texture is {}x{}; the game's {slot} texture is {}x{}",
         actual.x, actual.y, expected.x, expected.y
@@ -164,7 +160,8 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
                 })
             }
         };
-        // Eye, mouth, and clothing textures fill fixed-size game buffers.
+        // The game supplies clothing at a fixed size; eye, mouth, and body
+        // textures are the villager's own arrays, sized by their loads.
         let check_size = |slot: &'static str, w: u32, h: u32| {
             let expected = glam::UVec2::new(w, h);
             if size == expected {
@@ -180,14 +177,12 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
         let placement = match (texture.slot.0.as_str(), texture.content()) {
             (SLOT_EYES, TextureContent::Painted(_)) => {
                 once(&mut seen_eye, SLOT_EYES)?;
-                check_size(SLOT_EYES, 32, 16)?;
                 check_count(SLOT_EYES, EYE_VARIANTS)?;
                 out.eyes = variant_bytes(texture)?;
                 Placement::Eye
             }
             (SLOT_MOUTH, TextureContent::Painted(_)) => {
                 once(&mut seen_mouth, SLOT_MOUTH)?;
-                check_size(SLOT_MOUTH, 32, 16)?;
                 check_count(SLOT_MOUTH, MOUTH_VARIANTS)?;
                 out.mouths = variant_bytes(texture)?;
                 Placement::Mouth
@@ -211,9 +206,6 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
             }
         };
         out.placements.push(placement);
-    }
-    if out.body.len() > BODY_BUFFER {
-        return Err(ExportError::BodyBufferFull(out.body.len()));
     }
     Ok(out)
 }

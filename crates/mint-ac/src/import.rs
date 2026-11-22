@@ -222,8 +222,11 @@ fn joints(file: &CFile, model: &str) -> Result<Vec<Joint>, ImportError> {
             let dl = f[0].as_expr().and_then(Expr::as_ident).ok_or_else(bad)?;
             // Translucent (XLU) joints draw after every opaque one, with their
             // own depth rules; villagers do not use them.
-            let flag = f[2].as_expr().and_then(Expr::as_ident);
-            if flag != Some("cKF_JOINT_FLAG_DISP_OPA") {
+            let flag = f[2].as_expr();
+            let opaque = flag.is_some_and(|e| {
+                e.as_ident() == Some("cKF_JOINT_FLAG_DISP_OPA") || e.as_int() == Some(0)
+            });
+            if !opaque {
                 return Err(malformed(
                     file,
                     format!("{table_name}[{i}] is not drawn opaque (cKF_JOINT_FLAG_DISP_OPA)"),

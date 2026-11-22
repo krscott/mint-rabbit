@@ -60,7 +60,7 @@ pub enum TexSource {
     Eye,
     Mouth,
     Clothing,
-    /// A texture at a byte offset in the body buffer.
+    /// A texture at a byte offset in the villager's body texture array.
     Body {
         offset: u32,
     },

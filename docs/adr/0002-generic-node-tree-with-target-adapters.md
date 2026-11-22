@@ -4,8 +4,8 @@ The core model is a generic tree of nodes, each with an optional mesh, where a
 vertex follows its mesh's node or one other node (a seam vertex). Nothing in
 the core knows about Animal Crossing. The AC import/export adapter owns all of
 its structure: the shared 26-joint skeleton, the rule that a joint's mesh
-follows at most two nodes, texture slots, packing body textures into the
-0x800-byte buffer, and merging added nodes into their nearest joint ancestor's
+follows at most two nodes, texture slots, packing body textures into one
+array addressed by offset, and merging added nodes into their nearest joint ancestor's
 mesh on export. Each project records its export target, and the target's
 constraints are checked while editing rather than only at export.
 
