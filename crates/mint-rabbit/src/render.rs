@@ -88,16 +88,27 @@ pub struct MaterialData {
 impl SceneData {
     /// Prepares `project`, showing `variants[t]` of each texture `t`.
     pub fn new(project: &Project, variants: &[usize], generation: u64) -> Self {
+        // Each texture once, however many materials use it.
+        let textures: Vec<Vec<u8>> = project
+            .textures()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                scene::texture_pixels(project, t, variants[i])
+                    .iter()
+                    .flat_map(|c| c.to_array())
+                    .collect()
+            })
+            .collect();
         let materials = project
             .materials()
             .iter()
             .map(|m| {
                 let texture = project.texture(m.texture);
-                let pixels = scene::texture_pixels(project, texture, variants[m.texture.index()]);
                 // The tint is a full RGBA8 register, not a palette color.
                 let tint = m.tint;
                 MaterialData {
-                    pixels: pixels.iter().flat_map(|c| c.to_array()).collect(),
+                    pixels: textures[m.texture.index()].clone(),
                     size: texture.size().to_array(),
                     wrap: m.wrap,
                     alpha: m.alpha,

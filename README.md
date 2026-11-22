@@ -8,12 +8,28 @@ checkout. See [GLOSSARY.md](GLOSSARY.md) for the domain language and
 ## Usage
 
 ```sh
-mint-rabbit --decomp PATH/TO/ac-decomp [--game-version GAFE01_00]
+mint-rabbit [--decomp PATH/TO/ac-decomp] [--game-version GAFE01_00] [--project DIR]
 ```
 
 The decomp must be built once with your own disc image so its villager assets
 are extracted (`python configure.py && ninja`). Pick a villager and press
 Import to see it in the Model View (left) and Texture View (right).
+
+Paint in the Texture View with the tools in the Paint section: Select (V),
+Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on the picked
+layer in the palette color picked below them. With Select, drag a shape to move
+it, its corner handles to scale (Shift keeps proportions), and the round handle
+to rotate; drag a single shape's anchors and handles to reshape it, double-click
+its outline to add an anchor, and press Delete to remove the picked anchor or
+shapes. The pen adds an anchor per click (drag to pull out handles), closes on
+its first anchor, and finishes an open path with Enter. Scroll to zoom,
+middle-drag to pan. Ctrl+Z and Ctrl+Shift+Z undo and redo, Ctrl+S saves, and
+Ctrl+D duplicates the picked shapes.
+
+A project saves as a folder (Save, Save as). Export either replaces the
+imported villager's texture set in the decomp, after which the decomp must be
+built with `python configure.py --non-matching && ninja`, or writes a new
+texture set to a folder with the steps for adding it.
 
 To try the app without a disc, `just demo` writes a generated villager to a
 decomp-shaped directory and opens it.
