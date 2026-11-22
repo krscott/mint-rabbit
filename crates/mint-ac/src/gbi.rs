@@ -326,7 +326,6 @@ impl Interp<'_> {
                 self.alpha = Some(match args[1].as_ident() {
                     Some("G_RM_AA_ZB_OPA_SURF2") => AlphaMode::Opaque,
                     Some("G_RM_AA_ZB_TEX_EDGE2") => AlphaMode::Cutout,
-                    Some("G_RM_AA_ZB_XLU_SURF2") => AlphaMode::Translucent,
                     _ => return Err(format!("unsupported render mode {}", args[1])),
                 });
             }

@@ -67,7 +67,7 @@ _Avoid_: Placeholder, runtime texture
 
 **Material**:
 How triangles draw with a texture: the texture, a wrap mode per axis (clamp,
-repeat, or mirror), an alpha mode (opaque, cutout, or translucent), whether
+repeat, or mirror), an alpha mode (opaque or cutout), whether
 back faces show, and a tint.
 _Avoid_: Shader, render mode
 

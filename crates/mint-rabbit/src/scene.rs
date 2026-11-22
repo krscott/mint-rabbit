@@ -1,5 +1,6 @@
-//! CPU-side preparation of a project for display: posed triangles grouped
-//! by material, and textures resolved to the colors the target shows.
+//! CPU-side preparation of a project for display: posed triangles in drawing
+//! order, batched in runs of one material, and textures resolved to the
+//! colors the target shows.
 
 use glam::{Mat3, Vec2, Vec3};
 use mint_core::{MaterialId, Project, Rgba8, Texture, TextureContent, TextureId};
@@ -53,7 +54,7 @@ pub struct PosedMesh {
     pub bounds_max: Vec3,
 }
 
-/// Poses every mesh and groups the triangle corners by material.
+/// Poses every mesh and batches its triangles in drawing order.
 pub fn posed_mesh(project: &Project) -> PosedMesh {
     let model = project.model();
     let world = model.world_matrices(project.pose());
@@ -127,7 +128,9 @@ mod tests {
 
     use super::*;
 
-    fn project() -> Project {
+    /// A root and an arm; the arm has one triangle per entry of `materials`,
+    /// each drawing with that material (0 or 1).
+    fn project_with(materials: &[u32]) -> Project {
         let mut model = Model::new("root", Transform::default());
         let child = model.add_child(
             NodeId::ROOT,
@@ -149,10 +152,13 @@ mod tests {
                 vertex(Vec3::X, None),
                 vertex(Vec3::Y, None),
             ],
-            triangles: vec![Triangle {
-                corners: [corner(0), corner(1), corner(2)],
-                material: MaterialId(0),
-            }],
+            triangles: materials
+                .iter()
+                .map(|&m| Triangle {
+                    corners: [corner(0), corner(1), corner(2)],
+                    material: MaterialId(m),
+                })
+                .collect(),
         });
         let mut pose = Pose::default();
         pose.set_rotation(child, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
@@ -164,16 +170,33 @@ mod tests {
             Palette::from_colors([Rgba8::new(255, 1, 2, 255)]).unwrap(),
             model,
             vec![texture],
-            vec![Material {
-                texture: TextureId(0),
-                wrap: [Wrap::Clamp; 2],
-                alpha: AlphaMode::Opaque,
-                double_sided: false,
-                tint: Rgba8::new(255, 255, 255, 255),
-            }],
+            [AlphaMode::Opaque, AlphaMode::Cutout]
+                .map(|alpha| Material {
+                    texture: TextureId(0),
+                    wrap: [Wrap::Clamp; 2],
+                    alpha,
+                    double_sided: false,
+                    tint: Rgba8::new(255, 255, 255, 255),
+                })
+                .to_vec(),
             pose,
         )
         .unwrap()
+    }
+
+    fn project() -> Project {
+        project_with(&[0])
+    }
+
+    #[test]
+    fn batches_keep_drawing_order() {
+        let posed = posed_mesh(&project_with(&[0, 0, 1, 0]));
+        let batches: Vec<_> = posed
+            .batches
+            .iter()
+            .map(|b| (b.material.0, b.first, b.count))
+            .collect();
+        assert_eq!(batches, vec![(0, 0, 6), (1, 6, 3), (0, 9, 3)]);
     }
 
     #[test]

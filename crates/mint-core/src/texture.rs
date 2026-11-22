@@ -264,7 +264,6 @@ pub enum AlphaMode {
     Opaque,
     /// Pixels below half alpha are not drawn.
     Cutout,
-    Translucent,
 }
 
 /// Index of a material within its project.

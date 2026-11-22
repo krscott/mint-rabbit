@@ -53,13 +53,20 @@ fn tables(file: &CFile, name: &str) -> Result<Tables, AnimError> {
         file.get(sym)
             .and_then(|d| d.init.as_ints())
             .and_then(|v| {
+                // The flag table is u8; the others are s16.
                 if i == 0 {
-                    Some(v)
+                    v.into_iter()
+                        .map(|v| u8::try_from(v).ok().map(i64::from))
+                        .collect()
                 } else {
                     v.into_iter().map(s16).collect()
                 }
             })
-            .ok_or_else(|| malformed(&format!("table {sym} is missing or not 16-bit integers")))
+            .ok_or_else(|| {
+                malformed(&format!(
+                    "table {sym} is missing or has values out of range"
+                ))
+            })
     };
     Ok(Tables {
         flags: table(0)?,

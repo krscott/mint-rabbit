@@ -30,7 +30,7 @@ pub fn ci4_len(width: u32, height: u32) -> usize {
 }
 
 /// Checks a texture size the game can load: whole 8x8 tiles, and at most
-/// 1024 texels a side to fit the load command's 10-bit size fields.
+/// 1024 texels a side to fit the texture image command's size fields.
 pub fn check_size(width: u32, height: u32) -> Result<(), GxError> {
     let ok = |v: u32| (TILE..=1024).contains(&v) && v.is_multiple_of(TILE);
     if ok(width) && ok(height) {

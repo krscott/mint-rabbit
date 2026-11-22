@@ -334,7 +334,6 @@ impl ModelWriter<'_> {
             let render = match m.alpha {
                 AlphaMode::Opaque => "G_RM_AA_ZB_OPA_SURF2",
                 AlphaMode::Cutout => "G_RM_AA_ZB_TEX_EDGE2",
-                AlphaMode::Translucent => "G_RM_AA_ZB_XLU_SURF2",
             };
             let cull = if m.double_sided { "" } else { " | G_CULL_BACK" };
             let _ = writeln!(body, "    gsSPTexture(0, 0, 0, 0, G_ON),");
@@ -597,18 +596,13 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
                 "AC joints only translate; rotation and scale are not supported".into(),
             ));
         }
-        let xlu = node.mesh.as_ref().is_some_and(|m| {
-            m.triangles
-                .iter()
-                .any(|t| project.material(t.material).alpha == AlphaMode::Translucent)
-        });
         let pos = t.translation;
         let p = [pos.x, pos.y, pos.z]
             .map(|c| to_i16(c, "joint translation"))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|p| node_err(id, p))?;
-        joints.push((dl, children, xlu, p));
+        joints.push((dl, children, p));
     }
 
     let mut out = String::new();
@@ -625,15 +619,10 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
     out.push_str(&w.lists);
     out.push_str("// clang-format off\n");
     let _ = writeln!(out, "static cKF_Joint_R_c cKF_je_r_{model}_tbl[] = {{");
-    for (i, (dl, children, xlu, p)) in joints.iter().enumerate() {
-        let flag = if *xlu {
-            "cKF_JOINT_FLAG_DISP_XLU"
-        } else {
-            "cKF_JOINT_FLAG_DISP_OPA"
-        };
+    for (i, (dl, children, p)) in joints.iter().enumerate() {
         let _ = writeln!(
             out,
-            "    /* joint {i} */ {{ {}, {children}, {flag}, {},{},{} }},",
+            "    /* joint {i} */ {{ {}, {children}, cKF_JOINT_FLAG_DISP_OPA, {},{},{} }},",
             dl.as_deref().unwrap_or("NULL"),
             p[0],
             p[1],

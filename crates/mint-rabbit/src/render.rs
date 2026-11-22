@@ -140,23 +140,19 @@ struct GpuScene {
     linear_filter: bool,
     vertices: wgpu::Buffer,
     materials: Vec<GpuMaterial>,
-    /// (first, count, material) in draw order: opaque before translucent.
+    /// (first, count, material) in draw order.
     draws: Vec<(u32, u32, usize)>,
 }
 
 /// Long-lived GPU state, stored in egui's callback resources.
 pub struct Renderer {
-    /// Indexed by `pipeline_index(alpha, double_sided)`.
+    /// Indexed by whether the pipeline draws back faces.
     pipelines: Vec<wgpu::RenderPipeline>,
     globals: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
     srgb_textures: bool,
     scene: Option<GpuScene>,
-}
-
-fn pipeline_index(alpha: AlphaMode, double_sided: bool) -> usize {
-    usize::from(alpha == AlphaMode::Translucent) * 2 + usize::from(double_sided)
 }
 
 fn address(w: Wrap) -> wgpu::AddressMode {
@@ -235,10 +231,9 @@ impl Renderer {
             bind_group_layouts: &[Some(&globals_layout), Some(&material_layout)],
             immediate_size: 0,
         });
-        let pipelines = (0..4)
-            .map(|i| {
-                let translucent = i >= 2;
-                let double_sided = i % 2 == 1;
+        let pipelines = [false, true]
+            .into_iter()
+            .map(|double_sided| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("model view"),
                     layout: Some(&layout),
@@ -258,7 +253,7 @@ impl Renderer {
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: target_format,
-                            blend: translucent.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                            blend: None,
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
                     }),
@@ -268,7 +263,7 @@ impl Renderer {
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(!translucent),
+                        depth_write_enabled: Some(true),
                         depth_compare: Some(wgpu::CompareFunction::Less),
                         stencil: wgpu::StencilState::default(),
                         bias: wgpu::DepthBiasState::default(),
@@ -420,17 +415,16 @@ impl Renderer {
                 });
                 GpuMaterial {
                     bind_group,
-                    pipeline: pipeline_index(m.alpha, m.double_sided),
+                    pipeline: usize::from(m.double_sided),
                 }
             })
             .collect();
-        let mut draws: Vec<(u32, u32, usize)> = data
+        let draws = data
             .mesh
             .batches
             .iter()
             .map(|b| (b.first, b.count, b.material.index()))
             .collect();
-        draws.sort_by_key(|&(_, _, m)| data.materials[m].alpha == AlphaMode::Translucent);
         self.scene = Some(GpuScene {
             generation: data.generation,
             linear_filter,

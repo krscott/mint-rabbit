@@ -220,10 +220,19 @@ fn joints(file: &CFile, model: &str) -> Result<Vec<Joint>, ImportError> {
                 return Err(bad());
             }
             let dl = f[0].as_expr().and_then(Expr::as_ident).ok_or_else(bad)?;
+            // Translucent (XLU) joints draw after every opaque one, with their
+            // own depth rules; villagers do not use them.
+            let flag = f[2].as_expr().and_then(Expr::as_ident);
+            if flag != Some("cKF_JOINT_FLAG_DISP_OPA") {
+                return Err(malformed(
+                    file,
+                    format!("{table_name}[{i}] is not drawn opaque (cKF_JOINT_FLAG_DISP_OPA)"),
+                ));
+            }
             let int = |k: usize| f[k].as_expr().and_then(Expr::as_int).ok_or_else(bad);
             Ok(Joint {
                 dl: (dl != "NULL").then(|| dl.to_owned()),
-                children: int(1)? as usize,
+                children: usize::try_from(int(1)?).map_err(|_| bad())?,
                 translation: [int(3)?, int(4)?, int(5)?],
             })
         })
@@ -566,7 +575,14 @@ mod tests {
                     s
                 });
             let file = CFile::parse_str(&path, &text).unwrap();
-            let js = joints(&file, &model).unwrap();
+            count += 1;
+            let js = match joints(&file, &model) {
+                Ok(js) => js,
+                Err(e) => {
+                    refused.insert(model.clone(), e.to_string());
+                    continue;
+                }
+            };
             assert!(parents(&js).is_some(), "{model}");
             // Export relies on every model sharing this skeleton.
             assert_eq!(
@@ -574,7 +590,6 @@ mod tests {
                 crate::VILLAGER_JOINT_CHILDREN.map(usize::from),
                 "{model}"
             );
-            count += 1;
             for j in &js {
                 let Some(dl) = &j.dl else { continue };
                 let list = file.get(dl).unwrap().init.as_list().unwrap();
