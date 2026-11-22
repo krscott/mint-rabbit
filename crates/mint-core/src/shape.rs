@@ -212,7 +212,10 @@ impl Shape {
 /// get exactly the same points and agree on which pixels it covers.
 fn flatten_cubic(segment: [Vec2; 4], out: &mut Vec<Vec2>) {
     let end = segment[3];
-    let reversed = (end.x, end.y) < (segment[0].x, segment[0].y);
+    // By the ends, then the controls, so a loop back to its start has a
+    // fixed direction too.
+    let key = |a: Vec2, b: Vec2| (a.x, a.y, b.x, b.y);
+    let reversed = key(end, segment[2]) < key(segment[0], segment[1]);
     let [p0, p1, p2, p3] = if reversed {
         [segment[3], segment[2], segment[1], segment[0]]
     } else {
@@ -308,7 +311,9 @@ impl Outline {
         }
     }
 
-    /// Distance from `p` to the nearest point of the path itself.
+    /// Distance from `p` to the nearest point of the path itself. Each edge
+    /// is measured from the same one of its ends whichever way the path runs,
+    /// so a stroke and its reverse cover the same pixels.
     #[must_use]
     pub fn distance(&self, p: Vec2) -> f32 {
         if self.points.len() == 1 {
@@ -316,6 +321,11 @@ impl Outline {
         }
         self.edges()
             .map(|(a, b)| {
+                let (a, b) = if (b.x, b.y) < (a.x, a.y) {
+                    (b, a)
+                } else {
+                    (a, b)
+                };
                 let ab = b - a;
                 let t =
                     ((p - a).dot(ab) / ab.length_squared().max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
@@ -562,6 +572,43 @@ mod tests {
         for p in [Vec2::splat(0.5), Vec2::new(1.5, 1.5), Vec2::new(2.0, 1.7)] {
             assert_eq!(halves.iter().filter(|o| o.covers(p)).count(), 1, "{p}");
         }
+
+        // A stroke and its reverse cover the same pixels.
+        let style = Style::Stroke {
+            width: 1.0,
+            closed: false,
+        };
+        let line = [Vec2::ZERO, Vec2::new(3.0, 4.0)].map(Anchor::corner);
+        let forward = Shape::new(line.to_vec(), style, PaletteIndex(0))
+            .unwrap()
+            .outline();
+        let mut back = line;
+        back.reverse();
+        let back = Shape::new(back.to_vec(), style, PaletteIndex(0))
+            .unwrap()
+            .outline();
+        for y in 0..5 {
+            for x in 0..4 {
+                let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                assert_eq!(forward.covers(c), back.covers(c), "{c}");
+            }
+        }
+
+        // A loop back to its own anchor flattens to the same points in
+        // either direction.
+        let (a, h1, h2) = (Vec2::splat(2.0), Vec2::new(-2.0, 6.0), Vec2::new(13.0, 4.0));
+        let looped = |handle_out: Vec2, handle_in: Vec2| {
+            fill(vec![Anchor {
+                point: a,
+                handle_in,
+                handle_out,
+            }])
+            .outline()
+        };
+        let mut reversed: Vec<Vec2> = looped(h2, h1).points().to_vec();
+        reversed.reverse();
+        reversed.rotate_right(1);
+        assert_eq!(looped(h1, h2).points(), &reversed[..]);
 
         // Two fills sharing a curve in opposite directions cover each pixel
         // center beside it exactly once.
