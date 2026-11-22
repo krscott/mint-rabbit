@@ -224,7 +224,6 @@ impl Placement {
 }
 
 impl TextureView {
-    /// Cancels any drawing in progress, as when the tool or texture changes.
     /// Whether a drag is in progress, during which nothing else should
     /// change the project.
     pub fn dragging(&self) -> bool {
