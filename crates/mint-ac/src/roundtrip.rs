@@ -390,6 +390,47 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
         Err(ExportError::ClothingSize(_))
     ));
 
+    // A 24-wide body texture cannot repeat across U.
+    let mut textures = p.textures().to_vec();
+    let body = textures
+        .iter()
+        .position(|t| t.slot.0 == crate::SLOT_BODY)
+        .unwrap();
+    let narrow = mint_core::IndexedImage::new(
+        glam::UVec2::new(24, 8),
+        vec![mint_core::PaletteIndex(0); 24 * 8],
+    )
+    .unwrap();
+    textures[body] = mint_core::Texture::painted(
+        "narrow",
+        mint_core::Slot(crate::SLOT_BODY.into()),
+        glam::UVec2::new(24, 8),
+        [("1".to_owned(), narrow)],
+    )
+    .unwrap();
+    let mut materials = p.materials().to_vec();
+    for m in &mut materials {
+        if m.texture == mint_core::TextureId(body as u32) {
+            m.wrap = [mint_core::Wrap::Repeat, mint_core::Wrap::Clamp];
+        }
+    }
+    let narrow = Project::new(
+        p.target().clone(),
+        p.palette().clone(),
+        p.model().clone(),
+        textures,
+        materials,
+        p.pose().clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        export(&narrow, "rt_1", "rt_1"),
+        Err(ExportError::Gx {
+            source: gx::GxError::WrapNeedsPowerOfTwo { .. },
+            ..
+        })
+    ));
+
     // Both display lists would be named body_rt_model.
     let mut renamed = p.model().clone();
     renamed.node_mut(NodeId(HEAD_JOINT as u32)).name = "body".into();
