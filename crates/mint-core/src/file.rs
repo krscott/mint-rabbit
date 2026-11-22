@@ -28,6 +28,8 @@ const FORMAT: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
+    #[error("{0} is a link; images are saved only into a directory inside the project")]
+    ImageDirLink(PathBuf),
     #[error("{0}: {1}")]
     Io(PathBuf, std::io::Error),
     #[error("{0}: {1}")]
@@ -220,6 +222,11 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     let previous = referenced_images(dir);
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    let linked =
+        std::fs::symlink_metadata(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    if !linked.is_dir() {
+        return Err(SaveError::ImageDirLink(images));
+    }
     let mut written = Vec::new();
     let mut image = |stem: String, png: Vec<u8>| -> Result<String, SaveError> {
         let rel = format!("{IMAGE_DIR}/{stem}-{:016x}.png", fnv1a(&png));
@@ -290,6 +297,24 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     })
 }
 
+/// Whether `name` has the form save gives images, such as
+/// `3-0-0123456789abcdef.png` or `4-preview-0123456789abcdef.png`.
+fn is_saved_image_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".png") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match stem.split('-').collect::<Vec<_>>()[..] {
+        [t, v, hash] => {
+            digits(t)
+                && (digits(v) || v == "preview")
+                && hash.len() == 16
+                && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        _ => false,
+    }
+}
+
 /// The images the project file in `dir` refers to that a save may later
 /// remove, or none if there is no readable project file.
 fn referenced_images(dir: &Path) -> Vec<PathBuf> {
@@ -309,7 +334,10 @@ fn referenced_images(dir: &Path) -> Vec<PathBuf> {
         .filter(|rel| {
             let path = Path::new(rel);
             path.parent() == Some(Path::new(IMAGE_DIR))
-                && path.extension().is_some_and(|e| e == "png")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_saved_image_name)
         })
         // Resolved inside the project directory, as load requires.
         .filter_map(|rel| image_path(dir, &rel).ok())
@@ -387,7 +415,7 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
                     .map(|v| {
                         Ok((
                             v.name.clone(),
-                            read_indexed(&image_path(dir, &v.underlay)?)?,
+                            read_indexed(&image_path(dir, &v.underlay)?, size)?,
                         ))
                     })
                     .collect::<Result<Vec<_>, LoadError>>()?;
@@ -405,13 +433,7 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
                 texture
             }
             ContentFile::External { preview } => {
-                let image = read_rgba(&image_path(dir, &preview)?)?;
-                if image.size != size {
-                    return Err(LoadError::Image(
-                        image_path(dir, &preview)?,
-                        format!("is {} but the texture is {size}", image.size),
-                    ));
-                }
+                let image = read_rgba(&image_path(dir, &preview)?, size)?;
                 Texture::external(t.name, slot, image)
             }
         };
@@ -595,14 +617,15 @@ fn relative_inside(rel: &str) -> bool {
 }
 
 /// Resolves an image path from the project file, which must stay inside
-/// the project directory, links included.
+/// the project directory, links included; returns its resolved path.
 fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     if !relative_inside(rel) {
         return Err(LoadError::ImagePath(rel.to_owned()));
     }
-    let path = dir.join(rel);
     let resolve = |p: &Path| p.canonicalize().map_err(|e| LoadError::Io(p.to_owned(), e));
-    if resolve(&path)?.starts_with(resolve(dir)?) {
+    let path = resolve(&dir.join(rel))?;
+    if path.starts_with(resolve(dir)?) {
+        // The resolved path, so the file checked is the file opened.
         Ok(path)
     } else {
         Err(LoadError::ImagePath(rel.to_owned()))
@@ -612,7 +635,7 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
 /// Replaces the file at `path` with `bytes` all at once: they are written
 /// to a new, uniquely named file beside it (never one already there, such as
 /// a planted link), synced, and renamed over it, and the directory is synced
-/// so the rename survives a power loss. The file keeps the permissions of
+/// where possible so the rename survives a power loss. The file keeps the permissions of
 /// the one it replaces, and a new file gets the usual ones for the umask. A
 /// failed write removes the new file and leaves the old one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -631,7 +654,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
-    std::fs::File::open(dir)?.sync_all()
+    // The file is in place; a directory that can't be synced only loses
+    // durability, so it isn't an error.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 fn encode_indexed(image: &IndexedImage, palette: &Palette) -> Result<Vec<u8>, png::EncodingError> {
@@ -669,12 +697,24 @@ fn encode_rgba(image: &RgbaImage) -> Result<Vec<u8>, png::EncodingError> {
 
 /// Decodes a PNG with no color conversion, returning its size, color type,
 /// and pixel bytes.
-fn read_png(path: &Path) -> Result<(UVec2, png::ColorType, png::BitDepth, Vec<u8>), LoadError> {
+fn read_png(
+    path: &Path,
+    size: UVec2,
+) -> Result<(png::ColorType, png::BitDepth, Vec<u8>), LoadError> {
     let file = std::fs::File::open(path).map_err(|e| LoadError::Io(path.to_owned(), e))?;
     let png_err = |e| LoadError::Png(path.to_owned(), e);
     let mut dec = png::Decoder::new(BufReader::new(file));
     dec.set_transformations(png::Transformations::IDENTITY);
     let mut reader = dec.read_info().map_err(png_err)?;
+    // Checked before decoding, so a wrong file can't make load allocate for
+    // an image of any size.
+    let actual = UVec2::new(reader.info().width, reader.info().height);
+    if actual != size {
+        return Err(LoadError::Image(
+            path.to_owned(),
+            format!("is {actual} but the texture is {size}"),
+        ));
+    }
     let mut buf = vec![
         0;
         reader.output_buffer_size().ok_or_else(|| LoadError::Image(
@@ -684,16 +724,11 @@ fn read_png(path: &Path) -> Result<(UVec2, png::ColorType, png::BitDepth, Vec<u8
     ];
     let info = reader.next_frame(&mut buf).map_err(png_err)?;
     buf.truncate(info.buffer_size());
-    Ok((
-        UVec2::new(info.width, info.height),
-        info.color_type,
-        info.bit_depth,
-        buf,
-    ))
+    Ok((info.color_type, info.bit_depth, buf))
 }
 
-fn read_indexed(path: &Path) -> Result<IndexedImage, LoadError> {
-    let (size, color, depth, pixels) = read_png(path)?;
+fn read_indexed(path: &Path, size: UVec2) -> Result<IndexedImage, LoadError> {
+    let (color, depth, pixels) = read_png(path, size)?;
     if (color, depth) != (png::ColorType::Indexed, png::BitDepth::Eight) {
         return Err(LoadError::Image(
             path.to_owned(),
@@ -704,8 +739,8 @@ fn read_indexed(path: &Path) -> Result<IndexedImage, LoadError> {
         .map_err(|e| LoadError::Image(path.to_owned(), e.to_string()))
 }
 
-fn read_rgba(path: &Path) -> Result<RgbaImage, LoadError> {
-    let (size, color, depth, pixels) = read_png(path)?;
+fn read_rgba(path: &Path, size: UVec2) -> Result<RgbaImage, LoadError> {
+    let (color, depth, pixels) = read_png(path, size)?;
     if (color, depth) != (png::ColorType::Rgba, png::BitDepth::Eight) {
         return Err(LoadError::Image(
             path.to_owned(),
@@ -907,6 +942,33 @@ mod tests {
             0o664
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn save_refuses_a_linked_image_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(shared.path(), dir.path().join(IMAGE_DIR)).unwrap();
+        assert!(matches!(
+            save(&sample(), dir.path()),
+            Err(SaveError::ImageDirLink(_))
+        ));
+        assert_eq!(std::fs::read_dir(shared.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_saved_image_names_are_cleaned_up() {
+        assert!(is_saved_image_name("3-0-0123456789abcdef.png"));
+        assert!(is_saved_image_name("12-preview-0123456789abcdef.png"));
+        for name in [
+            "reference.png",
+            "3-0.png",
+            "3-0-0123456789ABCDEF.png",
+            "3-x-0123456789abcdef.png",
+            "3-0-0123456789abcdef.ron",
+        ] {
+            assert!(!is_saved_image_name(name), "{name}");
+        }
     }
 
     #[test]
