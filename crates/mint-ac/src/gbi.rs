@@ -108,6 +108,9 @@ pub struct UsedVertex {
 pub struct DlTriangle {
     pub vertices: [UsedVertex; 3],
     pub state: DrawState,
+    /// Matrix slot current when the triangle is drawn, or `None` for the
+    /// caller's.
+    pub draw_matrix: Option<u32>,
 }
 
 /// The geometry one display list draws.
@@ -458,7 +461,11 @@ impl Interp<'_> {
                     .flatten()
                     .ok_or_else(|| format!("triangle uses empty vertex slot {slot}"))?;
             }
-            self.out.triangles.push(DlTriangle { vertices, state });
+            self.out.triangles.push(DlTriangle {
+                vertices,
+                state,
+                draw_matrix: self.matrix,
+            });
             self.pending_triangles -= 1;
         }
         Ok(())

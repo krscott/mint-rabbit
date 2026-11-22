@@ -319,11 +319,13 @@ pub(crate) fn build_project(
                 .ok_or_else(|| malformed(model_file, format!("{vertex_array}[{i}] is not a Vtx")))
         })
         .collect::<Result<_, _>>()?;
-    // Flag 0 vertices are transformed by the matrix current when they load,
-    // which is what seam detection relies on.
-    if let Some((i, v)) = raw_vertices.iter().enumerate().find(|(_, v)| v.flag != 0) {
+    // emu64 transforms flag 0 ("shared") vertices by the matrix current when
+    // they load, and flag 1 ("non-shared") vertices by the matrix current when
+    // they are drawn. The game loads seam vertices with flag 0 and a joint's
+    // own vertices with flag 1.
+    if let Some((i, v)) = raw_vertices.iter().enumerate().find(|(_, v)| v.flag > 1) {
         return Err(model_err(format!(
-            "{vertex_array}[{i}] has flag {}; only flag 0 vertices are supported",
+            "{vertex_array}[{i}] has flag {}; only flags 0 and 1 are supported",
             v.flag
         )));
     }
@@ -459,6 +461,12 @@ pub(crate) fn build_project(
                 uv: Vec2::ZERO,
             }; 3];
             for (c, used) in corners.iter_mut().zip(t.vertices) {
+                if raw_vertices[used.index].flag == 1 && used.matrix != t.draw_matrix {
+                    return Err(model_err(format!(
+                        "joint {i}: {vertex_array}[{}] is transformed when drawn, but is drawn under a different matrix than it was loaded under",
+                        used.index
+                    )));
+                }
                 let followed = match used.matrix {
                     None => i,
                     Some(slot) => *slots.get(&slot).ok_or_else(|| {

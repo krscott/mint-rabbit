@@ -248,6 +248,10 @@ fn texture_c(project: &Project, set: &str, layout: &Layout) -> Result<String, Ex
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct OutVtx {
     pos: [i16; 3],
+    /// 0 for seam vertices, transformed when loaded under the other node's
+    /// matrix; 1 for the node's own, transformed when drawn, as the game's
+    /// lists do.
+    flag: u8,
     st: [i16; 2],
     normal: [u8; 3],
 }
@@ -453,36 +457,40 @@ impl ModelWriter<'_> {
             .copied()
             .partition(|(v, _)| mesh.vertices[*v as usize].followed(node) != node);
         let mut slot_of: HashMap<CornerKey, usize> = HashMap::new();
-        let mut load =
-            |this: &mut Self, body: &mut String, group: &[CornerKey]| -> Result<(), String> {
-                if group.is_empty() {
-                    return Ok(());
-                }
-                let first = this.vertices.len();
-                let first_slot = slot_of.len();
-                for &(v, st) in group {
-                    let vert = mesh.vertices[v as usize];
-                    let p = vert.position;
-                    let n = vert.normal * 127.0;
-                    this.vertices.push(OutVtx {
-                        pos: [
-                            to_i16(p.x, "position")?,
-                            to_i16(p.y, "position")?,
-                            to_i16(p.z, "position")?,
-                        ],
-                        st,
-                        normal: [n.x, n.y, n.z].map(|c| c.round().clamp(-128.0, 127.0) as i8 as u8),
-                    });
-                    slot_of.insert((v, st), slot_of.len());
-                }
-                let _ = writeln!(
-                    body,
-                    "    gsSPVertex(&{}_v[{first}], {}, {first_slot}),",
-                    this.model,
-                    group.len(),
-                );
-                Ok(())
-            };
+        let mut load = |this: &mut Self,
+                        body: &mut String,
+                        group: &[CornerKey],
+                        flag: u8|
+         -> Result<(), String> {
+            if group.is_empty() {
+                return Ok(());
+            }
+            let first = this.vertices.len();
+            let first_slot = slot_of.len();
+            for &(v, st) in group {
+                let vert = mesh.vertices[v as usize];
+                let p = vert.position;
+                let n = vert.normal * 127.0;
+                this.vertices.push(OutVtx {
+                    pos: [
+                        to_i16(p.x, "position")?,
+                        to_i16(p.y, "position")?,
+                        to_i16(p.z, "position")?,
+                    ],
+                    flag,
+                    st,
+                    normal: [n.x, n.y, n.z].map(|c| c.round().clamp(-128.0, 127.0) as i8 as u8),
+                });
+                slot_of.insert((v, st), slot_of.len());
+            }
+            let _ = writeln!(
+                body,
+                "    gsSPVertex(&{}_v[{first}], {}, {first_slot}),",
+                this.model,
+                group.len(),
+            );
+            Ok(())
+        };
         if let Some(seam) = seam
             && !seam_verts.is_empty()
         {
@@ -491,14 +499,14 @@ impl ModelWriter<'_> {
                 body,
                 "    gsSPMatrix(anime_6_model + sizeof(Mtx) * {s}, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW),"
             );
-            load(self, body, &seam_verts)?;
+            load(self, body, &seam_verts, 0)?;
             let own = self.matrix(node)?;
             let _ = writeln!(
                 body,
                 "    gsSPMatrix(anime_6_model + sizeof(Mtx) * {own}, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW),"
             );
         }
-        load(self, body, &own_verts)?;
+        load(self, body, &own_verts, 1)?;
 
         let tris: Vec<[usize; 3]> = batch.iter().map(|t| t.map(|k| slot_of[&k])).collect();
         let fmt = |t: Option<&[usize; 3]>| {
@@ -618,8 +626,16 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
     for v in &w.vertices {
         let _ = writeln!(
             out,
-            "    {{ {}, {}, {}, 0, {}, {}, {}, {}, {}, 255 }},",
-            v.pos[0], v.pos[1], v.pos[2], v.st[0], v.st[1], v.normal[0], v.normal[1], v.normal[2]
+            "    {{ {}, {}, {}, {}, {}, {}, {}, {}, {}, 255 }},",
+            v.pos[0],
+            v.pos[1],
+            v.pos[2],
+            v.flag,
+            v.st[0],
+            v.st[1],
+            v.normal[0],
+            v.normal[1],
+            v.normal[2]
         );
     }
     out.push_str("};\n\n");
