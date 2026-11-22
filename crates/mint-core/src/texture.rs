@@ -1,6 +1,9 @@
-//! Palette, textures, variants, and materials.
+//! Palette, textures, variants, layers, and materials.
 
-use glam::UVec2;
+use glam::{UVec2, Vec2};
+
+use crate::Shape;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgba8 {
     pub r: u8,
@@ -60,6 +63,27 @@ impl Palette {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    #[must_use]
+    pub fn contains(&self, index: PaletteIndex) -> bool {
+        usize::from(index.0) < self.entries.len()
+    }
+
+    pub(crate) fn set(&mut self, index: PaletteIndex, color: Rgba8) {
+        self.entries[usize::from(index.0)] = color;
+    }
+
+    pub(crate) fn push(&mut self, color: Rgba8) -> Result<PaletteIndex, PaletteFull> {
+        if self.entries.len() == Self::MAX_LEN {
+            return Err(PaletteFull);
+        }
+        self.entries.push(color);
+        Ok(PaletteIndex((self.entries.len() - 1) as u8))
+    }
+
+    pub(crate) fn remove(&mut self, index: PaletteIndex) {
+        self.entries.remove(usize::from(index.0));
+    }
 }
 
 /// A raster image whose pixels are palette indices, row-major from the top
@@ -103,6 +127,29 @@ impl IndexedImage {
     #[must_use]
     pub fn pixel(&self, x: u32, y: u32) -> PaletteIndex {
         self.pixels[(y * self.size.x + x) as usize]
+    }
+
+    /// Replaces every pixel's index with `f` of it.
+    pub(crate) fn remap(&mut self, f: impl Fn(PaletteIndex) -> PaletteIndex) {
+        for p in &mut self.pixels {
+            *p = f(*p);
+        }
+    }
+
+    /// Sets each pixel whose center `shape` covers to its color.
+    fn paint(&mut self, shape: &Shape) {
+        let outline = shape.outline();
+        let (min, max) = outline.bounds();
+        // Pixels whose centers (x + 0.5) fall within the bounds.
+        let lo = |v: f32| (v - 0.5).ceil().max(0.0) as u32;
+        let hi = |v: f32, size: u32| ((v - 0.5).floor() + 1.0).clamp(0.0, size as f32) as u32;
+        for y in lo(min.y)..hi(max.y, self.size.y) {
+            for x in lo(min.x)..hi(max.x, self.size.x) {
+                if outline.covers(Vec2::new(x as f32 + 0.5, y as f32 + 0.5)) {
+                    self.pixels[(y * self.size.x + x) as usize] = shape.color();
+                }
+            }
+        }
     }
 }
 
@@ -158,16 +205,123 @@ pub enum TextureContent {
     External { preview: RgbaImage },
 }
 
+/// An ordered list of shapes in one variant; later shapes draw over
+/// earlier ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layer {
+    pub name: String,
+    /// Hidden layers neither show nor export.
+    pub visible: bool,
+    /// Locked layers are not edited; the app enforces it.
+    pub locked: bool,
+    /// Opacity in the views only, from 0 to 1; export ignores it.
+    pub opacity: f32,
+    shapes: Vec<Shape>,
+}
+
+impl Layer {
+    /// An empty, visible, unlocked, opaque layer.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            visible: true,
+            locked: false,
+            opacity: 1.0,
+            shapes: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn shapes(&self) -> &[Shape] {
+        &self.shapes
+    }
+
+    /// The shapes, to edit or reorder; adding one goes through
+    /// [`crate::Project::insert_shape`], which checks its color.
+    pub fn shapes_mut(&mut self) -> &mut [Shape] {
+        &mut self.shapes
+    }
+
+    pub fn remove_shape(&mut self, index: usize) -> Shape {
+        self.shapes.remove(index)
+    }
+
+    /// Moves the shape at `from` so that it ends up at `to`.
+    pub fn move_shape(&mut self, from: usize, to: usize) {
+        let shape = self.shapes.remove(from);
+        self.shapes.insert(to, shape);
+    }
+
+    pub(crate) fn insert_shape(&mut self, index: usize, shape: Shape) {
+        self.shapes.insert(index, shape);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Variant {
     pub name: String,
     underlay: IndexedImage,
+    /// Bottom to top.
+    layers: Vec<Layer>,
 }
 
 impl Variant {
     #[must_use]
     pub fn underlay(&self) -> &IndexedImage {
         &self.underlay
+    }
+
+    pub(crate) fn underlay_mut(&mut self) -> &mut IndexedImage {
+        &mut self.underlay
+    }
+
+    /// The layers, bottom to top.
+    #[must_use]
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    pub fn layer_mut(&mut self, index: usize) -> &mut Layer {
+        &mut self.layers[index]
+    }
+
+    pub(crate) fn layers_mut(&mut self) -> &mut [Layer] {
+        &mut self.layers
+    }
+
+    /// Inserts an empty layer at `index`; layers with shapes go through
+    /// [`crate::Project::insert_layer`], which checks their colors.
+    pub fn add_layer(&mut self, index: usize, name: impl Into<String>) {
+        self.layers.insert(index, Layer::new(name));
+    }
+
+    pub(crate) fn insert_layer(&mut self, index: usize, layer: Layer) {
+        self.layers.insert(index, layer);
+    }
+
+    pub fn remove_layer(&mut self, index: usize) -> Layer {
+        self.layers.remove(index)
+    }
+
+    /// Moves the layer at `from` so that it ends up at `to`.
+    pub fn move_layer(&mut self, from: usize, to: usize) {
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+    }
+
+    /// The image the variant exports: the underlay with the shapes of every
+    /// visible layer on top, each pixel taking the topmost shape that covers
+    /// its center.
+    #[must_use]
+    pub fn rasterize(&self) -> IndexedImage {
+        let mut image = self.underlay.clone();
+        for layer in self.layers.iter().filter(|l| l.visible) {
+            for shape in &layer.shapes {
+                image.paint(shape);
+            }
+        }
+        image
     }
 }
 
@@ -200,6 +354,7 @@ impl Texture {
                     Ok(Variant {
                         name: variant,
                         underlay,
+                        layers: Vec::new(),
                     })
                 } else {
                     Err(TextureError::SizeMismatch {
@@ -248,6 +403,13 @@ impl Texture {
         match &self.content {
             TextureContent::Painted(v) => v,
             TextureContent::External { .. } => &[],
+        }
+    }
+
+    pub fn variants_mut(&mut self) -> &mut [Variant] {
+        match &mut self.content {
+            TextureContent::Painted(v) => v,
+            TextureContent::External { .. } => &mut [],
         }
     }
 }
@@ -305,6 +467,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TextureError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn rasterize_paints_visible_layers_in_order() {
+        use crate::{Style, shape};
+        let underlay = IndexedImage::new(UVec2::new(4, 2), vec![PaletteIndex(0); 8]).unwrap();
+        let mut t = Texture::painted(
+            "body",
+            Slot("body".into()),
+            UVec2::new(4, 2),
+            [("1".to_owned(), underlay)],
+        )
+        .unwrap();
+        let v = &mut t.variants_mut()[0];
+        let rect = |a: Vec2, b: Vec2, c: u8| {
+            Shape::new(shape::rectangle(a, b), Style::Fill, PaletteIndex(c)).unwrap()
+        };
+        v.add_layer(0, "low");
+        v.add_layer(1, "high");
+        v.layer_mut(0)
+            .insert_shape(0, rect(Vec2::ZERO, Vec2::new(3.0, 2.0), 1));
+        // Covers the centers of pixels 2 and 3 on the top row only.
+        v.layer_mut(1)
+            .insert_shape(0, rect(Vec2::new(1.6, -1.0), Vec2::new(9.0, 0.9), 2));
+        let px = |v: &Variant| -> Vec<u8> { v.rasterize().pixels().iter().map(|i| i.0).collect() };
+        assert_eq!(px(v), [1, 1, 2, 2, 1, 1, 1, 0]);
+        v.layer_mut(1).visible = false;
+        assert_eq!(px(v), [1, 1, 1, 0, 1, 1, 1, 0]);
+        assert_eq!(v.underlay().pixels(), &[PaletteIndex(0); 8]);
     }
 
     #[test]

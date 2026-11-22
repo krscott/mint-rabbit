@@ -1,0 +1,494 @@
+//! Shapes: Bézier paths in texture space, filled or stroked in one palette
+//! color.
+//!
+//! Texture space is a texture's UV space scaled by its pixel size: one unit is
+//! one texel, the origin is the top-left corner, and pixel (x, y) has its
+//! center at (x + 0.5, y + 0.5).
+
+use glam::{Affine2, Vec2};
+
+use crate::PaletteIndex;
+
+/// Flattening tolerance in texels: curves are approximated by lines that
+/// stray at most this far, well under the half-texel that decides coverage.
+const TOLERANCE: f32 = 0.05;
+
+/// Handle length, as a fraction of the radius, of a cubic Bézier quarter
+/// circle.
+const KAPPA: f32 = 0.552_284_8;
+
+/// A point on a path with the handles that shape the curve on either side of
+/// it, as offsets from the point. Zero handles make a sharp corner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    pub point: Vec2,
+    /// Handle of the segment arriving at the point.
+    pub handle_in: Vec2,
+    /// Handle of the segment leaving the point.
+    pub handle_out: Vec2,
+}
+
+impl Anchor {
+    #[must_use]
+    pub const fn corner(point: Vec2) -> Self {
+        Self {
+            point,
+            handle_in: Vec2::ZERO,
+            handle_out: Vec2::ZERO,
+        }
+    }
+
+    /// A smooth anchor whose handles mirror each other.
+    #[must_use]
+    pub fn smooth(point: Vec2, handle_out: Vec2) -> Self {
+        Self {
+            point,
+            handle_in: -handle_out,
+            handle_out,
+        }
+    }
+}
+
+/// How a shape covers pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Style {
+    /// The path closes back to its first anchor and covers its inside, by the
+    /// nonzero winding rule.
+    Fill,
+    /// Covers pixels within half of `width` texels of the path, with round
+    /// ends and joins.
+    Stroke { width: f32, closed: bool },
+}
+
+impl Style {
+    fn is_valid(self) -> bool {
+        match self {
+            Self::Fill => true,
+            Self::Stroke { width, .. } => width.is_finite() && width > 0.0,
+        }
+    }
+
+    #[must_use]
+    pub fn closed(self) -> bool {
+        match self {
+            Self::Fill => true,
+            Self::Stroke { closed, .. } => closed,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ShapeError {
+    #[error("a shape needs at least one anchor")]
+    NoAnchors,
+    #[error("stroke width must be a positive number of texels")]
+    BadWidth,
+}
+
+/// A single vector element of a layer: a path of cubic Bézier segments
+/// between anchors, with a style and a palette color.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shape {
+    /// Never empty.
+    anchors: Vec<Anchor>,
+    style: Style,
+    color: PaletteIndex,
+}
+
+impl Shape {
+    pub fn new(
+        anchors: Vec<Anchor>,
+        style: Style,
+        color: PaletteIndex,
+    ) -> Result<Self, ShapeError> {
+        if anchors.is_empty() {
+            return Err(ShapeError::NoAnchors);
+        }
+        if !style.is_valid() {
+            return Err(ShapeError::BadWidth);
+        }
+        Ok(Self {
+            anchors,
+            style,
+            color,
+        })
+    }
+
+    #[must_use]
+    pub fn anchors(&self) -> &[Anchor] {
+        &self.anchors
+    }
+
+    pub fn anchors_mut(&mut self) -> &mut [Anchor] {
+        &mut self.anchors
+    }
+
+    /// Inserts an anchor before position `index`.
+    pub fn insert_anchor(&mut self, index: usize, anchor: Anchor) {
+        self.anchors.insert(index, anchor);
+    }
+
+    /// Removes an anchor, unless it is the last one left.
+    pub fn remove_anchor(&mut self, index: usize) -> Result<Anchor, ShapeError> {
+        if self.anchors.len() == 1 {
+            return Err(ShapeError::NoAnchors);
+        }
+        Ok(self.anchors.remove(index))
+    }
+
+    #[must_use]
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
+    pub fn set_style(&mut self, style: Style) -> Result<(), ShapeError> {
+        if !style.is_valid() {
+            return Err(ShapeError::BadWidth);
+        }
+        self.style = style;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn color(&self) -> PaletteIndex {
+        self.color
+    }
+
+    /// Sets the color without checking it against a palette; projects check
+    /// through [`crate::Project::set_shape_color`].
+    pub(crate) fn set_color(&mut self, color: PaletteIndex) {
+        self.color = color;
+    }
+
+    /// Applies `transform` to every anchor and handle.
+    pub fn transform(&mut self, transform: Affine2) {
+        for a in &mut self.anchors {
+            a.point = transform.transform_point2(a.point);
+            a.handle_in = transform.transform_vector2(a.handle_in);
+            a.handle_out = transform.transform_vector2(a.handle_out);
+        }
+    }
+
+    /// The cubic segments as `[start, control, control, end]`, including the
+    /// closing segment of a closed path.
+    pub fn segments(&self) -> impl Iterator<Item = [Vec2; 4]> + '_ {
+        let n = self.anchors.len();
+        let count = if self.style.closed() && n > 1 {
+            n
+        } else {
+            n - 1
+        };
+        (0..count).map(move |i| {
+            let a = self.anchors[i];
+            let b = self.anchors[(i + 1) % n];
+            [
+                a.point,
+                a.point + a.handle_out,
+                b.point + b.handle_in,
+                b.point,
+            ]
+        })
+    }
+
+    /// The path as a polyline within [`TOLERANCE`] of the curves, with the
+    /// style that decides which pixels it covers.
+    #[must_use]
+    pub fn outline(&self) -> Outline {
+        let mut points = vec![self.anchors[0].point];
+        for seg in self.segments() {
+            flatten_cubic(seg, &mut points);
+        }
+        if self.style.closed() && points.len() > 1 {
+            // The closing segment ends on the first point again.
+            points.pop();
+        }
+        Outline {
+            points,
+            style: self.style,
+        }
+    }
+}
+
+/// Appends points along a cubic, excluding its start, enough of them that
+/// the lines between stay within [`TOLERANCE`] (Wang's formula).
+fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
+    let d = (p0 - 2.0 * p1 + p2)
+        .length()
+        .max((p1 - 2.0 * p2 + p3).length());
+    let n = ((0.75 * d / TOLERANCE).sqrt().ceil() as usize).clamp(1, 1024);
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let u = 1.0 - t;
+        out.push(u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3);
+    }
+}
+
+/// A shape flattened to lines, ready for coverage tests.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outline {
+    /// Never empty. A closed outline returns from the last point to the
+    /// first.
+    points: Vec<Vec2>,
+    style: Style,
+}
+
+impl Outline {
+    #[must_use]
+    pub fn points(&self) -> &[Vec2] {
+        &self.points
+    }
+
+    #[must_use]
+    pub fn closed(&self) -> bool {
+        self.style.closed()
+    }
+
+    fn edges(&self) -> impl Iterator<Item = (Vec2, Vec2)> + '_ {
+        let n = self.points.len();
+        let count = if self.closed() { n } else { n - 1 };
+        (0..count).map(move |i| (self.points[i], self.points[(i + 1) % n]))
+    }
+
+    /// The smallest box holding every covered point, as (min, max).
+    #[must_use]
+    pub fn bounds(&self) -> (Vec2, Vec2) {
+        let (min, max) = self
+            .points
+            .iter()
+            .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &p| {
+                (lo.min(p), hi.max(p))
+            });
+        let pad = match self.style {
+            Style::Fill => 0.0,
+            Style::Stroke { width, .. } => width / 2.0,
+        };
+        (min - pad, max + pad)
+    }
+
+    /// Whether the shape covers point `p`.
+    #[must_use]
+    pub fn covers(&self, p: Vec2) -> bool {
+        match self.style {
+            Style::Fill => self.winding(p) != 0,
+            Style::Stroke { width, .. } => self.distance(p) <= width / 2.0,
+        }
+    }
+
+    /// Distance from `p` to the nearest point of the path itself.
+    #[must_use]
+    pub fn distance(&self, p: Vec2) -> f32 {
+        if self.points.len() == 1 {
+            return p.distance(self.points[0]);
+        }
+        self.edges()
+            .map(|(a, b)| {
+                let ab = b - a;
+                let t =
+                    ((p - a).dot(ab) / ab.length_squared().max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
+                p.distance(a + ab * t)
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Winding number of the closed outline around `p`. Edges include their
+    /// lower end and exclude their upper one, so a point on a shared edge
+    /// counts once.
+    fn winding(&self, p: Vec2) -> i32 {
+        let mut w = 0;
+        let n = self.points.len();
+        for i in 0..n {
+            let (a, b) = (self.points[i], self.points[(i + 1) % n]);
+            let side = (b - a).perp_dot(p - a);
+            if a.y <= p.y && p.y < b.y && side > 0.0 {
+                w += 1;
+            } else if b.y <= p.y && p.y < a.y && side < 0.0 {
+                w -= 1;
+            }
+        }
+        w
+    }
+}
+
+/// Anchors of an axis-aligned ellipse, clockwise on screen from the right.
+#[must_use]
+pub fn ellipse(center: Vec2, radii: Vec2) -> Vec<Anchor> {
+    let (x, y) = (Vec2::new(radii.x, 0.0), Vec2::new(0.0, radii.y));
+    vec![
+        Anchor::smooth(center + x, y * KAPPA),
+        Anchor::smooth(center + y, -x * KAPPA),
+        Anchor::smooth(center - x, -y * KAPPA),
+        Anchor::smooth(center - y, x * KAPPA),
+    ]
+}
+
+/// Anchors of an axis-aligned rectangle with corners `a` and `b`.
+#[must_use]
+pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
+    let (min, max) = (a.min(b), a.max(b));
+    [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
+        .map(Anchor::corner)
+        .to_vec()
+}
+
+/// Smooth anchors through a freehand stroke: the points are simplified to
+/// those within `tolerance` texels of the stroke, then joined by
+/// Catmull-Rom curves. Returns no anchors for no points.
+#[must_use]
+pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
+    let mut kept = Vec::new();
+    if let (Some(&first), Some(&last)) = (points.first(), points.last()) {
+        kept.push(first);
+        simplify(points, tolerance, &mut kept);
+        if kept.len() == 1 && last != first {
+            kept.push(last);
+        }
+    }
+    let n = kept.len();
+    (0..n)
+        .map(|i| {
+            if i == 0 || i == n - 1 {
+                return Anchor::corner(kept[i]);
+            }
+            Anchor::smooth(kept[i], (kept[i + 1] - kept[i - 1]) / 6.0)
+        })
+        .collect()
+}
+
+/// Ramer-Douglas-Peucker: appends the points of `points[1..]` that are
+/// needed to stay within `tolerance`, ending with the last point.
+fn simplify(points: &[Vec2], tolerance: f32, out: &mut Vec<Vec2>) {
+    let [first, .., last] = points else { return };
+    let (first, last) = (*first, *last);
+    let line = last - first;
+    let far = points[1..points.len() - 1]
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let d = if line == Vec2::ZERO {
+                p.distance(first)
+            } else {
+                line.perp_dot(p - first).abs() / line.length()
+            };
+            (i + 1, d)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    match far {
+        Some((i, d)) if d > tolerance => {
+            simplify(&points[..=i], tolerance, out);
+            simplify(&points[i..], tolerance, out);
+        }
+        _ => out.push(last),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(anchors: Vec<Anchor>) -> Shape {
+        Shape::new(anchors, Style::Fill, PaletteIndex(1)).unwrap()
+    }
+
+    #[test]
+    fn shapes_need_anchors_and_a_positive_width() {
+        assert_eq!(
+            Shape::new(vec![], Style::Fill, PaletteIndex(0)),
+            Err(ShapeError::NoAnchors)
+        );
+        let bad = Style::Stroke {
+            width: 0.0,
+            closed: false,
+        };
+        let dot = vec![Anchor::corner(Vec2::ZERO)];
+        assert_eq!(
+            Shape::new(dot.clone(), bad, PaletteIndex(0)),
+            Err(ShapeError::BadWidth)
+        );
+        let mut s = fill(dot);
+        assert_eq!(s.remove_anchor(0), Err(ShapeError::NoAnchors));
+        assert_eq!(s.set_style(bad), Err(ShapeError::BadWidth));
+    }
+
+    #[test]
+    fn rectangle_fill_covers_its_inside() {
+        let o = fill(rectangle(Vec2::new(1.0, 1.0), Vec2::new(3.0, 2.0))).outline();
+        assert!(o.covers(Vec2::new(1.5, 1.5)));
+        assert!(o.covers(Vec2::new(2.5, 1.5)));
+        assert!(!o.covers(Vec2::new(0.5, 1.5)));
+        assert!(!o.covers(Vec2::new(1.5, 2.5)));
+    }
+
+    #[test]
+    fn ellipse_stays_close_to_a_circle() {
+        let o = fill(ellipse(Vec2::splat(8.0), Vec2::splat(4.0))).outline();
+        for &p in o.points() {
+            assert!((p.distance(Vec2::splat(8.0)) - 4.0).abs() < 0.01, "{p}");
+        }
+        assert!(o.covers(Vec2::new(11.5, 8.0)));
+        assert!(!o.covers(Vec2::new(11.0, 11.0)));
+    }
+
+    #[test]
+    fn nonzero_rule_covers_doubly_wound_regions() {
+        // A pentagram winds twice around its center.
+        let star: Vec<Anchor> = (0..5)
+            .map(|i| {
+                let a = i as f32 * 4.0 * std::f32::consts::PI / 5.0;
+                Anchor::corner(Vec2::splat(8.0) + 6.0 * Vec2::new(a.sin(), -a.cos()))
+            })
+            .collect();
+        let o = fill(star).outline();
+        assert!(o.covers(Vec2::splat(8.0)));
+        assert!(!o.covers(Vec2::new(1.0, 1.0)));
+    }
+
+    #[test]
+    fn strokes_cover_within_half_their_width() {
+        let line = vec![
+            Anchor::corner(Vec2::new(0.0, 0.0)),
+            Anchor::corner(Vec2::new(10.0, 0.0)),
+        ];
+        let style = Style::Stroke {
+            width: 2.0,
+            closed: false,
+        };
+        let o = Shape::new(line, style, PaletteIndex(0)).unwrap().outline();
+        assert!(o.covers(Vec2::new(5.0, 1.0)));
+        assert!(!o.covers(Vec2::new(5.0, 1.1)));
+        // Round end cap.
+        assert!(o.covers(Vec2::new(-0.7, 0.7)));
+        assert!(!o.covers(Vec2::new(-1.0, 1.0)));
+        assert_eq!(o.bounds(), (Vec2::new(-1.0, -1.0), Vec2::new(11.0, 1.0)));
+    }
+
+    #[test]
+    fn transform_moves_points_and_turns_handles() {
+        let mut s = fill(ellipse(Vec2::ZERO, Vec2::new(2.0, 1.0)));
+        s.transform(Affine2::from_angle_translation(
+            std::f32::consts::FRAC_PI_2,
+            Vec2::new(5.0, 0.0),
+        ));
+        let a = s.anchors()[0];
+        assert!(a.point.abs_diff_eq(Vec2::new(5.0, 2.0), 1e-5));
+        assert!(a.handle_out.abs_diff_eq(Vec2::new(-KAPPA, 0.0), 1e-5));
+    }
+
+    #[test]
+    fn freehand_simplifies_and_smooths() {
+        let points: Vec<Vec2> = (0..=20).map(|i| Vec2::new(i as f32, 0.0)).collect();
+        let anchors = freehand(&points, 0.5);
+        assert_eq!(
+            anchors,
+            vec![
+                Anchor::corner(Vec2::ZERO),
+                Anchor::corner(Vec2::new(20.0, 0.0))
+            ]
+        );
+        let bend = [Vec2::ZERO, Vec2::new(5.0, 5.0), Vec2::new(10.0, 0.0)];
+        let anchors = freehand(&bend, 0.5);
+        assert_eq!(anchors.len(), 3);
+        assert_eq!(anchors[1].handle_out, Vec2::new(10.0 / 6.0, 0.0));
+        assert!(freehand(&[], 0.5).is_empty());
+        assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
+    }
+}

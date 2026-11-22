@@ -111,7 +111,7 @@ fn variant_bytes(texture: &Texture) -> Result<Vec<Vec<u8>>, ExportError> {
         .variants()
         .iter()
         .map(|v| {
-            let img = v.underlay();
+            let img = v.rasterize();
             gx::encode_ci4(img.pixels(), img.size().x, img.size().y).map_err(|source| {
                 ExportError::Gx {
                     texture: texture.name.clone(),
