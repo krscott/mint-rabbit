@@ -43,6 +43,7 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "3D model and vector texture painter";
+    license = lib.licenses.gpl3Only;
     mainProgram = "mint-rabbit";
     platforms = lib.platforms.unix;
   };

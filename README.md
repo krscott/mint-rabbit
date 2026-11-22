@@ -45,3 +45,8 @@ Install the formatting hook with `just install-hooks`. It formats fully staged
 files and leaves partially staged files alone.
 
 Update dependencies with `nix flake update`.
+
+## License
+
+mint-rabbit is licensed under the GNU General Public License, version 3 only
+(`GPL-3.0-only`); see [LICENSE](LICENSE).
