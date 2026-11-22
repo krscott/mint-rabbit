@@ -10,8 +10,8 @@ const TILE_BYTES: usize = 32;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GxError {
-    #[error("CI4 texture size {width}x{height} is not a multiple of 8 on both sides")]
-    UnalignedSize { width: u32, height: u32 },
+    #[error("texture size {width}x{height} is not a multiple of 8 within 8..=1024 on both sides")]
+    BadSize { width: u32, height: u32 },
     #[error("CI4 texture {width}x{height} needs {expected} bytes, found {actual}")]
     WrongLength {
         width: u32,
@@ -29,11 +29,15 @@ pub fn ci4_len(width: u32, height: u32) -> usize {
     (width * height / 2) as usize
 }
 
-fn check_size(width: u32, height: u32) -> Result<(), GxError> {
-    if !width.is_multiple_of(TILE) || !height.is_multiple_of(TILE) || width == 0 || height == 0 {
-        return Err(GxError::UnalignedSize { width, height });
+/// Checks a texture size the game can load: whole 8x8 tiles, and at most
+/// 1024 texels a side to fit the load command's 10-bit size fields.
+pub fn check_size(width: u32, height: u32) -> Result<(), GxError> {
+    let ok = |v: u32| (TILE..=1024).contains(&v) && v.is_multiple_of(TILE);
+    if ok(width) && ok(height) {
+        Ok(())
+    } else {
+        Err(GxError::BadSize { width, height })
     }
-    Ok(())
 }
 
 /// The byte offset and nibble shift holding texel (x, y).
@@ -198,7 +202,7 @@ mod tests {
     fn ci4_rejects_unaligned_size() {
         assert_eq!(
             decode_ci4(&[0; 6], 4, 3),
-            Err(GxError::UnalignedSize {
+            Err(GxError::BadSize {
                 width: 4,
                 height: 3
             })

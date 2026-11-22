@@ -57,36 +57,35 @@ pub struct PosedMesh {
 pub fn posed_mesh(project: &Project) -> PosedMesh {
     let model = project.model();
     let world = model.world_matrices(project.pose());
-    let mut per_material: Vec<Vec<GpuVertex>> = vec![Vec::new(); project.materials().len()];
-    for id in model.ids() {
+    // Draw in the game's order, depth-first by node and then by triangle,
+    // batching runs of one material: the first of two coincident triangles
+    // is the one that shows.
+    let mut vertices = Vec::new();
+    let mut batches: Vec<Batch> = Vec::new();
+    for id in model.preorder() {
         let Some(mesh) = &model.node(id).mesh else {
             continue;
         };
         for t in &mesh.triangles {
+            match batches.last_mut() {
+                Some(b) if b.material == t.material => b.count += 3,
+                _ => batches.push(Batch {
+                    material: t.material,
+                    first: vertices.len() as u32,
+                    count: 3,
+                }),
+            }
             for c in t.corners {
                 let v = mesh.vertices[c.vertex as usize];
                 let m = world[v.followed(id).index()];
                 let normal = (Mat3::from_mat4(m) * v.normal).normalize_or_zero();
-                per_material[t.material.index()].push(GpuVertex {
+                vertices.push(GpuVertex {
                     position: m.transform_point3(v.position).to_array(),
                     normal: normal.to_array(),
                     uv: c.uv.to_array(),
                 });
             }
         }
-    }
-    let mut vertices = Vec::new();
-    let mut batches = Vec::new();
-    for (i, vs) in per_material.into_iter().enumerate() {
-        if vs.is_empty() {
-            continue;
-        }
-        batches.push(Batch {
-            material: MaterialId(i as u32),
-            first: vertices.len() as u32,
-            count: vs.len() as u32,
-        });
-        vertices.extend(vs);
     }
     // An empty model frames the origin.
     let bounds = |pick: fn(Vec3, Vec3) -> Vec3| {

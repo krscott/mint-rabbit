@@ -131,6 +131,11 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
     };
     let (mut seen_eye, mut seen_mouth, mut seen_clothing) = (false, false, false);
     for texture in project.textures() {
+        let size = texture.size();
+        gx::check_size(size.x, size.y).map_err(|source| ExportError::Gx {
+            texture: texture.name.clone(),
+            source,
+        })?;
         let once = |seen: &mut bool, slot: &'static str| {
             if std::mem::replace(seen, true) {
                 Err(ExportError::DuplicateSlot(slot))
@@ -295,12 +300,14 @@ impl ModelWriter<'_> {
         let species = self.model.split('_').next().unwrap_or(self.model);
         let name = format!("{}_{species}_model", sanitize(&n.name));
 
-        // Group triangles by material in order of first use.
+        // Runs of consecutive triangles sharing a material, in drawing order:
+        // the game keeps the first of two coincident triangles, so
+        // reordering could change what shows.
         let mut groups: Vec<(mint_core::MaterialId, Vec<usize>)> = Vec::new();
         for (i, t) in mesh.triangles.iter().enumerate() {
-            match groups.iter_mut().find(|(m, _)| *m == t.material) {
-                Some((_, v)) => v.push(i),
-                None => groups.push((t.material, vec![i])),
+            match groups.last_mut() {
+                Some((m, v)) if *m == t.material => v.push(i),
+                _ => groups.push((t.material, vec![i])),
             }
         }
         let others: Vec<NodeId> = {

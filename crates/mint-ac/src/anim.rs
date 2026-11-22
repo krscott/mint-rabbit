@@ -14,6 +14,15 @@ pub enum AnimError {
     Malformed { name: String, problem: String },
 }
 
+/// Reads a value stored in an `s16` table, accepting the signed or the
+/// unsigned spelling (`-175` or `0xFF51`).
+fn s16(v: i64) -> Option<i64> {
+    let bits = u16::try_from(v)
+        .ok()
+        .or_else(|| i16::try_from(v).ok().map(|v| v as u16))?;
+    Some(i64::from(bits as i16))
+}
+
 struct Tables {
     flags: Vec<i64>,
     data: Vec<i64>,
@@ -43,7 +52,14 @@ fn tables(file: &CFile, name: &str) -> Result<Tables, AnimError> {
             .ok_or_else(|| malformed("table reference is not a name"))?;
         file.get(sym)
             .and_then(|d| d.init.as_ints())
-            .ok_or_else(|| malformed(&format!("table {sym} is missing or not integers")))
+            .and_then(|v| {
+                if i == 0 {
+                    Some(v)
+                } else {
+                    v.into_iter().map(s16).collect()
+                }
+            })
+            .ok_or_else(|| malformed(&format!("table {sym} is missing or not 16-bit integers")))
     };
     Ok(Tables {
         flags: table(0)?,
@@ -174,6 +190,21 @@ mod tests {
             close(&f.concat(), &[90.0, 0.0, 45.0, 0.0, 0.0, 180.0]),
             "{f:?}"
         );
+    }
+
+    #[test]
+    fn reads_unsigned_spellings_as_s16() {
+        let file = CFile::parse_str(
+            Path::new("a.c"),
+            "u8 flags[] = { 0 };
+             s16 keys[] = { 0 };
+             s16 data[] = { 0 };
+             s16 fixed[] = { 0, 0, 0, 0xFF51, 0, 0 };
+             aNPC_Animation_c anim = { { flags, data, keys, fixed, -1, 1 } };",
+        )
+        .unwrap();
+        let rotations = sample(&file, "anim", 1, 1.0).unwrap();
+        assert!((rotations[0][0] + 17.5).abs() < 1e-4, "{rotations:?}");
     }
 
     #[test]

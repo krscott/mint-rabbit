@@ -12,12 +12,12 @@ use crate::{Decomp, ExportError, export, gx};
 
 /// Slot, size, variant pixels, and whether the texture is external.
 type CanonicalTexture = (String, [u32; 2], Vec<Vec<u8>>, bool);
-/// Name, parent, translation, and sorted triangle descriptions.
+/// Name, parent, translation, and triangle descriptions in drawing order.
 type CanonicalNode = (String, Option<u32>, [i64; 3], Vec<String>);
 
 /// A comparable summary of a project that ignores what the exporter is free
-/// to change: triangle order, vertex layout, texture names and placement,
-/// and colors beyond what the target can show.
+/// to change: vertex layout, texture names and placement, and colors beyond
+/// what the target can show.
 #[derive(Debug, PartialEq)]
 struct Canonical {
     palette: Vec<[u8; 4]>,
@@ -51,7 +51,7 @@ fn canonical(p: &Project) -> Canonical {
         .ids()
         .map(|id| {
             let n = model.node(id);
-            let mut tris: Vec<String> = n
+            let tris: Vec<String> = n
                 .mesh
                 .iter()
                 .flat_map(|m| {
@@ -79,7 +79,6 @@ fn canonical(p: &Project) -> Canonical {
                     })
                 })
                 .collect();
-            tris.sort();
             let t = n.transform.translation.round();
             (
                 n.name.clone(),
@@ -294,6 +293,25 @@ fn synthetic_villager_round_trips() {
 
     let again = reimport(&original, &pose);
     assert_eq!(canonical(&original), canonical(&again));
+}
+
+/// Triangles keep their drawing order even when materials interleave: the
+/// game keeps the first of two coincident triangles.
+#[test]
+fn export_keeps_triangle_order() {
+    let (p, pose) = synthetic_project();
+    let mut model = p.model().clone();
+    let mesh = model
+        .node_mut(NodeId(HEAD_JOINT as u32))
+        .mesh
+        .as_mut()
+        .unwrap();
+    // Move the eye triangle after the others, so the eye material appears
+    // in two separate runs.
+    let eye = mesh.triangles.remove(0);
+    mesh.triangles.push(eye);
+    let p = variant_of(&p, crate::TARGET, p.palette().clone(), model);
+    assert_eq!(canonical(&p), canonical(&reimport(&p, &pose)));
 }
 
 /// The synthetic project with some parts replaced.

@@ -413,18 +413,16 @@ impl Interp<'_> {
         if Self::int(args, 7)? != 0 || Self::int(args, 8)? != 0 {
             return Err("texture shifts are not supported".into());
         }
-        // CI4 textures are tiled in 8x8 blocks.
         let side = |i: usize| -> Result<u32, String> {
             let v = Self::int(args, i)?;
-            u32::try_from(v)
-                .ok()
-                .filter(|v| (8..=1024).contains(v) && v % 8 == 0)
-                .ok_or_else(|| format!("texture side {v} is not a multiple of 8 in 8..=1024"))
+            u32::try_from(v).map_err(|_| format!("texture side {v} is out of range"))
         };
+        let (width, height) = (side(2)?, side(3)?);
+        crate::gx::check_size(width, height).map_err(|e| e.to_string())?;
         self.tex = Some(TexLoad {
             source,
-            width: side(2)?,
-            height: side(3)?,
+            width,
+            height,
             wrap: [wrap(&args[5])?, wrap(&args[6])?],
         });
         Ok(())
