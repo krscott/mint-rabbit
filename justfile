@@ -34,8 +34,10 @@ snapshot decomp="":
         decomp=target/demo-decomp
         cargo run --locked -q -p mint-ac --example demo_decomp -- "$decomp"
     fi
-    MINT_AC_DECOMP="$(realpath "$decomp")" MINT_SNAPSHOT="$PWD/target/model-view.png" \
-        cargo test --locked -p mint-rabbit -- --ignored model_view_snapshot
+    MINT_AC_DECOMP="$(realpath -- "$decomp")"
+    MINT_SNAPSHOT="$PWD/target/model-view.png"
+    export MINT_AC_DECOMP MINT_SNAPSHOT
+    cargo test --locked -p mint-rabbit -- --ignored model_view_snapshot
 
 clippy:
     cargo clippy --locked --workspace --all-targets -- -D warnings

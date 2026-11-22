@@ -313,41 +313,31 @@ fn tokenize(
         }
         if c == b'#' && at_line_start {
             let end = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
-            let directive = without_comments(&text[i + 1..end]);
-            let directive = directive.trim();
-            // Splicing both branches of a conditional would silently pick the
-            // wrong definitions.
-            let word: String = directive
-                .chars()
-                .take_while(char::is_ascii_alphabetic)
-                .collect();
-            if matches!(
-                word.as_str(),
-                "if" | "ifdef" | "ifndef" | "elif" | "else" | "endif"
-            ) {
-                return Err(syntax(
+            let name = include_name(&text[i + 1..end]).ok_or_else(|| {
+                syntax(
                     line,
-                    format!("conditional compilation (#{word}) is not supported in asset sources"),
-                ));
-            }
-            if let Some(rest) = directive.strip_prefix("include") {
-                let rest = rest.trim();
-                if let Some(name) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("inc"))
-                {
-                    let found = include_dirs
-                        .iter()
-                        .map(|d| d.join(name))
-                        .find(|p| p.is_file())
-                        .ok_or_else(|| CError::MissingInclude {
-                            path: path.clone(),
-                            line,
-                            name: name.to_owned(),
-                        })?;
-                    tokenize_file(&found, include_dirs, files, out)?;
-                }
+                    format!(
+                        "unsupported directive {:?}; asset sources may only use #include \"file\"",
+                        text[i..end].trim()
+                    ),
+                )
+            })?;
+            // Only extracted asset data (.inc) is spliced in; headers declare
+            // types and macros the reader does not need.
+            if Path::new(name)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("inc"))
+            {
+                let found = include_dirs
+                    .iter()
+                    .map(|d| d.join(name))
+                    .find(|p| p.is_file())
+                    .ok_or_else(|| CError::MissingInclude {
+                        path: path.clone(),
+                        line,
+                        name: name.to_owned(),
+                    })?;
+                tokenize_file(&found, include_dirs, files, out)?;
             }
             i = end;
             continue;
@@ -412,24 +402,18 @@ fn tokenize(
     Ok(())
 }
 
-/// A directive line with its comments replaced by spaces, as the
-/// preprocessor sees it (`#/**/if` is `# if`).
-fn without_comments(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(start) = rest.find("/*").into_iter().chain(rest.find("//")).min() {
-        out.push_str(&rest[..start]);
-        out.push(' ');
-        if rest[start..].starts_with("//") {
-            return out;
-        }
-        match rest[start + 2..].find("*/") {
-            Some(end) => rest = &rest[start + 2 + end + 2..],
-            None => return out,
-        }
-    }
-    out.push_str(rest);
-    out
+/// The file named by a directive line (the text after `#`) of exactly the
+/// form `include "file"`, or `None` for anything else. Asset sources use no
+/// other directives, so the reader refuses them rather than emulating the
+/// preprocessor.
+fn include_name(directive: &str) -> Option<&str> {
+    let name = directive
+        .trim()
+        .strip_prefix("include")?
+        .trim_start()
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    (!name.contains('"')).then_some(name)
 }
 
 fn parse_number(s: &str) -> Option<Tok> {
@@ -710,14 +694,21 @@ mod tests {
     }
 
     #[test]
-    fn refuses_conditional_compilation() {
+    fn refuses_directives_other_than_include() {
         for text in [
             "#if(0)\nint a = 1;\n#endif\n",
-            "#/**/if 1\nint a = 1;\n#/**/endif\n",
+            "#/**/if 1\nint a = 1;\n",
+            "#define X 1\n",
+            "#include \"c_keyframe.h\" /* trailing */\n",
+            "#\\\nif 0\n",
         ] {
             let err = CFile::parse_str(Path::new("t.c"), text).unwrap_err();
-            assert!(err.to_string().contains("#if"), "{err}");
+            assert!(
+                err.to_string().contains("unsupported directive"),
+                "{text:?}: {err}"
+            );
         }
+        assert!(CFile::parse_str(Path::new("t.c"), "# include \"c_keyframe.h\"\n").is_ok());
     }
 
     #[test]

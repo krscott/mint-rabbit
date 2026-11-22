@@ -57,7 +57,9 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         n = -n;
     }
     let light = 0.45 + 0.55 * max(dot(n, globals.light_dir.xyz), 0.0);
-    return vec4<f32>(c.rgb * light, c.a);
+    // The game never writes framebuffer alpha; surfaces that pass the
+    // cutout test are fully covered.
+    return vec4<f32>(c.rgb * light, 1.0);
 }
 ";
 
@@ -132,7 +134,7 @@ struct MaterialUniform {
 
 struct GpuMaterial {
     bind_group: wgpu::BindGroup,
-    pipeline: usize,
+    double_sided: bool,
 }
 
 struct GpuScene {
@@ -140,14 +142,14 @@ struct GpuScene {
     linear_filter: bool,
     vertices: wgpu::Buffer,
     materials: Vec<GpuMaterial>,
-    /// (first, count, material) in draw order.
-    draws: Vec<(u32, u32, usize)>,
+    /// Runs of one material, in drawing order.
+    batches: Vec<scene::Batch>,
 }
 
 /// Long-lived GPU state, stored in egui's callback resources.
 pub struct Renderer {
     /// Indexed by whether the pipeline draws back faces.
-    pipelines: Vec<wgpu::RenderPipeline>,
+    pipelines: [wgpu::RenderPipeline; 2],
     globals: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     material_layout: wgpu::BindGroupLayout,
@@ -231,9 +233,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&globals_layout), Some(&material_layout)],
             immediate_size: 0,
         });
-        let pipelines = [false, true]
-            .into_iter()
-            .map(|double_sided| {
+        let pipelines = [false, true].map(|double_sided| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("model view"),
                     layout: Some(&layout),
@@ -272,8 +272,8 @@ impl Renderer {
                     multiview_mask: None,
                     cache: None,
                 })
-            })
-            .collect();
+            });
+
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -319,11 +319,11 @@ impl Renderer {
         let Some(scene) = &self.scene else { return };
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, scene.vertices.slice(..));
-        for &(first, count, m) in &scene.draws {
-            let material = &scene.materials[m];
-            pass.set_pipeline(&self.pipelines[material.pipeline]);
+        for b in &scene.batches {
+            let material = &scene.materials[b.material.index()];
+            pass.set_pipeline(&self.pipelines[usize::from(material.double_sided)]);
             pass.set_bind_group(1, &material.bind_group, &[]);
-            pass.draw(first..first + count, 0..1);
+            pass.draw(b.first..b.first + b.count, 0..1);
         }
     }
 
@@ -415,22 +415,16 @@ impl Renderer {
                 });
                 GpuMaterial {
                     bind_group,
-                    pipeline: usize::from(m.double_sided),
+                    double_sided: m.double_sided,
                 }
             })
-            .collect();
-        let draws = data
-            .mesh
-            .batches
-            .iter()
-            .map(|b| (b.first, b.count, b.material.index()))
             .collect();
         self.scene = Some(GpuScene {
             generation: data.generation,
             linear_filter,
             vertices,
             materials,
-            draws,
+            batches: data.mesh.batches.clone(),
         });
     }
 }

@@ -59,7 +59,10 @@ pub enum ExportError {
     },
     #[error("body textures take {0:#x} bytes; the body buffer holds {BODY_BUFFER:#x}")]
     BodyBufferFull(usize),
-    #[error("the {slot} texture is {actual}; the game's {slot} texture is {expected}")]
+    #[error(
+        "the {slot} texture is {}x{}; the game's {slot} texture is {}x{}",
+        actual.x, actual.y, expected.x, expected.y
+    )]
     SlotSize {
         slot: &'static str,
         expected: glam::UVec2,

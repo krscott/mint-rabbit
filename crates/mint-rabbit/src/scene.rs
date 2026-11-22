@@ -40,6 +40,7 @@ pub struct GpuVertex {
 }
 
 /// Triangle corners of one material, ready to draw.
+#[derive(Clone, Copy, Debug)]
 pub struct Batch {
     pub material: MaterialId,
     pub first: u32,
