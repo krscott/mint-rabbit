@@ -31,6 +31,11 @@ Geometry owned by a node: vertices with UVs, and triangles that each draw with
 one material.
 _Avoid_: Display list, model, geometry
 
+**Pose**:
+Display-only rotations applied to nodes so a model looks as it does in use,
+such as the first frame of a game's idle animation; it is never exported.
+_Avoid_: Rest pose, animation, frame
+
 **Seam Vertex**:
 A mesh vertex that follows a node other than its mesh's node, so that meshes on
 neighboring nodes stay joined when posed.
