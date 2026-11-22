@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use glam::UVec2;
-
 use crate::{
     Layer, Material, MaterialId, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Shape,
     Texture, TextureId, Variant,
@@ -21,8 +19,7 @@ pub struct VariantRef {
 /// The editable document for one model.
 ///
 /// Every palette index in it, in underlays and shapes, refers to an entry of
-/// its palette, and every variant matches its texture's size; the editing
-/// methods keep it so.
+/// its palette; the editing methods keep it so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     target: TargetId,
@@ -48,8 +45,8 @@ pub enum PaletteError {
 pub enum EditError {
     #[error("palette entry {index} does not exist; the palette has {len}")]
     MissingColor { index: u8, len: usize },
-    #[error("the variant's underlay is {actual} but its texture is {expected}")]
-    Size { expected: UVec2, actual: UVec2 },
+    #[error("a variant's underlay is never edited")]
+    UnderlayChanged,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,6 +70,18 @@ pub enum ProjectError {
     },
 }
 
+fn shape_colors(v: &Variant) -> impl Iterator<Item = PaletteIndex> + '_ {
+    v.layers().iter().flat_map(Layer::shapes).map(Shape::color)
+}
+
+/// The first of `colors` that `palette` has no entry for.
+fn missing_color(
+    palette: &Palette,
+    mut colors: impl Iterator<Item = PaletteIndex>,
+) -> Option<PaletteIndex> {
+    colors.find(|&c| !palette.contains(c))
+}
+
 impl Project {
     /// Builds a project, checking that every reference between its parts
     /// resolves.
@@ -86,14 +95,9 @@ impl Project {
     ) -> Result<Self, ProjectError> {
         for t in &textures {
             for v in t.variants() {
-                let shapes = v.layers().iter().flat_map(Layer::shapes).map(Shape::color);
-                if let Some(PaletteIndex(index)) = v
-                    .underlay()
-                    .pixels()
-                    .iter()
-                    .copied()
-                    .chain(shapes)
-                    .find(|&i| !palette.contains(i))
+                let pixels = v.underlay().pixels().iter().copied();
+                if let Some(PaletteIndex(index)) =
+                    missing_color(&palette, pixels.chain(shape_colors(v)))
                 {
                     return Err(ProjectError::MissingPaletteEntry {
                         texture: t.name.clone(),
@@ -199,33 +203,23 @@ impl Project {
         &self.textures[r.texture.index()].variants()[r.variant]
     }
 
-    /// Edits a variant's layers and shapes with `f`. If the variant then
-    /// uses a color the palette lacks, or its underlay no longer matches its
-    /// texture's size, the edit is undone and reported. Panics if `r` is not
-    /// a painted variant of this project.
+    /// Edits a variant's name, layers, and shapes with `f`. If the edit
+    /// changes the underlay, which is never edited, or leaves a shape using a
+    /// color the palette lacks, it is undone and reported. Panics if `r` is
+    /// not a painted variant of this project.
     pub fn edit_variant<T>(
         &mut self,
         r: VariantRef,
         f: impl FnOnce(&mut Variant) -> T,
     ) -> Result<T, EditError> {
-        let texture = &mut self.textures[r.texture.index()];
-        let size = texture.size();
-        let variant = &mut texture.variants_mut()[r.variant];
+        let variant = &mut self.textures[r.texture.index()].variants_mut()[r.variant];
         let before = variant.clone();
         let out = f(variant);
         let check = || {
-            let actual = variant.underlay().size();
-            if actual != size {
-                return Err(EditError::Size {
-                    expected: size,
-                    actual,
-                });
+            if variant.underlay() != before.underlay() {
+                return Err(EditError::UnderlayChanged);
             }
-            let shapes = variant.layers().iter().flat_map(Layer::shapes);
-            match shapes
-                .map(Shape::color)
-                .find(|&c| !self.palette.contains(c))
-            {
+            match missing_color(&self.palette, shape_colors(variant)) {
                 Some(PaletteIndex(index)) => Err(EditError::MissingColor {
                     index,
                     len: self.palette.len(),
@@ -301,7 +295,7 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use glam::Vec2;
+    use glam::{UVec2, Vec2};
 
     use super::*;
     use crate::{IndexedImage, Slot, Style, Transform, shape};
@@ -366,27 +360,14 @@ mod tests {
         assert_eq!(p, before);
 
         // Replacing the whole variant is checked too.
-        let other = project(2, [0; 4]);
-        let mut wrong_size = Texture::painted(
-            "big",
-            Slot("body".into()),
-            UVec2::ONE,
-            [(
-                "1".to_owned(),
-                IndexedImage::new(UVec2::ONE, vec![PaletteIndex(0)]).unwrap(),
-            )],
-        )
-        .unwrap();
-        let big = wrong_size.variants_mut()[0].clone();
+        let other = project(4, [3, 0, 0, 0]);
+        let foreign = other.variant(V).clone();
         assert_eq!(
-            p.edit_variant(V, |v| *v = big),
-            Err(EditError::Size {
-                expected: UVec2::new(2, 2),
-                actual: UVec2::ONE
-            })
+            p.edit_variant(V, |v| *v = foreign),
+            Err(EditError::UnderlayChanged)
         );
         assert_eq!(p, before);
-        let copy = other.variant(V).clone();
+        let copy = project(2, [0; 4]).variant(V).clone();
         assert_eq!(p.edit_variant(V, |v| *v = copy), Ok(()));
     }
 
