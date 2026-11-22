@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_that_break_the_project_are_undone() {
+    fn edits_that_break_the_project_are_refused() {
         let mut p = project(2, [0; 4]);
         let missing = Err(EditError::MissingColor { index: 2, len: 2 });
         let add = |c: u8| move |v: &mut Variant| v.layers_mut()[0].insert_shape(0, dot(c));
@@ -367,6 +367,16 @@ mod tests {
             p.edit_variant(V, |v| v.layers_mut()[0].shapes_mut()[0] = dot(2)),
             missing
         );
+        assert_eq!(p, before);
+
+        // A panic part-way through an edit leaves the project as it was.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.edit_variant(V, |v| {
+                v.layers_mut()[0].insert_shape(0, dot(1));
+                panic!("interrupted edit");
+            })
+        }));
+        assert!(panicked.is_err());
         assert_eq!(p, before);
 
         // Replacing the whole variant is checked too.

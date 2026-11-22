@@ -223,18 +223,18 @@ fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
 }
 
 /// Whether a cubic is a straight line from its start to its end: both
-/// controls lie on that segment.
+/// controls lie within [`TOLERANCE`] of that segment, so the curve strays no
+/// further from it than flattening allows.
 fn is_straight([p0, p1, p2, p3]: [Vec2; 4]) -> bool {
     let line = p3 - p0;
-    let len2 = line.length_squared();
+    let len = line.length();
     let on_segment = |c: Vec2| {
         let d = c - p0;
-        if len2 == 0.0 {
+        if !(len > 0.0 && len.is_finite()) {
             return d == Vec2::ZERO;
         }
-        // Within a millionth of a texel per texel of length, and between
-        // the ends.
-        line.perp_dot(d).abs() <= 1e-6 * len2 && (0.0..=len2).contains(&line.dot(d))
+        let dir = line / len;
+        dir.perp_dot(d).abs() <= TOLERANCE && (0.0..=len).contains(&dir.dot(d))
     };
     on_segment(p1) && on_segment(p2)
 }
@@ -348,9 +348,10 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 
 /// Smooth anchors through a freehand stroke: the points are simplified to
 /// those within `tolerance` texels of the stroke, then joined by
-/// Catmull-Rom curves, except that ends and turns sharper than a right angle
-/// stay corners so the curve doesn't overshoot them. Returns no anchors for
-/// no points.
+/// Catmull-Rom curves. Ends and turns sharper than a right angle stay
+/// corners, and each handle is at most a third of the segment it shapes, so
+/// the curve doesn't overshoot the stroke. Returns no anchors for no
+/// points.
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
     let mut kept = Vec::new();
@@ -364,7 +365,12 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
             if i == 0 || i == n - 1 || (kept[i] - kept[i - 1]).dot(kept[i + 1] - kept[i]) < 0.0 {
                 return Anchor::corner(kept[i]);
             }
-            Anchor::smooth(kept[i], (kept[i + 1] - kept[i - 1]) / 6.0)
+            let h = (kept[i + 1] - kept[i - 1]) / 6.0;
+            Anchor {
+                point: kept[i],
+                handle_in: -h.clamp_length_max(kept[i].distance(kept[i - 1]) / 3.0),
+                handle_out: h.clamp_length_max(kept[i].distance(kept[i + 1]) / 3.0),
+            }
         })
         .collect()
 }
@@ -548,6 +554,21 @@ mod tests {
         // A stroke that doubles back keeps its far end, as a corner.
         let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
         assert_eq!(freehand(&back, 0.25), back.map(Anchor::corner).to_vec());
+        // A long line ending in a short flick stops where the flick does.
+        let mut hook: Vec<Vec2> = (0..=100).map(|x| Vec2::new(x as f32, 0.0)).collect();
+        hook.extend([Vec2::new(101.0, 1.0), Vec2::new(101.5, 2.0)]);
+        let style = Style::Stroke {
+            width: 0.1,
+            closed: false,
+        };
+        let o = Shape::new(freehand(&hook, 0.5), style, PaletteIndex(0))
+            .unwrap()
+            .outline();
+        assert!(
+            o.points().iter().all(|p| p.x <= 101.5 + 1e-4),
+            "{:?}",
+            o.points()
+        );
         assert!(freehand(&[], 0.5).is_empty());
         assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
     }
