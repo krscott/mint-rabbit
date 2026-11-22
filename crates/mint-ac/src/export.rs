@@ -55,15 +55,8 @@ pub enum ExportError {
         texture: String,
         source: gx::GxError,
     },
-    #[error(
-        "the {slot} texture is {}x{}; the game's {slot} texture is {}x{}",
-        actual.x, actual.y, expected.x, expected.y
-    )]
-    SlotSize {
-        slot: &'static str,
-        expected: glam::UVec2,
-        actual: glam::UVec2,
-    },
+    #[error("the clothing texture is {}x{}; the game's clothing is 32x32", .0.x, .0.y)]
+    ClothingSize(glam::UVec2),
     #[error("node {node:?}: {problem}")]
     Node { node: String, problem: String },
 }
@@ -160,20 +153,6 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
                 })
             }
         };
-        // The game supplies clothing at a fixed size; eye, mouth, and body
-        // textures are the villager's own arrays, sized by their loads.
-        let check_size = |slot: &'static str, w: u32, h: u32| {
-            let expected = glam::UVec2::new(w, h);
-            if size == expected {
-                Ok(())
-            } else {
-                Err(ExportError::SlotSize {
-                    slot,
-                    expected,
-                    actual: size,
-                })
-            }
-        };
         let placement = match (texture.slot.0.as_str(), texture.content()) {
             (SLOT_EYES, TextureContent::Painted(_)) => {
                 once(&mut seen_eye, SLOT_EYES)?;
@@ -189,7 +168,12 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
             }
             (SLOT_CLOTHING, TextureContent::External { .. }) => {
                 once(&mut seen_clothing, SLOT_CLOTHING)?;
-                check_size(SLOT_CLOTHING, 32, 32)?;
+                // The game supplies clothing at this size; eye, mouth, and
+                // body textures are the villager's own arrays, sized by
+                // their loads.
+                if size != glam::UVec2::new(32, 32) {
+                    return Err(ExportError::ClothingSize(size));
+                }
                 Placement::Clothing
             }
             (SLOT_BODY, TextureContent::Painted(_)) => {

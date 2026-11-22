@@ -10,6 +10,10 @@ use mint_core::{AlphaMode, Project, Wrap};
 
 use crate::scene::{self, GpuVertex};
 
+/// Position, normal, and UV of a [`GpuVertex`].
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+
 /// Depth format of the egui render pass; must match `depth_buffer` in the
 /// native options.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -48,8 +52,7 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @locatio
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // The game's combiner tints color only; alpha comes from the texture.
     let texel = textureSample(tex, samp, in.uv);
-    let c = vec4<f32>(texel.rgb * material.tint.rgb, texel.a);
-    if material.cutout.x > 0.5 && c.a < 0.5 {
+    if material.cutout.x > 0.5 && texel.a < 0.5 {
         discard;
     }
     var n = normalize(in.normal);
@@ -59,7 +62,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let light = 0.45 + 0.55 * max(dot(n, globals.light_dir.xyz), 0.0);
     // The game never writes framebuffer alpha; surfaces that pass the
     // cutout test are fully covered.
-    return vec4<f32>(c.rgb * light, 1.0);
+    return vec4<f32>(texel.rgb * material.tint.rgb * light, 1.0);
 }
 ";
 
@@ -234,45 +237,45 @@ impl Renderer {
             immediate_size: 0,
         });
         let pipelines = [false, true].map(|double_sided| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("model view"),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers: &[Some(wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<GpuVertex>() as u64,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
-                        })],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: target_format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        cull_mode: (!double_sided).then_some(wgpu::Face::Back),
-                        ..wgpu::PrimitiveState::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(true),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("model view"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &VERTEX_ATTRIBUTES,
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: (!double_sided).then_some(wgpu::Face::Back),
+                    ..wgpu::PrimitiveState::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
 
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),

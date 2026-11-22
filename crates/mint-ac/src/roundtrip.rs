@@ -387,7 +387,7 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
     .unwrap();
     assert!(matches!(
         export(&big_shirt, "rt_1", "rt_1"),
-        Err(ExportError::SlotSize { .. })
+        Err(ExportError::ClothingSize(_))
     ));
 
     // Both display lists would be named body_rt_model.

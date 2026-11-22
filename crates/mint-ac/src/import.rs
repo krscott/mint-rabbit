@@ -550,6 +550,24 @@ mod tests {
     }
 
     #[test]
+    fn joints_must_be_drawn_opaque() {
+        let table = |flag: &str| {
+            CFile::parse_str(
+                Path::new("m.c"),
+                &format!(
+                    "cKF_Joint_R_c tbl[] = {{ {{ NULL, 0, {flag}, 0, 0, 0 }} }};
+                     cKF_Skeleton_R_c cKF_bs_r_m_1 = {{ 1, 0, tbl }};"
+                ),
+            )
+            .unwrap()
+        };
+        assert!(joints(&table("cKF_JOINT_FLAG_DISP_OPA"), "m_1").is_ok());
+        // The flag's value; the game only tests the XLU bit.
+        assert!(joints(&table("0"), "m_1").is_ok());
+        assert!(joints(&table("cKF_JOINT_FLAG_DISP_XLU"), "m_1").is_err());
+    }
+
+    #[test]
     fn parents_reject_inconsistent_counts() {
         assert_eq!(parents(&[joint(2), joint(0)]), None);
         assert_eq!(parents(&[joint(0), joint(0)]), None);
