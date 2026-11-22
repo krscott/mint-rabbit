@@ -5,6 +5,13 @@ use std::path::PathBuf;
 
 use mint_core::{EditError, Project, Variant, VariantRef};
 
+/// A control's key as stored in a [`Gesture`].
+fn hash(key: impl Hash) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// How many edits undo can go back.
 const UNDO_LIMIT: usize = 200;
 
@@ -89,9 +96,7 @@ impl Editor {
         key: impl Hash,
         f: impl FnOnce(&mut Project) -> Result<T, E>,
     ) -> Result<T, E> {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        let key = h.finish();
+        let key = hash(key);
         if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
             self.gesture = Gesture::Open {
                 key,
@@ -146,10 +151,12 @@ impl Editor {
         Ok(out)
     }
 
-    /// Takes back the open continuous edit's changes, as if it never
-    /// happened, and ends it.
-    pub fn revert_gesture(&mut self) {
-        if matches!(self.gesture, Gesture::Open { recorded: true, .. })
+    /// Rolls back the open continuous edit, if the control named `key`
+    /// opened it, dropping its undo step and restoring the redo history it
+    /// cleared; then ends whatever edit is open.
+    pub fn revert_gesture(&mut self, key: impl Hash) {
+        let key = hash(key);
+        if matches!(self.gesture, Gesture::Open { key: open, recorded: true } if open == key)
             && let Some(before) = self.undo.pop()
         {
             self.project = before;
@@ -287,7 +294,7 @@ mod tests {
             })
             .unwrap();
         }
-        e.revert_gesture();
+        e.revert_gesture("drag");
         assert_eq!(current(&e), 1);
         e.undo();
         assert_eq!(current(&e), 0);
@@ -299,8 +306,18 @@ mod tests {
         })
         .unwrap();
         assert!(!e.can_redo());
-        e.revert_gesture();
+        e.revert_gesture("drag");
         e.redo();
+        assert_eq!(current(&e), 1);
+
+        // Another control's edit is only ended, not rolled back.
+        e.edit_continuous("name", |p| {
+            p.set_palette_color(PaletteIndex(0), Rgba8::new(7, 0, 0, 255))
+        })
+        .unwrap();
+        e.revert_gesture("drag");
+        assert_eq!(current(&e), 7);
+        e.undo();
         assert_eq!(current(&e), 1);
     }
 

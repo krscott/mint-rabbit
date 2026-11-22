@@ -869,7 +869,7 @@ impl eframe::App for App {
             self.fail(refusal);
         }
         // A continuous edit (a drag, a slider, typing) is one undo step until
-        // the pointer is released and no field has focus.
+        // the pointer is released and no text field has focus.
         if let Some(d) = &mut self.doc
             && !ctx.input(|i| i.pointer.any_down())
             && !ctx.text_edit_focused()

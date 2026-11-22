@@ -14,6 +14,8 @@ use crate::scene;
 /// Pointer distance, in screen points, within which handles and outlines
 /// are hit.
 const HIT: f32 = 7.0;
+/// The key of a canvas drag's continuous edit.
+const CANVAS_DRAG: &str = "canvas drag";
 /// Freehand simplification tolerance in texels.
 const BRUSH_TOLERANCE: f32 = 0.25;
 
@@ -449,7 +451,7 @@ impl TextureView {
             if matches!(self.drag.take(), Some(Drag::PenHandle)) {
                 self.pen.clear();
             }
-            editor.revert_gesture();
+            editor.revert_gesture(CANVAS_DRAG);
         } else if response.drag_stopped() {
             // Only the primary button's release finishes a drawing.
             let drag = self.drag.take();
@@ -462,7 +464,6 @@ impl TextureView {
         }
 
         // Keys, while the view has the pointer.
-        // Keys a text field is using are its own.
         // Keys a text field is using are its own, and none act mid-drag.
         if (response.hovered() || !self.pen.is_empty())
             && !ui.ctx().text_edit_focused()
@@ -894,10 +895,9 @@ fn start_select(
     })
 }
 
-/// Replaces the picked shapes with `shapes`, in the same order.
 /// Replaces a drag's target shapes, `(layer, indices)`, with `shapes`, in
 /// the same order.
-fn replace_picked(
+fn replace_targets(
     editor: &mut Editor,
     r: VariantRef,
     (layer, picked): &(usize, Vec<usize>),
@@ -905,7 +905,7 @@ fn replace_picked(
 ) {
     let (layer, picked) = (*layer, picked.clone());
     // A drag's edits undo as one step.
-    let _ = editor.edit_variant_continuous("canvas drag", r, |v| {
+    let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
         let Some(l) = v.layers_mut().get_mut(layer) else {
             return;
         };
@@ -942,7 +942,7 @@ fn continue_drag(
     match drag {
         Drag::Move { start, original } => {
             let t = Affine2::from_translation(p - *start);
-            replace_picked(editor, r, targets, transformed(original, t));
+            replace_targets(editor, r, targets, transformed(original, t));
         }
         Drag::Scale {
             pivot,
@@ -962,7 +962,7 @@ fn continue_drag(
             let t = Affine2::from_translation(*pivot)
                 * Affine2::from_scale(k)
                 * Affine2::from_translation(-*pivot);
-            replace_picked(editor, r, targets, transformed(original, t));
+            replace_targets(editor, r, targets, transformed(original, t));
         }
         Drag::Rotate {
             center,
@@ -979,7 +979,7 @@ fn continue_drag(
             let t = Affine2::from_translation(*center)
                 * Affine2::from_angle(angle)
                 * Affine2::from_translation(-*center);
-            replace_picked(editor, r, targets, transformed(original, t));
+            replace_targets(editor, r, targets, transformed(original, t));
         }
         Drag::Anchor {
             anchor,
@@ -1007,7 +1007,7 @@ fn continue_drag(
                     }
                 }
             }
-            replace_picked(editor, r, targets, vec![s]);
+            replace_targets(editor, r, targets, vec![s]);
         }
         Drag::PenHandle => {
             if let Some(a) = pen.last_mut() {
