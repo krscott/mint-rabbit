@@ -306,10 +306,10 @@ fn export_keeps_triangle_order() {
         .mesh
         .as_mut()
         .unwrap();
-    // Move the eye triangle after the others, so the eye material appears
-    // in two separate runs.
-    let eye = mesh.triangles.remove(0);
-    mesh.triangles.push(eye);
+    // Move the last body triangle first, so the body material appears in
+    // two separate runs.
+    let body = mesh.triangles.pop().unwrap();
+    mesh.triangles.insert(0, body);
     let p = variant_of(&p, crate::TARGET, p.palette().clone(), model);
     assert_eq!(canonical(&p), canonical(&reimport(&p, &pose)));
 }
