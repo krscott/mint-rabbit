@@ -413,10 +413,15 @@ fn every_built_villager_round_trips() {
         }
     }
     eprintln!("{ok} villagers round-trip");
-    // Only the special NPC models the importer cannot represent may fail.
+    // Only these may fail: special NPC models the importer cannot represent,
+    // and flg_12, whose 0x380-byte body texture is shorter than the 0x400
+    // bytes the flg_1 model reads (the game reads past it).
     let unexpected: Vec<&str> = refused
         .iter()
-        .filter(|(model, _)| !["fob_1", "gst_1", "hem_1", "mka_1"].contains(&model.as_str()))
+        .filter(|(model, e)| {
+            !["fob_1", "gst_1", "hem_1", "mka_1"].contains(&model.as_str())
+                && !e.starts_with("flg_12:")
+        })
         .map(|(_, e)| e.as_str())
         .collect();
     assert!(

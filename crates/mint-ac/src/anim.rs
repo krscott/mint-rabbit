@@ -80,11 +80,11 @@ pub fn sample(
         if animated {
             let n = keys
                 .next()
-                .ok_or_else(|| malformed("key table too short".into()))?
-                as usize;
+                .ok_or_else(|| malformed("key table too short".into()))?;
+            let n = usize::try_from(n).map_err(|_| malformed(format!("key count {n} is negative")))?;
             let v = key_value(&t.data, data_index, n, frame)
                 .ok_or_else(|| malformed("data table too short".into()))?;
-            data_index += n;
+            data_index = data_index.saturating_add(n);
             Ok(f32::from(v))
         } else {
             fixed
@@ -112,8 +112,9 @@ pub fn sample(
 
 /// `cKF_KeyCalc`: Hermite interpolation over `(frame, value, tangent)` keys.
 fn key_value(data: &[i64], start: usize, n: usize, frame: f32) -> Option<i16> {
+    let end = start.checked_add(n)?.checked_mul(3)?;
     let keys: Vec<[f32; 3]> = data
-        .get(start * 3..(start + n) * 3)?
+        .get(start.checked_mul(3)?..end)?
         .chunks(3)
         .map(|k| [k[0] as f32, k[1] as f32, k[2] as f32])
         .collect();
