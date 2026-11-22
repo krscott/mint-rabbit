@@ -223,18 +223,19 @@ fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
 }
 
 /// Whether a cubic is a straight line from its start to its end: both
-/// controls lie within [`TOLERANCE`] of that segment, so the curve strays no
-/// further from it than flattening allows.
+/// controls lie within [`TOLERANCE`] of that segment and between its ends,
+/// so the curve strays no further from it than flattening allows. Controls
+/// exactly on the ends, as at corners, always count, at any angle.
 fn is_straight([p0, p1, p2, p3]: [Vec2; 4]) -> bool {
     let line = p3 - p0;
-    let len = line.length();
+    let len2 = line.length_squared();
     let on_segment = |c: Vec2| {
         let d = c - p0;
-        if !(len > 0.0 && len.is_finite()) {
+        if !(len2 > 0.0 && len2.is_finite()) {
             return d == Vec2::ZERO;
         }
-        let dir = line / len;
-        dir.perp_dot(d).abs() <= TOLERANCE && (0.0..=len).contains(&dir.dot(d))
+        // Unnormalized, so a control on an end compares exactly.
+        line.perp_dot(d).abs() <= TOLERANCE * len2.sqrt() && (0.0..=len2).contains(&line.dot(d))
     };
     on_segment(p1) && on_segment(p2)
 }
@@ -349,8 +350,10 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 /// Smooth anchors through a freehand stroke: the points are simplified to
 /// those within `tolerance` texels of the stroke, then joined by
 /// Catmull-Rom curves. Ends and turns sharper than a right angle stay
-/// corners, and each handle is at most a third of the segment it shapes, so
-/// the curve doesn't overshoot the stroke. Returns no anchors for no
+/// corners. Each handle keeps its Catmull-Rom direction but is at most a
+/// third of the segment it shapes and strays at most 4/3 `tolerance` to the
+/// side of it, so each curve stays within `tolerance` of the simplified line
+/// and within twice `tolerance` of the stroke. Returns no anchors for no
 /// points.
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
@@ -366,10 +369,22 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
                 return Anchor::corner(kept[i]);
             }
             let h = (kept[i + 1] - kept[i - 1]) / 6.0;
+            // A cubic strays at most 3/4 of its controls' offset from its
+            // chord.
+            let bound = |h: Vec2, segment: Vec2| {
+                let side = segment.normalize_or_zero().perp_dot(h).abs();
+                let max_side = tolerance.max(0.0) * 4.0 / 3.0;
+                let h = if side > max_side {
+                    h * (max_side / side)
+                } else {
+                    h
+                };
+                h.clamp_length_max(segment.length() / 3.0)
+            };
             Anchor {
                 point: kept[i],
-                handle_in: -h.clamp_length_max(kept[i].distance(kept[i - 1]) / 3.0),
-                handle_out: h.clamp_length_max(kept[i].distance(kept[i + 1]) / 3.0),
+                handle_in: bound(-h, kept[i - 1] - kept[i]),
+                handle_out: bound(h, kept[i + 1] - kept[i]),
             }
         })
         .collect()
@@ -502,12 +517,43 @@ mod tests {
         for x in 1..8 {
             assert!(o.covers(Vec2::new(x as f32 + 0.5, 0.5)), "{x}");
         }
-        // Handles along a straight edge leave it straight.
+        // Handles along a straight edge, or within the tolerance of it,
+        // leave it straight.
         let mut anchors = rectangle(Vec2::splat(0.5), Vec2::new(8.5, 4.5));
-        anchors[0].handle_out = Vec2::new(0.25, 0.0);
+        anchors[0].handle_out = Vec2::new(0.25, 0.01);
         anchors[1].handle_in = Vec2::new(-0.25, 0.0);
         let o = fill(anchors).outline();
         assert_eq!(o.points().len(), 4);
+
+        // Corner-only edges stay exact at any angle, so two triangles that
+        // share a diagonal through pixel centers cover each center once.
+        let mut rotated = fill(rectangle(Vec2::ZERO, Vec2::new(8.0, 5.0)));
+        rotated.transform(Affine2::from_angle(0.3));
+        assert_eq!(rotated.outline().points().len(), 4);
+        let (a, b) = (Vec2::new(1.5, 0.5), Vec2::new(10.5, 27.5));
+        let halves = [
+            fill(
+                vec![a, b, Vec2::new(10.5, 0.5)]
+                    .into_iter()
+                    .map(Anchor::corner)
+                    .collect(),
+            ),
+            fill(
+                vec![a, Vec2::new(1.5, 27.5), b]
+                    .into_iter()
+                    .map(Anchor::corner)
+                    .collect(),
+            ),
+        ]
+        .map(|s| s.outline());
+        for y in 0..28 {
+            for x in 0..11 {
+                let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let inside = (1.5..10.5).contains(&p.x) && (0.5..27.5).contains(&p.y);
+                let count = halves.iter().filter(|o| o.covers(p)).count();
+                assert_eq!(count, usize::from(inside), "{p}");
+            }
+        }
     }
 
     #[test]
@@ -550,7 +596,33 @@ mod tests {
         let bend = [Vec2::ZERO, Vec2::new(5.0, 5.0), Vec2::new(10.0, 0.0)];
         let anchors = freehand(&bend, 0.5);
         assert_eq!(anchors.len(), 3);
-        assert_eq!(anchors[1].handle_out, Vec2::new(10.0 / 6.0, 0.0));
+        // Along the Catmull-Rom direction, shortened to stay within the
+        // tolerance of each segment.
+        let out = anchors[1].handle_out;
+        assert!(out.y == 0.0 && out.x > 0.0 && out.x < 10.0 / 6.0, "{out}");
+        assert_eq!(anchors[1].handle_in, -out);
+        // A right-angle stroke stays within twice the tolerance of itself.
+        let mut ell: Vec<Vec2> = (0..=30).map(|x| Vec2::new(x as f32, 0.0)).collect();
+        ell.extend((1..=30).map(|y| Vec2::new(30.0, y as f32)));
+        let stroke = Style::Stroke {
+            width: 0.1,
+            closed: false,
+        };
+        let o = Shape::new(freehand(&ell, 0.5), stroke, PaletteIndex(0))
+            .unwrap()
+            .outline();
+        let drawn = Shape::new(
+            [Vec2::ZERO, Vec2::new(30.0, 0.0), Vec2::splat(30.0)]
+                .map(Anchor::corner)
+                .to_vec(),
+            stroke,
+            PaletteIndex(0),
+        )
+        .unwrap()
+        .outline();
+        for &p in o.points() {
+            assert!(drawn.distance(p) <= 1.0 + 1e-4, "{p}");
+        }
         // A stroke that doubles back keeps its far end, as a corner.
         let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
         assert_eq!(freehand(&back, 0.25), back.map(Anchor::corner).to_vec());
