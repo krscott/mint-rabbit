@@ -140,6 +140,18 @@ impl Editor {
         Ok(out)
     }
 
+    /// Takes back the open continuous edit's changes, as if it never
+    /// happened, and ends it.
+    pub fn revert_gesture(&mut self) {
+        if matches!(self.gesture, Gesture::Open { recorded: true, .. })
+            && let Some(before) = self.undo.pop()
+        {
+            self.project = before;
+            self.generation += 1;
+        }
+        self.end_gesture();
+    }
+
     /// Ends a continuous edit, so the next edit is a step of its own.
     pub fn end_gesture(&mut self) {
         self.gesture = Gesture::None;
@@ -253,6 +265,23 @@ mod tests {
         red(&mut e, 50);
         e.undo();
         assert_eq!(current(&e), 40);
+    }
+
+    #[test]
+    fn a_reverted_continuous_edit_leaves_no_step() {
+        let mut e = editor();
+        red(&mut e, 1);
+        for r in 2..5 {
+            e.edit_continuous("drag", |p| {
+                p.set_palette_color(PaletteIndex(0), Rgba8::new(r, 0, 0, 255))
+            })
+            .unwrap();
+        }
+        e.revert_gesture();
+        assert_eq!(current(&e), 1);
+        e.undo();
+        assert_eq!(current(&e), 0);
+        assert!(!e.can_undo());
     }
 
     #[test]

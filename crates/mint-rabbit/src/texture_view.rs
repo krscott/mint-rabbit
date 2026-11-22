@@ -249,7 +249,10 @@ impl TextureView {
             f.variant,
         );
 
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        // Clicks and drags without keyboard focus, which would stop the
+        // app's keys.
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), Sense::CLICK | Sense::DRAG);
         let fit = (rect.width() / size.x).min(rect.height() / size.y).max(1.0);
         let scale = fit * self.zoom;
         let image = Rect::from_center_size(rect.center() + self.pan, vec2(size.x, size.y) * scale);
@@ -436,20 +439,10 @@ impl TextureView {
         }
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
         let cancelled = escape && self.drag.is_some();
-        if let Some(drag) = self.drag.take_if(|_| cancelled) {
-            // A drawing is dropped, and a transform puts the shapes back.
-            match drag {
-                Drag::Move { original, .. }
-                | Drag::Scale { original, .. }
-                | Drag::Rotate { original, .. } => {
-                    replace_picked(editor, r, &self.targets, original);
-                }
-                Drag::Anchor { original, .. } => {
-                    replace_picked(editor, r, &self.targets, vec![original]);
-                }
-                Drag::PenHandle | Drag::Brush(_) | Drag::Box { .. } => {}
-            }
-            editor.end_gesture();
+        if cancelled {
+            // A drawing is dropped, and a transform's edits are rolled back.
+            self.drag = None;
+            editor.revert_gesture();
         } else if response.drag_stopped() {
             // Only the primary button's release finishes a drawing.
             let drag = self.drag.take();
@@ -465,7 +458,7 @@ impl TextureView {
         // Keys a text field is using are its own.
         // Keys a text field is using are its own, and none act mid-drag.
         if (response.hovered() || !self.pen.is_empty())
-            && !ui.ctx().egui_wants_keyboard_input()
+            && !ui.ctx().text_edit_focused()
             && self.drag.is_none()
         {
             let (enter, delete) = ui.input(|i| {

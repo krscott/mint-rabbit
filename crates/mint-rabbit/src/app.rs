@@ -690,7 +690,7 @@ impl App {
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
         // Text fields keep their own undo, and nothing changes the project
         // under an open confirmation.
-        if ctx.egui_wants_keyboard_input() || self.confirm.is_some() {
+        if ctx.text_edit_focused() || self.confirm.is_some() {
             return;
         }
         // Not mid-drag, which would keep editing the restored project.
@@ -873,7 +873,7 @@ impl eframe::App for App {
         // the pointer is released and no field has focus.
         if let Some(d) = &mut self.doc
             && !ctx.input(|i| i.pointer.any_down())
-            && ctx.memory(|m| m.focused().is_none())
+            && !ctx.text_edit_focused()
         {
             d.editor.end_gesture();
         }
