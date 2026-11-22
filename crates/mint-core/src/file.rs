@@ -23,6 +23,8 @@ use crate::{
 /// The project file inside a project directory.
 pub const PROJECT_FILE: &str = "project.ron";
 const IMAGE_DIR: &str = "textures";
+/// Largest texture side a project file may give, the usual GPU limit.
+const MAX_TEXTURE_SIDE: u32 = 8192;
 /// Version of the file layout this build reads and writes.
 const FORMAT: u32 = 1;
 
@@ -52,6 +54,8 @@ pub enum LoadError {
     Image(PathBuf, String),
     #[error("image path {0:?} must be a relative path inside the project directory")]
     ImagePath(String),
+    #[error("texture {texture:?} is {size}; textures are at most {MAX_TEXTURE_SIDE} texels a side")]
+    TextureTooLarge { texture: String, size: UVec2 },
     #[error("the project has no nodes; the first node is the model's root")]
     NoRoot,
     #[error("node {node} names parent {parent}, which is not an earlier node")]
@@ -407,6 +411,12 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
     let mut textures = Vec::new();
     for t in file.textures {
         let size = UVec2::from_array(t.size);
+        if size.max_element() > MAX_TEXTURE_SIDE {
+            return Err(LoadError::TextureTooLarge {
+                texture: t.name,
+                size,
+            });
+        }
         let slot = Slot(t.slot);
         let texture = match t.content {
             ContentFile::Painted(variants) => {
@@ -707,8 +717,9 @@ fn read_png(
     let mut dec = png::Decoder::new(BufReader::new(file));
     dec.set_transformations(png::Transformations::IDENTITY);
     let mut reader = dec.read_info().map_err(png_err)?;
-    // Checked before decoding, so a wrong file can't make load allocate for
-    // an image of any size.
+    // Checked before decoding, so a PNG that doesn't match its texture can't
+    // make load allocate for its size; texture sizes themselves are capped
+    // at MAX_TEXTURE_SIDE.
     let actual = UVec2::new(reader.info().width, reader.info().height);
     if actual != size {
         return Err(LoadError::Image(
@@ -1035,6 +1046,14 @@ mod tests {
         assert_ne!(escaping, text);
         std::fs::write(&path, escaping).unwrap();
         assert!(matches!(load(dir.path()), Err(LoadError::ImagePath(p)) if p.starts_with("../")));
+
+        let huge = text.replacen("size: (4, 2)", "size: (60000, 60000)", 1);
+        assert_ne!(huge, text);
+        std::fs::write(&path, huge).unwrap();
+        assert!(matches!(
+            load(dir.path()),
+            Err(LoadError::TextureTooLarge { .. })
+        ));
 
         // An underlay pixel past the palette's end fails as a project would.
         let one_color = text.replace("(200, 100, 0, 128),", "");
