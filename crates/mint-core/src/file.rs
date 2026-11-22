@@ -8,7 +8,7 @@
 //! a project that breaks their rules.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 
 use glam::{Quat, UVec2, Vec2, Vec3};
@@ -188,20 +188,35 @@ enum StyleFile {
     Stroke { width: f32, closed: bool },
 }
 
-/// Writes `project` into directory `dir`, creating it if needed. Each file is
-/// written beside its destination and renamed into place, the project file
-/// last, so an interrupted save leaves the previous project file readable.
+/// Writes `project` into directory `dir`, creating it if needed.
+///
+/// Image files are named after their contents, so a save never changes an
+/// image the previous project file refers to. The project file is written
+/// beside its destination and renamed into place, and only then are images
+/// it no longer uses removed; an interrupted save leaves the previous project
+/// intact.
 pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    let mut written = Vec::new();
+    let mut image = |stem: String, png: Vec<u8>| -> Result<String, SaveError> {
+        let rel = format!("{IMAGE_DIR}/{stem}-{:016x}.png", fnv1a(&png));
+        let path = dir.join(&rel);
+        if !path.is_file() {
+            write_atomic(&path, &png)?;
+        }
+        written.push(path);
+        Ok(rel)
+    };
     let mut textures = Vec::new();
     for (t, texture) in project.textures().iter().enumerate() {
         let content = match texture.content() {
             TextureContent::Painted(variants) => {
                 let mut out = Vec::new();
                 for (v, variant) in variants.iter().enumerate() {
-                    let rel = format!("{IMAGE_DIR}/{t}-{v}.png");
-                    write_indexed(&dir.join(&rel), variant.underlay(), project.palette())?;
+                    let png = encode_indexed(variant.underlay(), project.palette())
+                        .map_err(|e| SaveError::Png(dir.join(IMAGE_DIR), e))?;
+                    let rel = image(format!("{t}-{v}"), png)?;
                     out.push(VariantFile {
                         name: variant.name.clone(),
                         underlay: rel,
@@ -211,8 +226,9 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
                 ContentFile::Painted(out)
             }
             TextureContent::External { preview } => {
-                let rel = format!("{IMAGE_DIR}/{t}-preview.png");
-                write_rgba(&dir.join(&rel), preview)?;
+                let png =
+                    encode_rgba(preview).map_err(|e| SaveError::Png(dir.join(IMAGE_DIR), e))?;
+                let rel = image(format!("{t}-preview"), png)?;
                 ContentFile::External { preview: rel }
             }
         };
@@ -246,9 +262,22 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
             .collect(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(4))?;
-    let path = dir.join(PROJECT_FILE);
-    write_atomic(&path, |w| {
-        std::io::Write::write_all(w, text.as_bytes()).map_err(|e| SaveError::Io(path.clone(), e))
+    write_atomic(&dir.join(PROJECT_FILE), text.as_bytes())?;
+    // Remove the images of earlier saves.
+    let entries = std::fs::read_dir(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    for entry in entries {
+        let path = entry.map_err(|e| SaveError::Io(images.clone(), e))?.path();
+        if path.extension().is_some_and(|e| e == "png") && !written.contains(&path) {
+            std::fs::remove_file(&path).map_err(|e| SaveError::Io(path.clone(), e))?;
+        }
+    }
+    Ok(())
+}
+
+/// 64-bit FNV-1a, a stable hash for naming files by their contents.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
@@ -514,59 +543,54 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     }
 }
 
-fn write_atomic(
-    path: &Path,
-    write: impl FnOnce(&mut BufWriter<std::fs::File>) -> Result<(), SaveError>,
-) -> Result<(), SaveError> {
+/// Writes `bytes` to a temporary file beside `path`, then renames it into
+/// place.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let io = |e| SaveError::Io(path.to_owned(), e);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let mut w = BufWriter::new(std::fs::File::create(&tmp).map_err(io)?);
-    write(&mut w)?;
-    w.into_inner()
-        .map_err(|e| io(e.into_error()))?
-        .sync_all()
-        .map_err(io)?;
-    std::fs::rename(&tmp, path).map_err(io)
+    let mut file = std::fs::File::create(&tmp).map_err(io)?;
+    std::io::Write::write_all(&mut file, bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io(e)
+        })
 }
 
-fn write_indexed(path: &Path, image: &IndexedImage, palette: &Palette) -> Result<(), SaveError> {
-    write_atomic(path, |w| {
-        let png_err = |e| SaveError::Png(path.to_owned(), e);
-        let mut enc = png::Encoder::new(w, image.size().x, image.size().y);
-        enc.set_color(png::ColorType::Indexed);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut colors = palette.colors().to_vec();
-        if colors.is_empty() {
-            // PNG needs a palette entry; an image over an empty palette has
-            // no pixels to use it.
-            colors.push(Rgba8::new(0, 0, 0, 255));
-        }
-        enc.set_palette(
-            colors
-                .iter()
-                .flat_map(|c| [c.r, c.g, c.b])
-                .collect::<Vec<_>>(),
-        );
-        enc.set_trns(colors.iter().map(|c| c.a).collect::<Vec<_>>());
-        let pixels: Vec<u8> = image.pixels().iter().map(|i| i.0).collect();
-        enc.write_header()
-            .and_then(|mut w| w.write_image_data(&pixels))
-            .map_err(png_err)
-    })
+fn encode_indexed(image: &IndexedImage, palette: &Palette) -> Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, image.size().x, image.size().y);
+    enc.set_color(png::ColorType::Indexed);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut colors = palette.colors().to_vec();
+    if colors.is_empty() {
+        // PNG needs a palette entry; an image over an empty palette has no
+        // pixels to use it.
+        colors.push(Rgba8::new(0, 0, 0, 255));
+    }
+    enc.set_palette(
+        colors
+            .iter()
+            .flat_map(|c| [c.r, c.g, c.b])
+            .collect::<Vec<_>>(),
+    );
+    enc.set_trns(colors.iter().map(|c| c.a).collect::<Vec<_>>());
+    let pixels: Vec<u8> = image.pixels().iter().map(|i| i.0).collect();
+    enc.write_header()?.write_image_data(&pixels)?;
+    Ok(out)
 }
 
-fn write_rgba(path: &Path, image: &RgbaImage) -> Result<(), SaveError> {
-    write_atomic(path, |w| {
-        let mut enc = png::Encoder::new(w, image.size.x, image.size.y);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let pixels: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
-        enc.write_header()
-            .and_then(|mut w| w.write_image_data(&pixels))
-            .map_err(|e| SaveError::Png(path.to_owned(), e))
-    })
+fn encode_rgba(image: &RgbaImage) -> Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, image.size.x, image.size.y);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let pixels: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+    enc.write_header()?.write_image_data(&pixels)?;
+    Ok(out)
 }
 
 /// Decodes a PNG with no color conversion, returning its size, color type,
@@ -614,9 +638,10 @@ fn read_rgba(path: &Path) -> Result<RgbaImage, LoadError> {
             "must be an 8-bit RGBA PNG".into(),
         ));
     }
+    let (pixels, _) = pixels.as_chunks::<4>();
     let pixels = pixels
-        .chunks_exact(4)
-        .map(|p| Rgba8::new(p[0], p[1], p[2], p[3]))
+        .iter()
+        .map(|&[r, g, b, a]| Rgba8::new(r, g, b, a))
         .collect();
     Ok(RgbaImage { size, pixels })
 }
@@ -737,6 +762,46 @@ mod tests {
         assert_eq!(load(dir.path()).unwrap(), p);
     }
 
+    fn images(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<_> = std::fs::read_dir(dir.join(IMAGE_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn saving_keeps_the_previous_images_until_the_project_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample();
+        save(&p, dir.path()).unwrap();
+        let first = images(dir.path());
+        assert_eq!(first.len(), 3);
+
+        // Merging colors changes every underlay. If the project file can't be
+        // replaced, the old one still loads with its own images.
+        p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
+            .unwrap();
+        let manifest = dir.path().join(PROJECT_FILE);
+        let blocker = PathBuf::from(format!("{}.{}.tmp", manifest.display(), std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(save(&p, dir.path()).is_err());
+        assert_eq!(load(dir.path()).unwrap(), sample());
+
+        // Once it is replaced, only the new images remain.
+        std::fs::remove_dir(&blocker).unwrap();
+        save(&p, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), p);
+        let second = images(dir.path());
+        assert_eq!(second.len(), 3);
+        assert!(
+            second
+                .iter()
+                .all(|f| !first.contains(f) || f.to_string_lossy().contains("preview"))
+        );
+    }
+
     #[test]
     fn load_refuses_other_formats_and_escaping_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -747,12 +812,10 @@ mod tests {
         std::fs::write(&path, text.replace("format: 1", "format: 2")).unwrap();
         assert!(matches!(load(dir.path()), Err(LoadError::Format(2))));
 
-        std::fs::write(
-            &path,
-            text.replace("\"textures/0-0.png\"", "\"../0-0.png\""),
-        )
-        .unwrap();
-        assert!(matches!(load(dir.path()), Err(LoadError::ImagePath(p)) if p == "../0-0.png"));
+        let escaping = text.replacen("\"textures/", "\"../", 1);
+        assert_ne!(escaping, text);
+        std::fs::write(&path, escaping).unwrap();
+        assert!(matches!(load(dir.path()), Err(LoadError::ImagePath(p)) if p.starts_with("../")));
 
         // An underlay pixel past the palette's end fails as a project would.
         let one_color = text.replace("(200, 100, 0, 128),", "");

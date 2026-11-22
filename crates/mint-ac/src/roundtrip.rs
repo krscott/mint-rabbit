@@ -97,19 +97,21 @@ fn canonical(p: &Project) -> Canonical {
 }
 
 /// Exports `project` and imports the result again.
+/// Parses one villager table entry.
+fn table_row(entry: &str) -> crate::VillagerRef {
+    let table = CFile::parse_str(
+        Path::new("table.c"),
+        &format!("aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{entry}}};"),
+    )
+    .unwrap();
+    parse_villagers(&table).unwrap().remove(0)
+}
+
 fn reimport(project: &Project, pose_file: &CFile) -> Project {
     let out = export(project, "rt_1", "rt_1").unwrap();
     let model = CFile::parse_str(Path::new("rt_1.c"), &out.model_c).unwrap();
     let tex = CFile::parse_str(Path::new("rt_1_tex.c"), &out.textures.texture_c).unwrap();
-    let table = CFile::parse_str(
-        Path::new("table.c"),
-        &format!(
-            "aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};",
-            out.textures.draw_data_entry
-        ),
-    )
-    .unwrap();
-    let v = parse_villagers(&table).unwrap().remove(0);
+    let v = table_row(&out.textures.table_entry(None));
     build_project(&model, &tex, pose_file, &v).unwrap()
 }
 
@@ -174,6 +176,21 @@ fn prelude(
          gsDPLoadTextureBlock_4b_Dolphin({texture}, G_IM_FMT_CI, {w}, {h}, {tlut}, {wrap}, 0, 0),
          gsDPSetPrimColor(0, 128, 255, 250, 255, 255),
          gsSPLoadGeometryMode(G_ZBUFFER | G_SHADE{cull} | G_FOG | G_LIGHTING | G_SHADING_SMOOTH),"
+    )
+}
+
+/// The synthetic villager's table: one entry, texture set `t_1`.
+fn synthetic_table() -> String {
+    let eyes: Vec<String> = (1..=8).map(|k| format!("t_1_eye{k}_TA_tex_txt")).collect();
+    let mouths: Vec<String> = (1..=6)
+        .map(|k| format!("t_1_mouth{k}_TA_tex_txt"))
+        .collect();
+    format!(
+        "aNPC_draw_data_c npc_draw_data_tbl[] = {{
+            {{ 1, 2, &cKF_bs_r_t_1, {{ t_1_tmem_txt, t_1_pal, {{ {} }}, {{ {} }}, 0, 32, 128 }}, 0.009, 0 }},
+         }};",
+        eyes.join(", "),
+        mouths.join(", ")
     )
 }
 
@@ -249,22 +266,11 @@ fn synthetic() -> (CFile, CFile, CFile, CFile) {
         "unsigned char t_1_tmem_txt[] = {{ {} }};",
         bytes(99, 0xC0)
     );
-    let eyes: Vec<String> = (1..=8).map(|k| format!("t_1_eye{k}_TA_tex_txt")).collect();
-    let mouths: Vec<String> = (1..=6)
-        .map(|k| format!("t_1_mouth{k}_TA_tex_txt"))
-        .collect();
-    let table = format!(
-        "aNPC_draw_data_c npc_draw_data_tbl[] = {{
-            {{ 1, 2, &cKF_bs_r_t_1, {{ t_1_tmem_txt, t_1_pal, {{ {} }}, {{ {} }}, 0, 32, 128 }}, 0.009, 0 }},
-         }};",
-        eyes.join(", "),
-        mouths.join(", ")
-    );
     let parse = |name: &str, text: &str| CFile::parse_str(Path::new(name), text).unwrap();
     (
         parse("t_1.c", &model),
         parse("t_1_tex.c", &tex),
-        parse("table.c", &table),
+        parse("table.c", &synthetic_table()),
         parse("pose.c", &synthetic_pose()),
     )
 }
@@ -351,22 +357,18 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
     use crate::{Decomp, WriteError, export_textures};
     use mint_core::{Layer, PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
 
-    let (mut p, pose) = synthetic_project();
+    let (mut p, _) = synthetic_project();
     let dir = tempfile::tempdir().unwrap();
     let write = |rel: &str, text: &str| {
         let path = dir.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     };
-    let original = export(&p, "t_1", "t_1").unwrap().textures;
-    write(
-        "src/data/npc/npc_draw_data.c",
-        &format!(
-            "aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};",
-            original.draw_data_entry
-        ),
-    );
-    write("src/data/npc/model/tex/t_1.c", &original.texture_c);
+    let full = export(&p, "t_1", "t_1").unwrap();
+    write("src/data/npc/model/mdl/t_1.c", &full.model_c);
+    write("src/data/npc/npc_1_wait1.c", &synthetic_pose());
+    write("src/data/npc/npc_draw_data.c", &synthetic_table());
+    write("src/data/npc/model/tex/t_1.c", &full.textures.texture_c);
     std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
     let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
 
@@ -391,14 +393,15 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
     let path = decomp.write_texture_set(&painted).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), painted.texture_c);
 
-    let model = CFile::parse_str(
-        Path::new("t_1.c"),
-        &export(&p, "t_1", "t_1").unwrap().model_c,
-    );
     let v = decomp.villagers().unwrap().remove(0);
-    let tex = CFile::read(&path, &[]).unwrap();
-    let again = build_project(&model.unwrap(), &tex, &pose, &v).unwrap();
+    let again = decomp.import(&v).unwrap();
     assert_eq!(again.variant(r).underlay(), &p.variant(r).rasterize());
+
+    // A new villager's entry copies the base's settings.
+    let entry = painted.table_entry(Some(&v));
+    assert!(entry.contains("1, TEXTURE_BANK"), "{entry}");
+    assert!(entry.contains("0, 32, 128 }"), "{entry}");
+    assert!(entry.contains("0.009, 0"), "{entry}");
 
     let mut renamed = painted.clone();
     renamed.texture_set = "t_2".into();
@@ -412,12 +415,21 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
         decomp.write_texture_set(&other),
         Err(WriteError::OtherModel { .. })
     ));
+    let mut resized = painted.clone();
+    resized.layout[0].1 /= 2;
+    assert!(matches!(
+        decomp.write_texture_set(&resized),
+        Err(WriteError::Layout { .. })
+    ));
     let mut fewer = painted.clone();
-    fewer.symbols.pop();
+    fewer.symbols.mouths.pop();
     let Err(WriteError::Symbols { missing, extra, .. }) = decomp.write_texture_set(&fewer) else {
         panic!("expected a symbol mismatch");
     };
-    assert_eq!((missing, extra), (vec!["t_1_tmem_txt".to_owned()], vec![]));
+    assert_eq!(
+        (missing, extra),
+        (vec!["t_1_mouth6_TA_tex_txt".to_owned()], vec![])
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), painted.texture_c);
 }
 
@@ -637,8 +649,12 @@ fn every_built_villager_round_trips() {
                 mint_core::file::save(&p, dir.path()).unwrap();
                 let loaded = mint_core::file::load(dir.path()).unwrap();
                 assert!(loaded == p, "{} changed in save and load", v.texture_set);
-                // Its texture-only export could replace its own source.
+                // Its texture-only export could replace its own source, and
+                // a table entry based on it parses back to the same row.
                 let textures = crate::export_textures(&p, &v.texture_set).unwrap();
+                let mut row = table_row(&textures.table_entry(Some(&v)));
+                row.index = v.index;
+                assert_eq!(row, v, "{}", v.texture_set);
                 decomp
                     .check_texture_set(&textures)
                     .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));

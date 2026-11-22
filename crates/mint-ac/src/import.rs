@@ -71,6 +71,15 @@ pub enum WriteError {
         expected: String,
     },
     #[error(
+        "the textures differ in slot or size from those model {model} reads for {texture_set}: it reads {expected:?}, the export has {actual:?}"
+    )]
+    Layout {
+        model: String,
+        texture_set: String,
+        expected: Vec<(String, UVec2)>,
+        actual: Vec<(String, UVec2)>,
+    },
+    #[error(
         "{path} defines different arrays than the export would; missing from the export: {missing:?}; only in the export: {extra:?}"
     )]
     Symbols {
@@ -104,6 +113,17 @@ pub struct VillagerRef {
     palette: String,
     eyes: Vec<String>,
     mouths: Vec<String>,
+    pub(crate) fields: TableFields,
+}
+
+/// The parts of a villager table entry besides its model and textures, as C.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableFields {
+    pub model_bank: String,
+    /// Texture data fields after the mouth list.
+    pub texture_extra: Vec<String>,
+    /// Entry fields after the texture data: scale, talk type, and so on.
+    pub extra: Vec<String>,
 }
 
 impl Decomp {
@@ -152,9 +172,10 @@ impl Decomp {
     }
 
     /// Checks that `export` can replace the source of an existing texture
-    /// set: the set must be in the villager table on the export's model, and
-    /// its file must define the same arrays, so the table still links.
-    /// Returns the path of that file.
+    /// set: the set must be in the villager table on the export's model, its
+    /// textures must have the slots and sizes the model reads, and its file
+    /// must define the same arrays, so the table still links. Returns the
+    /// path of that file.
     pub fn check_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
         let set = &export.texture_set;
         let v = self
@@ -169,10 +190,19 @@ impl Decomp {
                 expected: export.model.clone(),
             });
         }
+        let expected = crate::export::texture_layout(&self.import(&v)?);
+        if expected != export.layout {
+            return Err(WriteError::Layout {
+                model: v.model,
+                texture_set: set.clone(),
+                expected,
+                actual: export.layout.clone(),
+            });
+        }
         let rel = Self::texture_path(set);
         let existing: BTreeSet<String> =
             self.read(&rel)?.decls.into_iter().map(|d| d.name).collect();
-        let exported: BTreeSet<String> = export.symbols.iter().cloned().collect();
+        let exported: BTreeSet<String> = export.symbols.all().cloned().collect();
         let path = self.root.join(rel);
         if existing != exported {
             return Err(WriteError::Symbols {
@@ -187,6 +217,9 @@ impl Decomp {
     /// Replaces the source of an existing texture set with `export`, after
     /// [`Self::check_texture_set`], so the next build draws that villager
     /// with the exported textures. Returns the path written.
+    ///
+    /// The game then no longer matches the original, so the decomp must be
+    /// configured with `python configure.py --non-matching` to build it.
     pub fn write_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
         let path = self.check_texture_set(export)?;
         // Write beside it and rename, so a failed write leaves the old file.
@@ -257,6 +290,7 @@ pub(crate) fn parse_villagers(file: &CFile) -> Result<Vec<VillagerRef>, ImportEr
                 .map(|v| v.into_iter().filter(|n| n != "NULL").collect::<Vec<_>>())
                 .ok_or_else(|| bad("eye or mouth list is malformed"))
         };
+        let c = |fields: &[Init]| fields.iter().map(ToString::to_string).collect();
         out.push(VillagerRef {
             index,
             model,
@@ -265,6 +299,11 @@ pub(crate) fn parse_villagers(file: &CFile) -> Result<Vec<VillagerRef>, ImportEr
             palette: palette.to_owned(),
             eyes: names(2)?,
             mouths: names(3)?,
+            fields: TableFields {
+                model_bank: fields[0].to_string(),
+                texture_extra: c(tex.get(4..).unwrap_or_default()),
+                extra: c(fields.get(4..).unwrap_or_default()),
+            },
         });
     }
     Ok(out)

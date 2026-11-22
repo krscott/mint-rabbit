@@ -9,7 +9,7 @@ use mint_core::{AlphaMode, MaterialId, NodeId, Project, Texture, TextureContent,
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
-use crate::{OPTION_MODEL, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
+use crate::{OPTION_MODEL, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET, VillagerRef};
 
 /// Most triangles one `gsSPNTrianglesInit_5b` group can count.
 const MAX_GROUP_TRIANGLES: usize = 128;
@@ -82,19 +82,110 @@ pub struct TextureExport {
     pub texture_set: String,
     /// Contents of `src/data/npc/model/tex/<texture_set>.c`.
     pub texture_c: String,
-    /// The arrays `texture_c` defines, in order.
-    pub symbols: Vec<String>,
-    /// Declarations the `npc_draw_data_tbl` file needs for the entry.
-    pub draw_data_externs: String,
-    /// The `npc_draw_data_tbl` entry, with `MODEL_BANK` and `TEXTURE_BANK`
-    /// to replace and a reminder to fill the fields after the textures.
-    pub draw_data_entry: String,
+    /// The arrays `texture_c` defines.
+    pub symbols: TextureSymbols,
+    /// Slot and size of each of the project's textures, in order, which
+    /// together set where the model finds each one.
+    pub layout: Vec<(String, glam::UVec2)>,
+}
+
+/// Names of the arrays a texture set defines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextureSymbols {
+    pub palette: String,
+    pub eyes: Vec<String>,
+    pub mouths: Vec<String>,
+    pub body: String,
+}
+
+impl TextureSymbols {
+    fn new(set: &str, layout: &Layout) -> Self {
+        Self {
+            palette: format!("{set}_pal"),
+            eyes: (1..=layout.eyes.len())
+                .map(|k| format!("{set}_eye{k}_TA_tex_txt"))
+                .collect(),
+            mouths: (1..=layout.mouths.len())
+                .map(|k| format!("{set}_mouth{k}_TA_tex_txt"))
+                .collect(),
+            body: format!("{set}_tmem_txt"),
+        }
+    }
+
+    /// Every name, in the order `texture_c` defines them.
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.palette)
+            .chain(&self.eyes)
+            .chain(&self.mouths)
+            .chain([&self.body])
+    }
 }
 
 impl TextureExport {
+    /// The declarations `src/data/npc/npc_draw_data.c` needs for the table
+    /// entry.
+    #[must_use]
+    pub fn table_externs(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "extern cKF_Skeleton_R_c cKF_bs_r_{};", self.model);
+        let _ = writeln!(out, "extern unsigned short {}[];", self.symbols.palette);
+        for n in self.symbols.all().skip(1) {
+            let _ = writeln!(out, "extern unsigned char {n}[];");
+        }
+        out
+    }
+
+    /// The `npc_draw_data_tbl` entry for the texture set. It copies the
+    /// model bank and the fields after the textures from `base`, a villager
+    /// on the same model, or leaves `MODEL_BANK` and comments to fill in
+    /// without one. `TEXTURE_BANK` is always left to replace with the new
+    /// texture set's object bank.
+    #[must_use]
+    pub fn table_entry(&self, base: Option<&VillagerRef>) -> String {
+        let base = base.filter(|b| b.model == self.model);
+        let list = |names: &[String], len: usize| {
+            (0..len)
+                .map(|i| names.get(i).map_or("NULL", String::as_str).to_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (model_bank, texture_extra, extra) = match base {
+            Some(b) => (
+                b.fields.model_bank.clone(),
+                b.fields.texture_extra.join(", "),
+                b.fields.extra.join(", "),
+            ),
+            None => (
+                "MODEL_BANK".to_owned(),
+                "/* the base villager's remaining texture fields */".to_owned(),
+                "/* the base villager's remaining fields: scale, talk type, ... */".to_owned(),
+            ),
+        };
+        let s = &self.symbols;
+        format!(
+            "    {{
+        {model_bank}, TEXTURE_BANK,
+        &cKF_bs_r_{},
+        {{ {}, {}, {{ {} }}, {{ {} }}, {texture_extra} }},
+        {extra}
+    }},
+",
+            self.model,
+            s.body,
+            s.palette,
+            list(&s.eyes, EYE_VARIANTS),
+            list(&s.mouths, MOUTH_VARIANTS),
+        )
+    }
+
     /// Writes `<texture_set>.c` and `<texture_set>_draw_data.txt`, the table
-    /// entry to paste, into `dir`, returning their paths.
-    pub fn write_to(&self, dir: &std::path::Path) -> std::io::Result<[std::path::PathBuf; 2]> {
+    /// declarations and [`Self::table_entry`] to paste, into `dir`, returning
+    /// their paths.
+    pub fn write_to(
+        &self,
+        dir: &std::path::Path,
+        base: Option<&VillagerRef>,
+    ) -> std::io::Result<[std::path::PathBuf; 2]> {
         std::fs::create_dir_all(dir)?;
         let c = dir.join(format!("{}.c", self.texture_set));
         let table = dir.join(format!("{}_draw_data.txt", self.texture_set));
@@ -102,8 +193,9 @@ impl TextureExport {
         std::fs::write(
             &table,
             format!(
-                "// Declarations for src/data/npc/npc_draw_data.c:\n{}\n// Entry for npc_draw_data_tbl:\n{}",
-                self.draw_data_externs, self.draw_data_entry
+                "// Declarations for src/data/npc/npc_draw_data.c:\n{}\n// Entry for npc_draw_data_tbl; replace TEXTURE_BANK with the texture set's object bank:\n{}",
+                self.table_externs(),
+                self.table_entry(base)
             ),
         )?;
         Ok([c, table])
@@ -248,16 +340,6 @@ fn byte_array(out: &mut String, name: &str, data: &[u8]) {
     out.push_str("};\n\n");
 }
 
-/// Names of the arrays a texture set defines, in the order `texture_c`
-/// writes them.
-fn symbols(set: &str, layout: &Layout) -> Vec<String> {
-    let mut out = vec![format!("{set}_pal")];
-    out.extend((1..=layout.eyes.len()).map(|k| format!("{set}_eye{k}_TA_tex_txt")));
-    out.extend((1..=layout.mouths.len()).map(|k| format!("{set}_mouth{k}_TA_tex_txt")));
-    out.push(format!("{set}_tmem_txt"));
-    out
-}
-
 fn texture_c(project: &Project, set: &str, layout: &Layout) -> String {
     let colors = project.palette().colors();
     let mut out = String::new();
@@ -274,13 +356,13 @@ fn texture_c(project: &Project, set: &str, layout: &Layout) -> String {
         let _ = write!(out, " 0x{:04X},", gx::encode_rgb5a3(c));
     }
     out.push_str("\n};\n\n");
-    let names = symbols(set, layout);
+    let names = TextureSymbols::new(set, layout);
     let arrays = layout
         .eyes
         .iter()
         .chain(&layout.mouths)
         .chain([&layout.body]);
-    for (name, data) in names[1..].iter().zip(arrays) {
+    for (name, data) in names.all().skip(1).zip(arrays) {
         byte_array(&mut out, name, data);
     }
     out
@@ -704,36 +786,6 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
     Ok(out)
 }
 
-/// The `extern` declarations and the table entry for `npc_draw_data_tbl`.
-fn draw_data(model: &str, set: &str, layout: &Layout, symbols: &[String]) -> (String, String) {
-    let mut externs = String::new();
-    let _ = writeln!(externs, "extern cKF_Skeleton_R_c cKF_bs_r_{model};");
-    let _ = writeln!(externs, "extern unsigned short {}[];", symbols[0]);
-    for n in &symbols[1..] {
-        let _ = writeln!(externs, "extern unsigned char {n}[];");
-    }
-    let eyes = &symbols[1..=layout.eyes.len()];
-    let mouths = &symbols[1 + layout.eyes.len()..symbols.len() - 1];
-    let list = |names: &[String], len: usize| {
-        (0..len)
-            .map(|i| names.get(i).map_or("NULL", String::as_str).to_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let entry = format!(
-        "    {{
-        MODEL_BANK, TEXTURE_BANK,
-        &cKF_bs_r_{model},
-        {{ {set}_tmem_txt, {set}_pal, {{ {} }}, {{ {} }}, /* copy the base villager's last three fields */ }},
-        /* scale, talk type, ... */
-    }},
-",
-        list(eyes, EYE_VARIANTS),
-        list(mouths, MOUTH_VARIANTS)
-    );
-    (externs, entry)
-}
-
 /// Checks what the target can hold and lays out the textures.
 fn prepare(project: &Project, texture_set: &str) -> Result<Layout, ExportError> {
     if project.target().id != TARGET {
@@ -765,21 +817,27 @@ fn prepare(project: &Project, texture_set: &str) -> Result<Layout, ExportError> 
     Ok(layout)
 }
 
+/// Slot and size of each texture, in order.
+pub(crate) fn texture_layout(project: &Project) -> Vec<(String, glam::UVec2)> {
+    project
+        .textures()
+        .iter()
+        .map(|t| (t.slot.0.clone(), t.size()))
+        .collect()
+}
+
 fn texture_export(
     project: &Project,
     model: &str,
     texture_set: &str,
     layout: &Layout,
 ) -> TextureExport {
-    let symbols = symbols(texture_set, layout);
-    let (draw_data_externs, draw_data_entry) = draw_data(model, texture_set, layout, &symbols);
     TextureExport {
         model: model.to_owned(),
         texture_set: texture_set.to_owned(),
         texture_c: texture_c(project, texture_set, layout),
-        symbols,
-        draw_data_externs,
-        draw_data_entry,
+        symbols: TextureSymbols::new(texture_set, layout),
+        layout: texture_layout(project),
     }
 }
 

@@ -100,7 +100,21 @@ impl fmt::Display for Expr {
                 f.write_str(")")
             }
             Expr::Unary(op, e) => write!(f, "{op}{e}"),
-            Expr::Binary(op, l, r) => write!(f, "({l} {op:?} {r})"),
+            Expr::Binary(op, l, r) => {
+                let op = match op {
+                    BinOp::Or => "|",
+                    BinOp::Xor => "^",
+                    BinOp::And => "&",
+                    BinOp::Shl => "<<",
+                    BinOp::Shr => ">>",
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Rem => "%",
+                };
+                write!(f, "({l} {op} {r})")
+            }
             Expr::AddrOf(e) => write!(f, "&{e}"),
             Expr::Index(a, i) => write!(f, "{a}[{i}]"),
             Expr::Sizeof(t) => write!(f, "sizeof({t})"),
@@ -177,6 +191,22 @@ fn size_of_type(ty: &str) -> Option<i64> {
 pub enum Init {
     List(Vec<Init>),
     Expr(Expr),
+}
+
+/// Prints the initializer back as C.
+impl fmt::Display for Init {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Init::Expr(e) => write!(f, "{e}"),
+            Init::List(items) => {
+                f.write_str("{ ")?;
+                for item in items {
+                    write!(f, "{item}, ")?;
+                }
+                f.write_str("}")
+            }
+        }
+    }
 }
 
 impl Init {

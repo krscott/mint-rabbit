@@ -344,7 +344,7 @@ fn main() {
         "src/data/npc/npc_draw_data.c",
         &format!(
             "extern aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};\n",
-            export.textures.draw_data_entry
+            export.textures.table_entry(None)
         ),
     );
     // The idle pose, all fixed values: the root translation, then each
