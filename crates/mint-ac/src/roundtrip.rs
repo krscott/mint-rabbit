@@ -365,6 +365,31 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
         Err(ExportError::Skeleton(_))
     ));
 
+    // The game's clothing texture is 32x32.
+    let mut textures = p.textures().to_vec();
+    let clothing = textures
+        .iter()
+        .position(|t| t.slot.0 == crate::SLOT_CLOTHING)
+        .unwrap();
+    textures[clothing] = mint_core::Texture::external(
+        crate::SLOT_CLOTHING,
+        mint_core::Slot(crate::SLOT_CLOTHING.into()),
+        mint_core::RgbaImage::filled(glam::UVec2::new(64, 64), Rgba8::new(0, 0, 0, 255)),
+    );
+    let big_shirt = Project::new(
+        p.target().clone(),
+        p.palette().clone(),
+        p.model().clone(),
+        textures,
+        p.materials().to_vec(),
+        p.pose().clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        export(&big_shirt, "rt_1", "rt_1"),
+        Err(ExportError::SlotSize { .. })
+    ));
+
     // Both display lists would be named body_rt_model.
     let mut renamed = p.model().clone();
     renamed.node_mut(NodeId(HEAD_JOINT as u32)).name = "body".into();

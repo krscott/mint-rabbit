@@ -313,7 +313,8 @@ fn tokenize(
         }
         if c == b'#' && at_line_start {
             let end = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
-            let directive = text[i + 1..end].trim();
+            let directive = without_comments(&text[i + 1..end]);
+            let directive = directive.trim();
             // Splicing both branches of a conditional would silently pick the
             // wrong definitions.
             let word: String = directive
@@ -409,6 +410,26 @@ fn tokenize(
         out.push(Token { tok, file, line });
     }
     Ok(())
+}
+
+/// A directive line with its comments replaced by spaces, as the
+/// preprocessor sees it (`#/**/if` is `# if`).
+fn without_comments(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("/*").into_iter().chain(rest.find("//")).min() {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        if rest[start..].starts_with("//") {
+            return out;
+        }
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_number(s: &str) -> Option<Tok> {
@@ -690,8 +711,13 @@ mod tests {
 
     #[test]
     fn refuses_conditional_compilation() {
-        let err = CFile::parse_str(Path::new("t.c"), "#if(0)\nint a = 1;\n#endif\n").unwrap_err();
-        assert!(err.to_string().contains("#if"), "{err}");
+        for text in [
+            "#if(0)\nint a = 1;\n#endif\n",
+            "#/**/if 1\nint a = 1;\n#/**/endif\n",
+        ] {
+            let err = CFile::parse_str(Path::new("t.c"), text).unwrap_err();
+            assert!(err.to_string().contains("#if"), "{err}");
+        }
     }
 
     #[test]

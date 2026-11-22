@@ -59,6 +59,12 @@ pub enum ExportError {
     },
     #[error("body textures take {0:#x} bytes; the body buffer holds {BODY_BUFFER:#x}")]
     BodyBufferFull(usize),
+    #[error("the {slot} texture is {actual}; the game's {slot} texture is {expected}")]
+    SlotSize {
+        slot: &'static str,
+        expected: glam::UVec2,
+        actual: glam::UVec2,
+    },
     #[error("node {node:?}: {problem}")]
     Node { node: String, problem: String },
 }
@@ -155,21 +161,37 @@ fn layout(project: &Project) -> Result<Layout, ExportError> {
                 })
             }
         };
+        // Eye, mouth, and clothing textures fill fixed-size game buffers.
+        let check_size = |slot: &'static str, w: u32, h: u32| {
+            let expected = glam::UVec2::new(w, h);
+            if size == expected {
+                Ok(())
+            } else {
+                Err(ExportError::SlotSize {
+                    slot,
+                    expected,
+                    actual: size,
+                })
+            }
+        };
         let placement = match (texture.slot.0.as_str(), texture.content()) {
             (SLOT_EYES, TextureContent::Painted(_)) => {
                 once(&mut seen_eye, SLOT_EYES)?;
+                check_size(SLOT_EYES, 32, 16)?;
                 check_count(SLOT_EYES, EYE_VARIANTS)?;
                 out.eyes = variant_bytes(texture)?;
                 Placement::Eye
             }
             (SLOT_MOUTH, TextureContent::Painted(_)) => {
                 once(&mut seen_mouth, SLOT_MOUTH)?;
+                check_size(SLOT_MOUTH, 32, 16)?;
                 check_count(SLOT_MOUTH, MOUTH_VARIANTS)?;
                 out.mouths = variant_bytes(texture)?;
                 Placement::Mouth
             }
             (SLOT_CLOTHING, TextureContent::External { .. }) => {
                 once(&mut seen_clothing, SLOT_CLOTHING)?;
+                check_size(SLOT_CLOTHING, 32, 32)?;
                 Placement::Clothing
             }
             (SLOT_BODY, TextureContent::Painted(_)) => {
