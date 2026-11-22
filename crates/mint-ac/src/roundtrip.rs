@@ -421,16 +421,29 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
         decomp.write_texture_set(&resized),
         Err(WriteError::Layout { .. })
     ));
-    let mut fewer = painted.clone();
-    fewer.symbols.mouths.pop();
-    let Err(WriteError::Symbols { missing, extra, .. }) = decomp.write_texture_set(&fewer) else {
+    let mut swapped = painted.clone();
+    swapped.symbols.eyes.swap(1, 2);
+    assert!(matches!(
+        decomp.write_texture_set(&swapped),
+        Err(WriteError::TableNames { .. })
+    ));
+    // The file defines an array the export would drop.
+    write(
+        "src/data/npc/model/tex/t_1.c",
+        &format!(
+            "{}unsigned char t_1_extra[] = {{ 0 }};\n",
+            painted.texture_c
+        ),
+    );
+    let Err(WriteError::Symbols { missing, extra, .. }) = decomp.write_texture_set(&painted) else {
         panic!("expected a symbol mismatch");
     };
-    assert_eq!(
-        (missing, extra),
-        (vec!["t_1_mouth6_TA_tex_txt".to_owned()], vec![])
+    assert_eq!((missing, extra), (vec!["t_1_extra".to_owned()], vec![]));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("t_1_extra[] = { 0 };\n")
     );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), painted.texture_c);
 }
 
 /// Triangles keep their drawing order even when materials interleave: the

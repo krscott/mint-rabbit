@@ -9,7 +9,10 @@ use mint_core::{AlphaMode, MaterialId, NodeId, Project, Texture, TextureContent,
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
-use crate::{OPTION_MODEL, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET, VillagerRef};
+use crate::{
+    OPTION_MODEL, OPTION_TEXTURE_SET, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET,
+    VillagerRef,
+};
 
 /// Most triangles one `gsSPNTrianglesInit_5b` group can count.
 const MAX_GROUP_TRIANGLES: usize = 128;
@@ -32,7 +35,9 @@ type CornerKey = (u32, [i16; 2]);
 pub enum ExportError {
     #[error("the project targets {0:?}, not {TARGET:?}")]
     WrongTarget(String),
-    #[error("the project has no {0:?} export target option")]
+    #[error(
+        "the project has no {0:?} export target option; texture-only export needs a project imported from a decomp"
+    )]
     MissingOption(&'static str),
     #[error("{0:?} is not a C identifier")]
     BadName(String),
@@ -76,22 +81,19 @@ pub struct Export {
 /// The exported sources of a texture set drawn on an existing model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextureExport {
-    /// The model the textures are drawn on, such as `cat_1`.
-    pub model: String,
-    /// The texture set's name, such as `cat_2`.
-    pub texture_set: String,
-    /// Contents of `src/data/npc/model/tex/<texture_set>.c`.
-    pub texture_c: String,
+    pub(crate) model: String,
+    pub(crate) texture_set: String,
+    pub(crate) texture_c: String,
     /// The arrays `texture_c` defines.
-    pub symbols: TextureSymbols,
+    pub(crate) symbols: TextureSymbols,
     /// Slot and size of each of the project's textures, in order, which
     /// together set where the model finds each one.
-    pub layout: Vec<(String, glam::UVec2)>,
+    pub(crate) layout: Vec<(String, glam::UVec2)>,
 }
 
 /// Names of the arrays a texture set defines.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextureSymbols {
+pub(crate) struct TextureSymbols {
     pub palette: String,
     pub eyes: Vec<String>,
     pub mouths: Vec<String>,
@@ -122,6 +124,24 @@ impl TextureSymbols {
 }
 
 impl TextureExport {
+    /// The model the textures are drawn on, such as `cat_1`.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The texture set's name, such as `cat_2`.
+    #[must_use]
+    pub fn texture_set(&self) -> &str {
+        &self.texture_set
+    }
+
+    /// Contents of `src/data/npc/model/tex/<texture_set>.c`.
+    #[must_use]
+    pub fn texture_c(&self) -> &str {
+        &self.texture_c
+    }
+
     /// The declarations `src/data/npc/npc_draw_data.c` needs for the table
     /// entry.
     #[must_use]
@@ -178,26 +198,44 @@ impl TextureExport {
         )
     }
 
-    /// Writes `<texture_set>.c` and `<texture_set>_draw_data.txt`, the table
-    /// declarations and [`Self::table_entry`] to paste, into `dir`, returning
-    /// their paths.
+    /// Writes `<texture_set>.c`, and `<texture_set>_draw_data.txt` with the
+    /// rest of what a new texture set needs in the decomp, into `dir`,
+    /// returning their paths.
     pub fn write_to(
         &self,
         dir: &std::path::Path,
         base: Option<&VillagerRef>,
-    ) -> std::io::Result<[std::path::PathBuf; 2]> {
-        std::fs::create_dir_all(dir)?;
-        let c = dir.join(format!("{}.c", self.texture_set));
-        let table = dir.join(format!("{}_draw_data.txt", self.texture_set));
-        std::fs::write(&c, &self.texture_c)?;
-        std::fs::write(
-            &table,
-            format!(
-                "// Declarations for src/data/npc/npc_draw_data.c:\n{}\n// Entry for npc_draw_data_tbl; replace TEXTURE_BANK with the texture set's object bank:\n{}",
-                self.table_externs(),
-                self.table_entry(base)
-            ),
-        )?;
+    ) -> Result<[std::path::PathBuf; 2], crate::WriteError> {
+        let set = &self.texture_set;
+        let io = |path: &std::path::Path| {
+            let path = path.to_owned();
+            move |e| crate::WriteError::Io(path, e)
+        };
+        std::fs::create_dir_all(dir).map_err(io(dir))?;
+        let c = dir.join(format!("{set}.c"));
+        let table = dir.join(format!("{set}_draw_data.txt"));
+        let notes = format!(
+            "// To add texture set {set} to the decomp:
+// 1. Copy {set}.c to src/data/npc/model/tex/{set}.c.
+// 2. List it in configure.py beside the other texture sets,
+//        Object(Matching, \"data/npc/model/tex/{set}.c\"),
+//    and add it to its module's link order with configure.py's
+//    link_order_callback (see the comment above it there).
+// 3. Add these declarations to src/data/npc/npc_draw_data.c:
+{}// 4. Add this entry to npc_draw_data_tbl, replacing TEXTURE_BANK with the
+//    texture set's object bank{}:
+{}// 5. Build with `python configure.py --non-matching && ninja`.
+",
+            self.table_externs(),
+            if base.is_some() {
+                ""
+            } else {
+                " and filling in the commented fields"
+            },
+            self.table_entry(base)
+        );
+        mint_core::file::write_atomic(&c, self.texture_c.as_bytes()).map_err(io(&c))?;
+        mint_core::file::write_atomic(&table, notes.as_bytes()).map_err(io(&table))?;
         Ok([c, table])
     }
 }
@@ -851,15 +889,24 @@ pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Expor
     })
 }
 
+/// The model and texture set an AC project was imported from, as recorded in
+/// its [`OPTION_MODEL`] and [`OPTION_TEXTURE_SET`] target options.
+pub fn imported_from(project: &Project) -> Result<(&str, &str), ExportError> {
+    let option = |key: &'static str| {
+        project
+            .target()
+            .options
+            .get(key)
+            .map(String::as_str)
+            .ok_or(ExportError::MissingOption(key))
+    };
+    Ok((option(OPTION_MODEL)?, option(OPTION_TEXTURE_SET)?))
+}
+
 /// Exports only the textures of `project`, as texture set `texture_set` for
-/// the unchanged model the project was imported from, named by its
-/// [`OPTION_MODEL`] target option.
+/// the unchanged model it was imported from (see [`imported_from`]).
 pub fn export_textures(project: &Project, texture_set: &str) -> Result<TextureExport, ExportError> {
-    let model = project
-        .target()
-        .options
-        .get(OPTION_MODEL)
-        .ok_or(ExportError::MissingOption(OPTION_MODEL))?;
+    let (model, _) = imported_from(project)?;
     check_name(model)?;
     let layout = prepare(project, texture_set)?;
     Ok(texture_export(project, model, texture_set, &layout))

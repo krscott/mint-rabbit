@@ -1,4 +1,5 @@
-//! Builds a project from a villager in a built decomp checkout.
+//! Reads villagers from a built decomp checkout as projects, and writes
+//! exported texture sets back into it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -78,6 +79,14 @@ pub enum WriteError {
         texture_set: String,
         expected: Vec<(String, UVec2)>,
         actual: Vec<(String, UVec2)>,
+    },
+    #[error(
+        "the villager table lists {texture_set}'s arrays as {table:?}, but the export names them {export:?}"
+    )]
+    TableNames {
+        texture_set: String,
+        table: Vec<String>,
+        export: Vec<String>,
     },
     #[error(
         "{path} defines different arrays than the export would; missing from the export: {missing:?}; only in the export: {extra:?}"
@@ -172,10 +181,10 @@ impl Decomp {
     }
 
     /// Checks that `export` can replace the source of an existing texture
-    /// set: the set must be in the villager table on the export's model, its
-    /// textures must have the slots and sizes the model reads, and its file
-    /// must define the same arrays, so the table still links. Returns the
-    /// path of that file.
+    /// set: the set must be in the villager table on the export's model,
+    /// listing the export's arrays in the same order; its textures must have
+    /// the slots and sizes the model reads; and its file must define the same
+    /// arrays, so the table still links. Returns the path of that file.
     pub fn check_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
         let set = &export.texture_set;
         let v = self
@@ -188,6 +197,21 @@ impl Decomp {
                 texture_set: set.clone(),
                 actual: v.model,
                 expected: export.model.clone(),
+            });
+        }
+        let s = &export.symbols;
+        let names = |v: &VillagerRef| {
+            let mut out = vec![v.tmem.clone(), v.palette.clone()];
+            out.extend(v.eyes.iter().chain(&v.mouths).cloned());
+            out
+        };
+        let mut ours = vec![s.body.clone(), s.palette.clone()];
+        ours.extend(s.eyes.iter().chain(&s.mouths).cloned());
+        if names(&v) != ours {
+            return Err(WriteError::TableNames {
+                texture_set: set.clone(),
+                table: names(&v),
+                export: ours,
             });
         }
         let expected = crate::export::texture_layout(&self.import(&v)?);
@@ -222,10 +246,7 @@ impl Decomp {
     /// configured with `python configure.py --non-matching` to build it.
     pub fn write_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
         let path = self.check_texture_set(export)?;
-        // Write beside it and rename, so a failed write leaves the old file.
-        let tmp = path.with_extension("c.tmp");
-        std::fs::write(&tmp, &export.texture_c)
-            .and_then(|()| std::fs::rename(&tmp, &path))
+        mint_core::file::write_atomic(&path, export.texture_c.as_bytes())
             .map_err(|e| WriteError::Io(path.clone(), e))?;
         Ok(path)
     }

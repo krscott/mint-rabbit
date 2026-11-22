@@ -50,8 +50,14 @@ pub enum LoadError {
     Image(PathBuf, String),
     #[error("image path {0:?} must be a relative path inside the project directory")]
     ImagePath(String),
+    #[error("the project has no nodes; the first node is the model's root")]
+    NoRoot,
     #[error("node {node} names parent {parent}, which is not an earlier node")]
     Parent { node: usize, parent: u32 },
+    #[error("node {0} has no parent; only the first node is the root")]
+    SecondRoot(usize),
+    #[error(transparent)]
+    Palette(crate::PaletteFull),
     #[error("texture {texture:?} variant {variant:?}: {source}")]
     Shape {
         texture: String,
@@ -196,6 +202,17 @@ enum StyleFile {
 /// it no longer uses removed; an interrupted save leaves the previous project
 /// intact.
 pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
+    stage(project, dir)?.commit(dir)
+}
+
+/// A save whose images are written but whose project file is not.
+struct Staged {
+    text: String,
+    images: Vec<PathBuf>,
+}
+
+/// Writes the images of `project` into `dir` and prepares its project file.
+fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
     let mut written = Vec::new();
@@ -203,7 +220,7 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
         let rel = format!("{IMAGE_DIR}/{stem}-{:016x}.png", fnv1a(&png));
         let path = dir.join(&rel);
         if !path.is_file() {
-            write_atomic(&path, &png)?;
+            write_atomic(&path, &png).map_err(|e| SaveError::Io(path.clone(), e))?;
         }
         written.push(path);
         Ok(rel)
@@ -262,16 +279,27 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
             .collect(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(4))?;
-    write_atomic(&dir.join(PROJECT_FILE), text.as_bytes())?;
-    // Remove the images of earlier saves.
-    let entries = std::fs::read_dir(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
-    for entry in entries {
-        let path = entry.map_err(|e| SaveError::Io(images.clone(), e))?.path();
-        if path.extension().is_some_and(|e| e == "png") && !written.contains(&path) {
-            std::fs::remove_file(&path).map_err(|e| SaveError::Io(path.clone(), e))?;
+    Ok(Staged {
+        text,
+        images: written,
+    })
+}
+
+impl Staged {
+    /// Replaces the project file, then removes the images of earlier saves.
+    fn commit(self, dir: &Path) -> Result<(), SaveError> {
+        let manifest = dir.join(PROJECT_FILE);
+        write_atomic(&manifest, self.text.as_bytes()).map_err(|e| SaveError::Io(manifest, e))?;
+        let images = dir.join(IMAGE_DIR);
+        let entries = std::fs::read_dir(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+        for entry in entries {
+            let path = entry.map_err(|e| SaveError::Io(images.clone(), e))?.path();
+            if path.extension().is_some_and(|e| e == "png") && !self.images.contains(&path) {
+                std::fs::remove_file(&path).map_err(|e| SaveError::Io(path.clone(), e))?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// 64-bit FNV-1a, a stable hash for naming files by their contents.
@@ -296,20 +324,17 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
         ron::from_str(&text).map_err(|e| LoadError::Ron(path.clone(), Box::new(e)))?;
 
     let mut nodes = file.nodes.into_iter().enumerate();
-    let (_, root) = nodes
-        .next()
-        .ok_or(LoadError::Parent { node: 0, parent: 0 })?;
+    let (_, root) = nodes.next().ok_or(LoadError::NoRoot)?;
+    if let Some(parent) = root.parent {
+        return Err(LoadError::Parent { node: 0, parent });
+    }
     let mut model = Model::new(root.name.clone(), transform(&root));
     model.node_mut(NodeId::ROOT).mesh = root.mesh.map(mesh);
     for (i, n) in nodes {
         let parent = match n.parent {
             Some(p) if (p as usize) < i => NodeId(p),
-            p => {
-                return Err(LoadError::Parent {
-                    node: i,
-                    parent: p.unwrap_or(u32::MAX),
-                });
-            }
+            Some(parent) => return Err(LoadError::Parent { node: i, parent }),
+            None => return Err(LoadError::SecondRoot(i)),
         };
         let id = model.add_child(parent, n.name.clone(), transform(&n));
         model.node_mut(id).mesh = n.mesh.map(mesh);
@@ -320,7 +345,7 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
             .iter()
             .map(|&[r, g, b, a]| Rgba8::new(r, g, b, a)),
     )
-    .map_err(|e| LoadError::Image(path.clone(), e.to_string()))?;
+    .map_err(LoadError::Palette)?;
     let mut textures = Vec::new();
     for t in file.textures {
         let size = UVec2::from_array(t.size);
@@ -543,21 +568,17 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     }
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it into
-/// place.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
-    let io = |e| SaveError::Io(path.to_owned(), e);
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let mut file = std::fs::File::create(&tmp).map_err(io)?;
-    std::io::Write::write_all(&mut file, bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            io(e)
-        })
+/// Replaces the file at `path` with `bytes` all at once: they are written
+/// to a new, uniquely named file beside it (never one already there, such as
+/// a planted link), synced, and renamed over it. A failed write removes the
+/// new file and leaves the old one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 fn encode_indexed(image: &IndexedImage, palette: &Palette) -> Result<Vec<u8>, png::EncodingError> {
@@ -779,19 +800,15 @@ mod tests {
         let first = images(dir.path());
         assert_eq!(first.len(), 3);
 
-        // Merging colors changes every underlay. If the project file can't be
+        // Merging colors changes every underlay. Until the project file is
         // replaced, the old one still loads with its own images.
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
             .unwrap();
-        let manifest = dir.path().join(PROJECT_FILE);
-        let blocker = PathBuf::from(format!("{}.{}.tmp", manifest.display(), std::process::id()));
-        std::fs::create_dir(&blocker).unwrap();
-        assert!(save(&p, dir.path()).is_err());
+        let staged = stage(&p, dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), sample());
 
         // Once it is replaced, only the new images remain.
-        std::fs::remove_dir(&blocker).unwrap();
-        save(&p, dir.path()).unwrap();
+        staged.commit(dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), p);
         let second = images(dir.path());
         assert_eq!(second.len(), 3);

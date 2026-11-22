@@ -338,7 +338,7 @@ fn main() {
     save("src/data/npc/model/mdl/demo_1.c", &export.model_c);
     save(
         "src/data/npc/model/tex/demo_1.c",
-        &export.textures.texture_c,
+        export.textures.texture_c(),
     );
     save(
         "src/data/npc/npc_draw_data.c",
