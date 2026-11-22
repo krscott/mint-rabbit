@@ -308,18 +308,17 @@ impl Outline {
     }
 
     /// Winding number of the closed outline around `p`. Edges include their
-    /// lower end and exclude their upper one, so a point on a shared edge
-    /// counts once.
+    /// lower end and exclude their upper one, and the side of an edge is
+    /// always computed from its lower end, so two outlines sharing an edge in
+    /// opposite directions agree on every point and one of them covers it.
     fn winding(&self, p: Vec2) -> i32 {
         let mut w = 0;
         let n = self.points.len();
         for i in 0..n {
             let (a, b) = (self.points[i], self.points[(i + 1) % n]);
-            let side = (b - a).perp_dot(p - a);
-            if a.y <= p.y && p.y < b.y && side > 0.0 {
-                w += 1;
-            } else if b.y <= p.y && p.y < a.y && side < 0.0 {
-                w -= 1;
+            let (lo, hi, dir) = if a.y <= b.y { (a, b, 1) } else { (b, a, -1) };
+            if lo.y <= p.y && p.y < hi.y && (hi - lo).perp_dot(p - lo) > 0.0 {
+                w += dir;
             }
         }
         w
@@ -347,8 +346,8 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
         .to_vec()
 }
 
-/// Smooth anchors through a freehand stroke: the points are simplified to
-/// those within `tolerance` texels of the stroke, then joined by
+/// Smooth anchors through a freehand stroke: the points are simplified to a
+/// polyline within `tolerance` texels of the stroke, then joined by
 /// Catmull-Rom curves. Ends and turns sharper than a right angle stay
 /// corners. Each handle keeps its Catmull-Rom direction but is at most a
 /// third of the segment it shapes and strays at most 4/3 `tolerance` to the
@@ -357,6 +356,8 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 /// points.
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
+    // A negative or NaN tolerance means none.
+    let tolerance = if tolerance >= 0.0 { tolerance } else { 0.0 };
     let mut kept = Vec::new();
     if let Some(&first) = points.first() {
         kept.push(first);
@@ -373,7 +374,7 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
             // chord.
             let bound = |h: Vec2, segment: Vec2| {
                 let side = segment.normalize_or_zero().perp_dot(h).abs();
-                let max_side = tolerance.max(0.0) * 4.0 / 3.0;
+                let max_side = tolerance * 4.0 / 3.0;
                 let h = if side > max_side {
                     h * (max_side / side)
                 } else {
@@ -391,28 +392,35 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
 }
 
 /// Ramer-Douglas-Peucker: appends the points of `points[1..]` that are
-/// needed to stay within `tolerance`, ending with the last point.
+/// needed to stay within `tolerance`, ending with the last point. Pending
+/// ranges sit on an explicit stack, as a long stroke can split many times.
 fn simplify(points: &[Vec2], tolerance: f32, out: &mut Vec<Vec2>) {
-    let [first, .., last] = points else { return };
-    let (first, last) = (*first, *last);
-    let line = last - first;
-    let far = points[1..points.len() - 1]
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| {
-            // Distance to the segment, not the line through it, so a stroke
-            // that doubles back keeps its turning point.
-            let t = ((p - first).dot(line) / line.length_squared().max(f32::MIN_POSITIVE))
-                .clamp(0.0, 1.0);
-            (i + 1, p.distance(first + line * t))
-        })
-        .max_by(|a, b| a.1.total_cmp(&b.1));
-    match far {
-        Some((i, d)) if d > tolerance => {
-            simplify(&points[..=i], tolerance, out);
-            simplify(&points[i..], tolerance, out);
+    if points.len() < 2 {
+        return;
+    }
+    // Ranges of `points` still to simplify, by first and last index; the
+    // leftmost is on top.
+    let mut pending = vec![(0, points.len() - 1)];
+    while let Some((start, end)) = pending.pop() {
+        let (first, last) = (points[start], points[end]);
+        let line = last - first;
+        let far = (start + 1..end)
+            .map(|i| {
+                // Distance to the segment, not the line through it, so a
+                // stroke that doubles back keeps its turning point.
+                let p = points[i];
+                let t = ((p - first).dot(line) / line.length_squared().max(f32::MIN_POSITIVE))
+                    .clamp(0.0, 1.0);
+                (i, p.distance(first + line * t))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        match far {
+            Some((i, d)) if d > tolerance => {
+                pending.push((i, end));
+                pending.push((start, i));
+            }
+            _ => out.push(last),
         }
-        _ => out.push(last),
     }
 }
 
@@ -525,6 +533,18 @@ mod tests {
         let o = fill(anchors).outline();
         assert_eq!(o.points().len(), 4);
 
+        // Two triangles sharing a diagonal with fractional ends cover each
+        // pixel center along it exactly once.
+        let (a, b) = (Vec2::new(0.0, 0.1), Vec2::new(2.5, 2.1));
+        let halves = [
+            fill([a, Vec2::new(2.5, 0.1), b].map(Anchor::corner).to_vec()),
+            fill([a, b, Vec2::new(0.0, 2.1)].map(Anchor::corner).to_vec()),
+        ]
+        .map(|s| s.outline());
+        for p in [Vec2::splat(0.5), Vec2::new(1.5, 1.5), Vec2::new(2.0, 1.7)] {
+            assert_eq!(halves.iter().filter(|o| o.covers(p)).count(), 1, "{p}");
+        }
+
         // Corner-only edges stay exact at any angle, so two triangles that
         // share a diagonal through pixel centers cover each center once.
         let mut rotated = fill(rectangle(Vec2::ZERO, Vec2::new(8.0, 5.0)));
@@ -601,7 +621,8 @@ mod tests {
         let out = anchors[1].handle_out;
         assert!(out.y == 0.0 && out.x > 0.0 && out.x < 10.0 / 6.0, "{out}");
         assert_eq!(anchors[1].handle_in, -out);
-        // A right-angle stroke stays within twice the tolerance of itself.
+        // A right-angle stroke stays within the tolerance of its simplified
+        // line, here the stroke itself.
         let mut ell: Vec<Vec2> = (0..=30).map(|x| Vec2::new(x as f32, 0.0)).collect();
         ell.extend((1..=30).map(|y| Vec2::new(30.0, y as f32)));
         let stroke = Style::Stroke {
@@ -621,7 +642,7 @@ mod tests {
         .unwrap()
         .outline();
         for &p in o.points() {
-            assert!(drawn.distance(p) <= 1.0 + 1e-4, "{p}");
+            assert!(drawn.distance(p) <= 0.5 + 1e-4, "{p}");
         }
         // A stroke that doubles back keeps its far end, as a corner.
         let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
@@ -641,6 +662,11 @@ mod tests {
             "{:?}",
             o.points()
         );
+        // A long zigzag simplifies without deep recursion.
+        let zigzag: Vec<Vec2> = (0..12_000)
+            .map(|i| [Vec2::ZERO, Vec2::new(8.0, 0.0), Vec2::new(0.0, 8.0)][i % 3])
+            .collect();
+        assert!(freehand(&zigzag, 0.5).len() > 3);
         assert!(freehand(&[], 0.5).is_empty());
         assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
     }
