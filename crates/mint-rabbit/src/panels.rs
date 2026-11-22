@@ -215,7 +215,12 @@ pub fn layers(
             return;
         }
         let i = selection.layer;
-        if ui.button("Delete").clicked() {
+        let locked = editor.project().variant(r).layers()[i].locked;
+        if ui
+            .add_enabled(!locked, egui::Button::new("Delete"))
+            .on_disabled_hover_text("The layer is locked")
+            .clicked()
+        {
             edit_variant(editor, r, message, |v| {
                 v.remove_layer(i);
             });
@@ -353,13 +358,18 @@ pub fn shapes(
         }
         let mut fill = style == Style::Fill;
         if ui.checkbox(&mut fill, "Filled").changed() {
+            // Every picked shape takes the box's new value; strokes keep
+            // their width and fills become closed strokes.
             let width = paint.width;
-            set_style(editor, None, r, layer, &picked, message, |s| match s {
-                Style::Fill => Style::Stroke {
-                    width,
-                    closed: true,
-                },
-                Style::Stroke { .. } => Style::Fill,
+            set_style(editor, None, r, layer, &picked, message, |s| {
+                match (fill, s) {
+                    (true, _) => Style::Fill,
+                    (false, Style::Fill) => Style::Stroke {
+                        width,
+                        closed: true,
+                    },
+                    (false, stroke) => stroke,
+                }
             });
         }
         // Width and closing apply to each picked stroke, keeping its other

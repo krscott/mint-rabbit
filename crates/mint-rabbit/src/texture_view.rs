@@ -137,9 +137,12 @@ enum Drag {
         start: Vec2,
         original: Vec<Shape>,
     },
+    /// The corner `start` follows the pointer's movement from `press`,
+    /// with the opposite corner `pivot` fixed.
     Scale {
         pivot: Vec2,
         start: Vec2,
+        press: Vec2,
         original: Vec<Shape>,
     },
     Rotate {
@@ -170,6 +173,9 @@ pub struct Frame<'a> {
     pub paint: Paint,
     pub selection: &'a mut Selection,
     pub show_uv: bool,
+    /// Whether the view takes pointer and key input; not while a dialog is
+    /// open.
+    pub input: bool,
     /// Set when the view refuses an edit, to show the user.
     pub message: &'a mut Option<String>,
 }
@@ -182,6 +188,8 @@ pub struct TextureView {
     /// Offset of the image from the view's center, in screen points.
     pan: egui::Vec2,
     drag: Option<Drag>,
+    /// The layer and shapes a transform drag edits, fixed when it starts.
+    targets: (usize, Vec<usize>),
     /// Anchors of the pen path being drawn.
     pen: Vec<Anchor>,
 }
@@ -272,8 +280,14 @@ impl TextureView {
                 painter.add(egui::Shape::closed_line(p.to_vec(), stroke));
             }
         }
-        if editable {
+        if !editable {
+            return;
+        }
+        if f.input {
             self.interact(ui, &response, at, f, r);
+        } else {
+            self.cancel();
+            self.overlay(ui, f.editor.project(), r, f.selection, at, None, f.tool);
         }
     }
 
@@ -369,6 +383,7 @@ impl TextureView {
                 .map(|p| at.to_texture(p))
         {
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
+            self.targets = (selection.layer, selection.shapes.clone());
         } else if response.clicked()
             && let Some(p) = pointer
         {
@@ -385,7 +400,25 @@ impl TextureView {
                         message,
                     );
                 }
-                Tool::Select => pick(editor.project(), r, selection, p, at, shift),
+                Tool::Select => {
+                    // A click on the picked shape's anchor picks the anchor.
+                    let anchor = selection.single().and_then(|s| {
+                        let shapes = editor
+                            .project()
+                            .variant(r)
+                            .layers()
+                            .get(selection.layer)?
+                            .shapes();
+                        shapes[s]
+                            .anchors()
+                            .iter()
+                            .position(|a| a.point.distance(p) <= at.hit())
+                    });
+                    match anchor {
+                        Some(k) if !shift => selection.anchor = Some(k),
+                        _ => pick(editor.project(), r, selection, p, at, shift),
+                    }
+                }
                 Tool::Ellipse | Tool::Rectangle => {}
             }
         }
@@ -398,15 +431,19 @@ impl TextureView {
         }
 
         if let (Some(drag), Some(p)) = (&mut self.drag, pointer) {
-            continue_drag(editor, drag, selection, r, p, &mut self.pen, shift);
+            continue_drag(editor, drag, &self.targets, r, p, &mut self.pen, shift);
         }
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
         if escape && self.drag.is_some() {
             // Drawing is dropped; edits a drag already made stay one step.
             self.drag = None;
             editor.end_gesture();
-        } else if response.drag_stopped_by(PointerButton::Primary) {
-            if let Some(drag) = self.drag.take() {
+        } else if response.drag_stopped() {
+            // Only the primary button's release finishes a drawing.
+            let drag = self.drag.take();
+            if let Some(drag) = drag
+                && response.drag_stopped_by(PointerButton::Primary)
+            {
                 finish_drag(editor, drag, selection, r, paint, message);
             }
             editor.end_gesture();
@@ -444,9 +481,14 @@ impl TextureView {
                 }
             }
             if delete {
-                // While drawing a pen path, its last anchor goes first.
-                if self.pen.pop().is_none() {
-                    delete_selected(editor, r, selection);
+                // The pen removes its path's last anchor; only Select
+                // deletes picked artwork.
+                match tool {
+                    Tool::Pen => {
+                        self.pen.pop();
+                    }
+                    Tool::Select => delete_selected(editor, r, selection),
+                    _ => {}
                 }
             }
         }
@@ -796,6 +838,7 @@ fn start_select(
             return Some(Drag::Scale {
                 pivot: c[(k + 2) % 4],
                 start: c[k],
+                press: p,
                 original: picked,
             });
         }
@@ -817,8 +860,15 @@ fn start_select(
 }
 
 /// Replaces the picked shapes with `shapes`, in the same order.
-fn replace_picked(editor: &mut Editor, r: VariantRef, selection: &Selection, shapes: Vec<Shape>) {
-    let (layer, picked) = (selection.layer, selection.shapes.clone());
+/// Replaces a drag's target shapes, `(layer, indices)`, with `shapes`, in
+/// the same order.
+fn replace_picked(
+    editor: &mut Editor,
+    r: VariantRef,
+    (layer, picked): &(usize, Vec<usize>),
+    shapes: Vec<Shape>,
+) {
+    let (layer, picked) = (*layer, picked.clone());
     // A drag's edits undo as one step.
     let _ = editor.edit_variant_continuous("canvas drag", r, |v| {
         let Some(l) = v.layers_mut().get_mut(layer) else {
@@ -848,7 +898,7 @@ fn transformed(original: &[Shape], t: Affine2) -> Vec<Shape> {
 fn continue_drag(
     editor: &mut Editor,
     drag: &mut Drag,
-    selection: &Selection,
+    targets: &(usize, Vec<usize>),
     r: VariantRef,
     p: Vec2,
     pen: &mut [Anchor],
@@ -857,15 +907,16 @@ fn continue_drag(
     match drag {
         Drag::Move { start, original } => {
             let t = Affine2::from_translation(p - *start);
-            replace_picked(editor, r, selection, transformed(original, t));
+            replace_picked(editor, r, targets, transformed(original, t));
         }
         Drag::Scale {
             pivot,
             start,
+            press,
             original,
         } => {
             let from = *start - *pivot;
-            let to = p - *pivot;
+            let to = *start + (p - *press) - *pivot;
             let ratio = |a: f32, b: f32| if a.abs() > 1e-3 { b / a } else { 1.0 };
             let mut k = Vec2::new(ratio(from.x, to.x), ratio(from.y, to.y));
             if shift {
@@ -876,7 +927,7 @@ fn continue_drag(
             let t = Affine2::from_translation(*pivot)
                 * Affine2::from_scale(k)
                 * Affine2::from_translation(-*pivot);
-            replace_picked(editor, r, selection, transformed(original, t));
+            replace_picked(editor, r, targets, transformed(original, t));
         }
         Drag::Rotate {
             center,
@@ -893,7 +944,7 @@ fn continue_drag(
             let t = Affine2::from_translation(*center)
                 * Affine2::from_angle(angle)
                 * Affine2::from_translation(-*center);
-            replace_picked(editor, r, selection, transformed(original, t));
+            replace_picked(editor, r, targets, transformed(original, t));
         }
         Drag::Anchor {
             anchor,
@@ -921,7 +972,7 @@ fn continue_drag(
                     }
                 }
             }
-            replace_picked(editor, r, selection, vec![s]);
+            replace_picked(editor, r, targets, vec![s]);
         }
         Drag::PenHandle => {
             if let Some(a) = pen.last_mut() {
@@ -1092,16 +1143,31 @@ fn insert_anchor(
     at: Placement,
 ) -> Option<usize> {
     let s = &editor.project().variant(r).layers()[layer].shapes()[shape];
+    // The nearest of 32 samples per segment, refined twice around itself.
+    let nearest = |c: [Vec2; 4], lo: f32, hi: f32| {
+        (0..=32)
+            .map(|k| {
+                let t = lo + (hi - lo) * k as f32 / 32.0;
+                (t, cubic(c, t).distance(p))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("samples exist")
+    };
     let (seg, t, d) = s
         .segments()
         .enumerate()
-        .flat_map(|(i, c)| {
-            (1..32).map(move |k| {
-                let t = k as f32 / 32.0;
-                (i, t, cubic(c, t).distance(p))
-            })
+        .map(|(i, c)| {
+            let (mut t, mut d) = nearest(c, 0.0, 1.0);
+            for step in [1.0 / 32.0, 1.0 / 1024.0] {
+                (t, d) = nearest(c, (t - step).max(0.0), (t + step).min(1.0));
+            }
+            (i, t, d)
         })
         .min_by(|a, b| a.2.total_cmp(&b.2))?;
+    // An anchor itself isn't a place to split.
+    if t <= 0.0 || t >= 1.0 {
+        return None;
+    }
     if d > at.hit() {
         return None;
     }

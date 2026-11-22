@@ -676,6 +676,7 @@ impl App {
                 paint: self.paint,
                 selection: &mut doc.selection,
                 show_uv: self.show_uv,
+                input: self.confirm.is_none(),
                 message: &mut self.refusal,
             },
         );
@@ -706,7 +707,8 @@ impl App {
         if pressed(command(Key::S)) && self.doc.is_some() {
             self.save();
         }
-        if pressed(command(Key::D))
+        if !held
+            && pressed(command(Key::D))
             && let Some(d) = &mut self.doc
             && let Some(r) = d.variant()
         {
