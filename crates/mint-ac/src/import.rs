@@ -27,9 +27,9 @@ pub enum ImportError {
     #[error("{0} is not an ac-decomp checkout: {1} is missing")]
     NotDecomp(PathBuf, PathBuf),
     #[error(
-        "{0} has no extracted assets; build the decomp once (`python configure.py && ninja`) with your disc image in orig/"
+        "{0} is missing, so the decomp has no extracted assets for {1}: check the version, or build the decomp once (`python configure.py && ninja`) with your disc image in orig/{1}"
     )]
-    NotBuilt(PathBuf),
+    NotBuilt(PathBuf, String),
     #[error(transparent)]
     C(#[from] CError),
     #[error("{file}: {problem}")]
@@ -86,8 +86,9 @@ impl Decomp {
         if !marker.is_file() {
             return Err(ImportError::NotDecomp(d.root.clone(), marker));
         }
-        if !d.build_include().join("assets/npc").is_dir() {
-            return Err(ImportError::NotBuilt(d.root.clone()));
+        let assets = d.build_include().join("assets/npc");
+        if !assets.is_dir() {
+            return Err(ImportError::NotBuilt(assets, d.version.clone()));
         }
         Ok(d)
     }
@@ -251,10 +252,12 @@ fn parents(joints: &[Joint]) -> Option<Vec<Option<usize>>> {
     stack.iter().all(|&(_, r)| r == 0).then_some(parents)
 }
 
-fn joint_name(dl: Option<&str>, model: &str, index: usize) -> String {
-    let species = model.split('_').next().unwrap_or(model);
-    dl.and_then(|d| d.strip_suffix(&format!("_{species}_model")))
-        .map_or_else(|| format!("joint {index}"), str::to_owned)
+/// Names a joint after its display list, `<joint>_<species>_model`. The
+/// species part is not always the model's own (`lrc_1` uses `Lfoot2_rcd_model`).
+fn joint_name(dl: Option<&str>, index: usize) -> String {
+    dl.and_then(|d| d.strip_suffix("_model"))
+        .and_then(|d| d.rsplit_once('_'))
+        .map_or_else(|| format!("joint {index}"), |(name, _)| name.to_owned())
 }
 
 fn bytes(file: &CFile, name: &str) -> Result<Vec<u8>, ImportError> {
@@ -293,6 +296,7 @@ pub(crate) fn build_project(
     };
     let joints = joints(model_file, model_name)?;
     let parents = parents(&joints)
+        .filter(|p| !p.is_empty())
         .ok_or_else(|| model_err("joint child counts do not form a tree".into()))?;
 
     let vertex_array = format!("{model_name}_v");
@@ -307,6 +311,14 @@ pub(crate) fn build_project(
                 .ok_or_else(|| malformed(model_file, format!("{vertex_array}[{i}] is not a Vtx")))
         })
         .collect::<Result<_, _>>()?;
+    // Flag 0 vertices are transformed by the matrix current when they load,
+    // which is what seam detection relies on.
+    if let Some((i, v)) = raw_vertices.iter().enumerate().find(|(_, v)| v.flag != 0) {
+        return Err(model_err(format!(
+            "{vertex_array}[{i}] has flag {}; only flag 0 vertices are supported",
+            v.flag
+        )));
+    }
 
     // Interpret every joint's display list.
     let mut dl_meshes = Vec::with_capacity(joints.len());
@@ -370,7 +382,7 @@ pub(crate) fn build_project(
                     .enumerate()
                     .map(|(k, name)| {
                         let img = ci4_image(tex_file, name, &bytes(tex_file, name)?, size)?;
-                        Ok((format!("{}", k + 1), Some(img)))
+                        Ok((format!("{}", k + 1), img))
                     })
                     .collect::<Result<Vec<_>, ImportError>>()?;
                 Texture::painted(slot, Slot(slot.into()), size, variants)?
@@ -382,7 +394,9 @@ pub(crate) fn build_project(
             ),
             TexSource::Body { offset } => {
                 let len = gx::ci4_len(size.x, size.y) as u32;
-                let end = offset + len;
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    model_err(format!("body texture offset {offset:#x} is out of range"))
+                })?;
                 if let Some(&(o, e)) = body_ranges.iter().find(|&&(o, e)| offset < e && o < end) {
                     return Err(model_err(format!(
                         "body textures at {offset:#x}..{end:#x} and {o:#x}..{e:#x} overlap"
@@ -397,12 +411,7 @@ pub(crate) fn build_project(
                 })?;
                 let name = format!("{SLOT_BODY} {offset:#05x}");
                 let img = ci4_image(tex_file, &name, data, size)?;
-                Texture::painted(
-                    name,
-                    Slot(SLOT_BODY.into()),
-                    size,
-                    [("1".to_owned(), Some(img))],
-                )?
+                Texture::painted(name, Slot(SLOT_BODY.into()), size, [("1".to_owned(), img)])?
             }
         };
         texture_ids.insert(source, TextureId(textures.len() as u32));
@@ -411,16 +420,12 @@ pub(crate) fn build_project(
 
     // Nodes and meshes.
     let mut model = Model::new(
-        joint_name(joints[0].dl.as_deref(), model_name, 0),
+        joint_name(joints[0].dl.as_deref(), 0),
         translation(&joints[0]),
     );
     for (i, j) in joints.iter().enumerate().skip(1) {
         let parent = NodeId(parents[i].expect("non-root joints have parents") as u32);
-        let id = model.add_child(
-            parent,
-            joint_name(j.dl.as_deref(), model_name, i),
-            translation(j),
-        );
+        let id = model.add_child(parent, joint_name(j.dl.as_deref(), i), translation(j));
         debug_assert_eq!(id.index(), i);
     }
     let mut materials: Vec<Material> = Vec::new();
@@ -480,9 +485,9 @@ pub(crate) fn build_project(
     }
 
     // Display pose from the shared idle animation.
-    let frame = anim::sample(pose_file, POSE_ANIMATION, joints.len(), 1.0)?;
+    let rotations = anim::sample(pose_file, POSE_ANIMATION, joints.len(), 1.0)?;
     let mut pose = Pose::default();
-    for (i, [x, y, z]) in frame.rotations.iter().enumerate() {
+    for (i, [x, y, z]) in rotations.iter().enumerate() {
         pose.set_rotation(
             NodeId(i as u32),
             Quat::from_euler(
@@ -588,14 +593,15 @@ mod tests {
         assert_eq!(cat.mouths.len(), 6);
 
         let pose = CFile::read(&root.join(POSE_FILE), &[]).unwrap();
-        let frame = anim::sample(&pose, POSE_ANIMATION, 26, 1.0).unwrap();
-        assert_eq!(frame.rotations.len(), 26);
-        eprintln!("{frame:?}");
+        let rotations = anim::sample(&pose, POSE_ANIMATION, 26, 1.0).unwrap();
+        assert_eq!(rotations.len(), 26);
+        eprintln!("{rotations:?}");
     }
 
     #[test]
     fn joint_names_come_from_display_lists() {
-        assert_eq!(joint_name(Some("head_cat_model"), "cat_1", 24), "head");
-        assert_eq!(joint_name(None, "cat_1", 5), "joint 5");
+        assert_eq!(joint_name(Some("head_cat_model"), 24), "head");
+        assert_eq!(joint_name(Some("Lfoot2_rcd_model"), 4), "Lfoot2");
+        assert_eq!(joint_name(None, 5), "joint 5");
     }
 }

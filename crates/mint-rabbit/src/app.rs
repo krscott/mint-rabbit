@@ -16,14 +16,16 @@ use crate::texture_view::TextureView;
 
 pub struct Options {
     pub decomp: Option<PathBuf>,
-    pub version: String,
+    /// Game version the decomp was built for, such as `GAFE01_00`.
+    pub game_version: String,
 }
 
 struct Loaded {
     project: Project,
     /// Variant shown for each texture.
     variants: Vec<usize>,
-    selected: TextureId,
+    /// Texture shown in the Texture View; `None` when there are none.
+    selected: Option<TextureId>,
     scene: Arc<SceneData>,
 }
 
@@ -52,7 +54,7 @@ impl App {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            version: options.version,
+            version: options.game_version,
             decomp: None,
             villagers: Vec::new(),
             villager: 0,
@@ -99,7 +101,8 @@ impl App {
                     .textures()
                     .iter()
                     .position(|t| matches!(t.content(), TextureContent::Painted(_)))
-                    .map_or(TextureId(0), |i| TextureId(i as u32));
+                    .or_else(|| (!project.textures().is_empty()).then_some(0))
+                    .map(|i| TextureId(i as u32));
                 self.generation += 1;
                 let scene = Arc::new(SceneData::new(&project, &variants, self.generation));
                 self.camera = Orbit::framing(scene.mesh.bounds_min, scene.mesh.bounds_max);
@@ -165,7 +168,7 @@ impl App {
                     size.y,
                     if external { " (external)" } else { "" }
                 );
-                ui.selectable_value(&mut loaded.selected, id, text);
+                ui.selectable_value(&mut loaded.selected, Some(id), text);
                 let count = t.variants().len();
                 if count > 1 {
                     egui::ComboBox::from_id_salt(("variant", i))
@@ -257,8 +260,9 @@ impl eframe::App for App {
                 self.model_view(ui);
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                if let Some(loaded) = &self.loaded {
-                    let t = loaded.selected;
+                if let Some(loaded) = &self.loaded
+                    && let Some(t) = loaded.selected
+                {
                     self.texture_view.show(
                         ui,
                         &loaded.project,

@@ -46,7 +46,9 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @locatio
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, samp, in.uv) * material.tint;
+    // The game's combiner tints color only; alpha comes from the texture.
+    let texel = textureSample(tex, samp, in.uv);
+    let c = vec4<f32>(texel.rgb * material.tint.rgb, texel.a);
     if material.cutout.x > 0.5 && c.a < 0.5 {
         discard;
     }
@@ -87,7 +89,8 @@ impl SceneData {
             .map(|m| {
                 let texture = project.texture(m.texture);
                 let pixels = scene::texture_pixels(project, texture, variants[m.texture.index()]);
-                let tint = scene::display_color(project, m.tint);
+                // The tint is a full RGBA8 register, not a palette color.
+                let tint = m.tint;
                 MaterialData {
                     pixels: pixels.iter().flat_map(|c| c.to_array()).collect(),
                     size: texture.size().to_array(),

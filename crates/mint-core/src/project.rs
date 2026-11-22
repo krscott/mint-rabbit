@@ -1,13 +1,11 @@
-use serde::{Deserialize, Serialize};
-
-use crate::{Material, MaterialId, Model, Palette, Pose, Texture, TextureId};
+use crate::{Material, MaterialId, Model, Palette, PaletteIndex, Pose, Texture, TextureId};
 
 /// Names the export target a project is built for, such as `ac-villager`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TargetId(pub String);
 
 /// The editable document for one character.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     target: TargetId,
     palette: Palette,
@@ -27,6 +25,15 @@ pub enum ProjectError {
     MissingVertex { node: String, vertex: u32 },
     #[error("node {node:?} has a vertex following missing node {follows}")]
     MissingFollowedNode { node: String, follows: u32 },
+    #[error(
+        "texture {texture:?} variant {variant:?} uses palette entry {index}, but the palette has {len}"
+    )]
+    MissingPaletteEntry {
+        texture: String,
+        variant: String,
+        index: u8,
+        len: usize,
+    },
 }
 
 impl Project {
@@ -40,6 +47,23 @@ impl Project {
         materials: Vec<Material>,
         pose: Pose,
     ) -> Result<Self, ProjectError> {
+        for t in &textures {
+            for v in t.variants() {
+                if let Some(&PaletteIndex(index)) = v
+                    .underlay()
+                    .pixels()
+                    .iter()
+                    .find(|i| usize::from(i.0) >= palette.len())
+                {
+                    return Err(ProjectError::MissingPaletteEntry {
+                        texture: t.name.clone(),
+                        variant: v.name.clone(),
+                        index,
+                        len: palette.len(),
+                    });
+                }
+            }
+        }
         for (i, m) in materials.iter().enumerate() {
             if m.texture.index() >= textures.len() {
                 return Err(ProjectError::MissingTexture {

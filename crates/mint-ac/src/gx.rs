@@ -119,23 +119,35 @@ pub fn decode_rgb5a3(v: u16) -> Rgba8 {
     }
 }
 
-/// Encodes a color as RGB5A3, choosing the form that reproduces it exactly
-/// when one exists, so decoded game palettes encode back to the same bits.
-/// Otherwise the nearest color in the higher-precision form for its alpha.
+/// Rounds an 8-bit channel to the nearest level of a `bits`-bit one.
+fn round_to(v: u8, bits: u32) -> u16 {
+    let max = (1u32 << bits) - 1;
+    ((u32::from(v) * max + 127) / 255) as u16
+}
+
+/// Encodes a color as the nearest RGB5A3 value. Of the two forms (opaque
+/// RGB555, or 3-bit alpha with RGB444) it picks the one that decodes closer
+/// to `c`, preferring RGB555 on a tie, so decoded game palettes encode back
+/// to colors that decode identically.
 #[must_use]
 pub fn encode_rgb5a3(c: Rgba8) -> u16 {
-    let rgb555 =
-        0x8000 | (u16::from(c.r >> 3) << 10) | (u16::from(c.g >> 3) << 5) | u16::from(c.b >> 3);
-    let a3rgb4 = (u16::from(c.a >> 5) << 12)
-        | (u16::from(c.r >> 4) << 8)
-        | (u16::from(c.g >> 4) << 4)
-        | u16::from(c.b >> 4);
-    if c.a == 255 && decode_rgb5a3(rgb555) == c {
+    let rgb555 = 0x8000 | (round_to(c.r, 5) << 10) | (round_to(c.g, 5) << 5) | round_to(c.b, 5);
+    let a3rgb4 = (round_to(c.a, 3) << 12)
+        | (round_to(c.r, 4) << 8)
+        | (round_to(c.g, 4) << 4)
+        | round_to(c.b, 4);
+    let error = |v: u16| {
+        let d = decode_rgb5a3(v).to_array();
+        c.to_array()
+            .iter()
+            .zip(d)
+            .map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2))
+            .sum::<i32>()
+    };
+    if error(rgb555) <= error(a3rgb4) {
         rgb555
-    } else if decode_rgb5a3(a3rgb4) == c || c.a != 255 {
-        a3rgb4
     } else {
-        rgb555
+        a3rgb4
     }
 }
 
@@ -156,6 +168,19 @@ mod tests {
             let back = encode_rgb5a3(c);
             assert_eq!(decode_rgb5a3(back), c, "{v:#06x}");
         }
+    }
+
+    #[test]
+    fn encoding_rounds_to_nearest() {
+        // 7 is closer to the 5-bit level 8 than to 0.
+        assert_eq!(
+            quantize_rgb5a3(Rgba8::new(7, 7, 7, 255)),
+            Rgba8::new(8, 8, 8, 255)
+        );
+        // Nearly opaque stays opaque rather than dropping to 4-bit color.
+        assert_eq!(encode_rgb5a3(Rgba8::new(200, 0, 0, 254)) & 0x8000, 0x8000);
+        // Mostly transparent uses the alpha form.
+        assert_eq!(quantize_rgb5a3(Rgba8::new(255, 255, 255, 40)).a, 36);
     }
 
     #[test]

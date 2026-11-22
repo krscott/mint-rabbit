@@ -1,14 +1,12 @@
 use std::collections::BTreeMap;
 
-use glam::Quat;
-use serde::{Deserialize, Serialize};
-
 use crate::NodeId;
+use glam::Quat;
 
 /// Display-only rotations applied on top of node transforms. A pose is never
 /// exported; it exists so skeletons whose rest rotations come from animation
 /// data look right while editing.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pose {
     rotations: BTreeMap<NodeId, Quat>,
 }

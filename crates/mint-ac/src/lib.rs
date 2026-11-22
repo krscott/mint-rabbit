@@ -8,7 +8,7 @@ mod gbi;
 mod gx;
 mod import;
 
-pub use export::{BODY_BUFFER, Export, ExportError, export};
+pub use export::{BODY_BUFFER, Export, ExportError, VILLAGER_JOINT_CHILDREN, export};
 /// The color the game shows for a palette entry.
 pub use gx::quantize_rgb5a3 as quantize_color;
 pub use import::{Decomp, ImportError, VillagerRef};

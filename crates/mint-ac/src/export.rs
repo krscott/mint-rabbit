@@ -2,14 +2,14 @@
 //! lists, skeleton) and a texture file (palette, eye, mouth, and body
 //! textures), plus the villager table entry to paste.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use mint_core::{AlphaMode, NodeId, Project, Texture, TextureContent, TextureId, Wrap};
 
 use crate::gbi::VERTEX_CACHE;
 use crate::gx;
-use crate::{SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH};
+use crate::{SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
 
 /// Bytes in the body texture buffer the game reserves per villager.
 pub const BODY_BUFFER: usize = 0x800;
@@ -19,10 +19,27 @@ const EYE_VARIANTS: usize = 8;
 const MOUTH_VARIANTS: usize = 6;
 const PALETTE_LEN: usize = 16;
 
+/// Child counts of the skeleton every villager model shares, in depth-first
+/// order. The shared animations and the game's per-joint draw hooks assume
+/// exactly this tree.
+pub const VILLAGER_JOINT_CHILDREN: [u8; 26] = [
+    1, 4, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 3, 1, 1, 0, 1, 1, 1, 0, 2, 1, 0, 1, 0,
+];
+
+/// One vertex use in a display list: the mesh vertex and its texel
+/// coordinates.
+type CornerKey = (u32, [i16; 2]);
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExportError {
+    #[error("the project targets {0:?}, not {TARGET:?}")]
+    WrongTarget(String),
     #[error("{0:?} is not a C identifier")]
     BadName(String),
+    #[error(
+        "the node tree does not match the villager skeleton (26 joints with fixed children): {0}"
+    )]
+    Skeleton(String),
     #[error("the palette has {0} colors; AC villagers allow at most 16")]
     PaletteTooLarge(usize),
     #[error("texture {texture:?} has slot {slot:?}, which AC villagers do not have")]
@@ -35,8 +52,6 @@ pub enum ExportError {
         expected: usize,
         actual: usize,
     },
-    #[error("texture {texture:?} variant {variant:?} has no underlay to export")]
-    NoUnderlay { texture: String, variant: String },
     #[error("texture {texture:?}: {source}")]
     Gx {
         texture: String,
@@ -55,8 +70,11 @@ pub struct Export {
     pub model_c: String,
     /// Contents of `src/data/npc/model/tex/<texture_set>.c`.
     pub texture_c: String,
-    /// The `npc_draw_data_tbl` entry and `extern` lines to paste.
-    pub draw_data: String,
+    /// Declarations the `npc_draw_data_tbl` file needs for the entry.
+    pub draw_data_externs: String,
+    /// The `npc_draw_data_tbl` entry, with `MODEL_BANK` and `TEXTURE_BANK`
+    /// to replace and a reminder to fill the fields after the textures.
+    pub draw_data_entry: String,
 }
 
 fn check_name(name: &str) -> Result<(), ExportError> {
@@ -93,10 +111,7 @@ fn variant_bytes(texture: &Texture) -> Result<Vec<Vec<u8>>, ExportError> {
         .variants()
         .iter()
         .map(|v| {
-            let img = v.underlay().ok_or_else(|| ExportError::NoUnderlay {
-                texture: texture.name.clone(),
-                variant: v.name.clone(),
-            })?;
+            let img = v.underlay();
             gx::encode_ci4(img.pixels(), img.size().x, img.size().y).map_err(|source| {
                 ExportError::Gx {
                     texture: texture.name.clone(),
@@ -304,7 +319,6 @@ impl ModelWriter<'_> {
         let seam = others.first().copied();
 
         let mut body = String::new();
-        let mut matrices_loaded = false;
         for (material, tris) in &groups {
             let m = *project.material(*material);
             let texture = project.texture(m.texture);
@@ -348,46 +362,32 @@ impl ModelWriter<'_> {
             );
 
             // Batch triangles so each batch's vertices fit the cache.
-            let mut batch: Vec<usize> = Vec::new();
-            let mut batch_verts: Vec<(u32, [i16; 2])> = Vec::new();
+            let mut batch: Vec<[CornerKey; 3]> = Vec::new();
+            let mut batch_verts: Vec<CornerKey> = Vec::new();
             for &ti in tris {
                 let corners = self.corner_keys(node, ti, size)?;
-                let new: Vec<_> = corners
+                let mut new: Vec<CornerKey> = corners
                     .iter()
                     .filter(|k| !batch_verts.contains(k))
                     .copied()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
                     .collect();
+                new.sort_unstable();
+                new.dedup();
                 if batch_verts.len() + new.len() > VERTEX_CACHE
                     || batch.len() == MAX_GROUP_TRIANGLES
                 {
-                    self.flush(
-                        &mut body,
-                        node,
-                        seam,
-                        &batch,
-                        &batch_verts,
-                        size,
-                        &mut matrices_loaded,
-                    )?;
+                    self.flush(&mut body, node, seam, &batch, &batch_verts)?;
                     batch.clear();
                     batch_verts.clear();
-                    batch_verts.extend(corners.iter().copied().collect::<BTreeSet<_>>());
+                    batch_verts.extend(corners);
+                    batch_verts.sort_unstable();
+                    batch_verts.dedup();
                 } else {
                     batch_verts.extend(new);
                 }
-                batch.push(ti);
+                batch.push(corners);
             }
-            self.flush(
-                &mut body,
-                node,
-                seam,
-                &batch,
-                &batch_verts,
-                size,
-                &mut matrices_loaded,
-            )?;
+            self.flush(&mut body, node, seam, &batch, &batch_verts)?;
         }
 
         let _ = writeln!(self.lists, "static Gfx {name}[] = {{");
@@ -402,7 +402,7 @@ impl ModelWriter<'_> {
         node: NodeId,
         ti: usize,
         size: glam::UVec2,
-    ) -> Result<[(u32, [i16; 2]); 3], String> {
+    ) -> Result<[CornerKey; 3], String> {
         let mesh = self.project.model().node(node).mesh.as_ref().expect("mesh");
         let t = &mesh.triangles[ti];
         let mut out = [(0, [0, 0]); 3];
@@ -419,34 +419,34 @@ impl ModelWriter<'_> {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Writes one batch: its vertex loads, then its triangles.
     fn flush(
         &mut self,
         body: &mut String,
         node: NodeId,
         seam: Option<NodeId>,
-        batch: &[usize],
-        verts: &[(u32, [i16; 2])],
-        size: glam::UVec2,
-        matrices_loaded: &mut bool,
+        batch: &[[CornerKey; 3]],
+        verts: &[CornerKey],
     ) -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
         }
         let mesh = self.project.model().node(node).mesh.as_ref().expect("mesh");
-        // Seam vertices first, loaded under the other node's matrix.
+        // Seam vertices first, loaded under the other node's matrix; then the
+        // node's own matrix, which is also what the game loads before calling
+        // the list, so lists without seam vertices need no matrix commands.
         let (seam_verts, own_verts): (Vec<_>, Vec<_>) = verts
             .iter()
             .copied()
             .partition(|(v, _)| mesh.vertices[*v as usize].followed(node) != node);
-        let mut slot_of: HashMap<(u32, [i16; 2]), usize> = HashMap::new();
-        let mut next_slot = 0;
+        let mut slot_of: HashMap<CornerKey, usize> = HashMap::new();
         let mut load =
-            |this: &mut Self, body: &mut String, group: &[(u32, [i16; 2])]| -> Result<(), String> {
+            |this: &mut Self, body: &mut String, group: &[CornerKey]| -> Result<(), String> {
                 if group.is_empty() {
                     return Ok(());
                 }
                 let first = this.vertices.len();
+                let first_slot = slot_of.len();
                 for &(v, st) in group {
                     let vert = mesh.vertices[v as usize];
                     let p = vert.position;
@@ -460,20 +460,18 @@ impl ModelWriter<'_> {
                         st,
                         normal: [n.x, n.y, n.z].map(|c| c.round().clamp(-128.0, 127.0) as i8 as u8),
                     });
-                    slot_of.insert((v, st), next_slot);
-                    next_slot += 1;
+                    slot_of.insert((v, st), slot_of.len());
                 }
                 let _ = writeln!(
                     body,
-                    "    gsSPVertex(&{}_v[{first}], {}, {}),",
+                    "    gsSPVertex(&{}_v[{first}], {}, {first_slot}),",
                     this.model,
                     group.len(),
-                    next_slot - group.len()
                 );
                 Ok(())
             };
         if let Some(seam) = seam
-            && (!seam_verts.is_empty() || !*matrices_loaded)
+            && !seam_verts.is_empty()
         {
             let s = self.matrix(seam)?;
             let _ = writeln!(
@@ -486,21 +484,10 @@ impl ModelWriter<'_> {
                 body,
                 "    gsSPMatrix(anime_6_model + sizeof(Mtx) * {own}, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW),"
             );
-            *matrices_loaded = true;
         }
         load(self, body, &own_verts)?;
 
-        let tris: Vec<[usize; 3]> = batch
-            .iter()
-            .map(|&ti| {
-                let t = &mesh.triangles[ti];
-                let st = |c: mint_core::Corner| {
-                    let st = c.uv * size.as_vec2() * 32.0;
-                    (c.vertex, [st.x.round() as i16, st.y.round() as i16])
-                };
-                t.corners.map(|c| slot_of[&st(c)])
-            })
-            .collect();
+        let tris: Vec<[usize; 3]> = batch.iter().map(|t| t.map(|k| slot_of[&k])).collect();
         let fmt = |t: Option<&[usize; 3]>| {
             let [a, b, c] = t.copied().unwrap_or([0, 0, 0]);
             format!("{a}, {b}, {c}")
@@ -545,12 +532,25 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
         node: tree.node(id).name.clone(),
         problem,
     };
-    // Matrix slot N belongs to the N-th node, in tree order, with a mesh.
-    let slots: HashMap<NodeId, u32> = tree
-        .ids()
-        .filter(|&id| tree.node(id).mesh.is_some())
+    // The game reads joints depth-first, and matrix slot N belongs to the
+    // N-th of them with a display list.
+    let order = tree.preorder();
+    let children: Vec<usize> = order.iter().map(|&id| tree.children(id).count()).collect();
+    if !children
+        .iter()
+        .copied()
+        .eq(VILLAGER_JOINT_CHILDREN.map(usize::from))
+    {
+        return Err(ExportError::Skeleton(format!(
+            "found {} joints with child counts {children:?}",
+            children.len()
+        )));
+    }
+    let slots: HashMap<NodeId, u32> = order
+        .iter()
+        .filter(|&&id| tree.node(id).mesh.is_some())
         .enumerate()
-        .map(|(slot, id)| (id, slot as u32))
+        .map(|(slot, &id)| (id, slot as u32))
         .collect();
     let mut w = ModelWriter {
         project,
@@ -560,11 +560,19 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
         vertices: Vec::new(),
         lists: String::new(),
     };
+    let mut names = HashSet::new();
     let mut joints = Vec::new();
-    for id in tree.ids() {
+    for (&id, &children) in order.iter().zip(&children) {
         let node = tree.node(id);
         let dl = if node.mesh.is_some() {
-            Some(w.display_list(id).map_err(|p| node_err(id, p))?)
+            let name = w.display_list(id).map_err(|p| node_err(id, p))?;
+            if !names.insert(name.clone()) {
+                return Err(node_err(
+                    id,
+                    format!("another node's display list is also named {name}; rename one"),
+                ));
+            }
+            Some(name)
         } else {
             None
         };
@@ -575,9 +583,6 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
                 "AC joints only translate; rotation and scale are not supported".into(),
             ));
         }
-        let children = tree.children(id).count();
-        let children = u8::try_from(children)
-            .map_err(|_| node_err(id, format!("{children} children is more than 255")))?;
         let xlu = node.mesh.as_ref().is_some_and(|m| {
             m.triangles
                 .iter()
@@ -631,10 +636,11 @@ fn model_c(project: &Project, model: &str, layout: &Layout) -> Result<String, Ex
     Ok(out)
 }
 
-fn draw_data(model: &str, set: &str, layout: &Layout) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "extern cKF_Skeleton_R_c cKF_bs_r_{model};");
-    let _ = writeln!(out, "extern unsigned short {set}_pal[];");
+/// The `extern` declarations and the table entry for `npc_draw_data_tbl`.
+fn draw_data(model: &str, set: &str, layout: &Layout) -> (String, String) {
+    let mut externs = String::new();
+    let _ = writeln!(externs, "extern cKF_Skeleton_R_c cKF_bs_r_{model};");
+    let _ = writeln!(externs, "extern unsigned short {set}_pal[];");
     let eyes: Vec<String> = (1..=layout.eyes.len())
         .map(|k| format!("{set}_eye{k}_TA_tex_txt"))
         .collect();
@@ -642,41 +648,42 @@ fn draw_data(model: &str, set: &str, layout: &Layout) -> String {
         .map(|k| format!("{set}_mouth{k}_TA_tex_txt"))
         .collect();
     for n in eyes.iter().chain(&mouths) {
-        let _ = writeln!(out, "extern unsigned char {n}[];");
+        let _ = writeln!(externs, "extern unsigned char {n}[];");
     }
-    let _ = writeln!(out, "extern unsigned char {set}_tmem_txt[];\n");
+    let _ = writeln!(externs, "extern unsigned char {set}_tmem_txt[];");
     let list = |names: &[String], len: usize| {
         (0..len)
             .map(|i| names.get(i).map_or("NULL", String::as_str).to_owned())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let _ = writeln!(
-        out,
-        "    // npc_draw_data_tbl entry; fill in banks and the fields after the textures."
-    );
-    let _ = writeln!(
-        out,
-        "    {{\n        /* model bank */, /* texture bank */,\n        &cKF_bs_r_{model},"
-    );
-    let _ = writeln!(
-        out,
-        "        {{ {set}_tmem_txt, {set}_pal, {{ {} }}, {{ {} }}, /* copy the base villager's last three fields */ }},",
+    let entry = format!(
+        "    {{
+        MODEL_BANK, TEXTURE_BANK,
+        &cKF_bs_r_{model},
+        {{ {set}_tmem_txt, {set}_pal, {{ {} }}, {{ {} }}, /* copy the base villager's last three fields */ }},
+        /* scale, talk type, ... */
+    }},
+",
         list(&eyes, EYE_VARIANTS),
         list(&mouths, MOUTH_VARIANTS)
     );
-    out.push_str("        /* scale, talk type, ... */\n    },\n");
-    out
+    (externs, entry)
 }
 
 /// Exports `project` as model `model` with texture set `texture_set`.
 pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Export, ExportError> {
+    if project.target().0 != TARGET {
+        return Err(ExportError::WrongTarget(project.target().0.clone()));
+    }
     check_name(model)?;
     check_name(texture_set)?;
     let layout = layout(project)?;
+    let (draw_data_externs, draw_data_entry) = draw_data(model, texture_set, &layout);
     Ok(Export {
         model_c: model_c(project, model, &layout)?,
         texture_c: texture_c(project, texture_set, &layout)?,
-        draw_data: draw_data(model, texture_set, &layout),
+        draw_data_externs,
+        draw_data_entry,
     })
 }

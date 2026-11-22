@@ -20,9 +20,9 @@ pub struct RawVtx {
     pub flag: u16,
     /// Texture coordinates in 1/32 texel units.
     pub st: [i16; 2],
-    /// Normal components as signed bytes, then the alpha byte.
+    /// Normal components as signed bytes. The fourth byte, alpha, is unused:
+    /// villager combiners take alpha from the texture alone.
     pub normal: [i8; 3],
-    pub alpha: u8,
 }
 
 impl RawVtx {
@@ -32,12 +32,12 @@ impl RawVtx {
         let [x, y, z, flag, s, t, nx, ny, nz, a]: [i64; 10] = v.try_into().ok()?;
         let i16_ = |v: i64| i16::try_from(v).ok();
         let u8_ = |v: i64| u8::try_from(v).ok();
+        u8_(a)?;
         Some(Self {
             pos: [i16_(x)?, i16_(y)?, i16_(z)?],
             flag: u16::try_from(flag).ok()?,
             st: [i16_(s)?, i16_(t)?],
             normal: [u8_(nx)? as i8, u8_(ny)? as i8, u8_(nz)? as i8],
-            alpha: u8_(a)?,
         })
     }
 }
@@ -114,8 +114,6 @@ pub struct DlTriangle {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DlMesh {
     pub triangles: Vec<DlTriangle>,
-    /// Matrix slots loaded, in order.
-    pub matrices: Vec<u32>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -165,10 +163,6 @@ fn flag_names(e: &Expr) -> Option<Vec<&str>> {
     }
 }
 
-fn arg_text(e: &Expr) -> String {
-    e.to_string()
-}
-
 struct Interp<'a> {
     vertex_array: &'a str,
     matrix: Option<u32>,
@@ -206,20 +200,15 @@ pub fn interpret(
     for (index, item) in list.iter().enumerate() {
         let fail = |problem: String| DlError {
             index,
-            command: item.as_expr().map_or_else(|| "{...}".into(), arg_text),
+            command: item
+                .as_expr()
+                .map_or_else(|| "{...}".into(), Expr::to_string),
             problem,
         };
         let Some(Expr::Call(name, args)) = item.as_expr() else {
             return Err(fail("not a macro call".into()));
         };
-        let end = it.command(name, args, vertex_count).map_err(fail)?;
-        if end {
-            if it.pending_triangles != 0 {
-                return Err(fail(format!(
-                    "list ended with {} triangles still expected",
-                    it.pending_triangles
-                )));
-            }
+        if it.command(name, args, vertex_count).map_err(fail)? {
             return Ok(it.out);
         }
     }
@@ -247,6 +236,14 @@ impl Interp<'_> {
 
     /// Runs one command; returns `true` at the end of the list.
     fn command(&mut self, name: &str, args: &[Expr], vertex_count: usize) -> Result<bool, String> {
+        // emu64 reads the words after a triangle-group header as triangle
+        // data, whatever they are.
+        if self.pending_triangles != 0 && name != "gsSPNTriangles_5b" {
+            return Err(format!(
+                "{} triangles of the group are still expected",
+                self.pending_triangles
+            ));
+        }
         match name {
             "gsSPEndDisplayList" => return Ok(true),
             "gsSPMatrix" => {
@@ -261,9 +258,9 @@ impl Interp<'_> {
                 if !flags.contains(&"G_MTX_LOAD") || flags.contains(&"G_MTX_PUSH") {
                     return Err(format!("unsupported matrix flags {}", args[1]));
                 }
-                let slot = (offset / MTX_SIZE) as u32;
+                let slot = u32::try_from(offset / MTX_SIZE)
+                    .map_err(|_| format!("unsupported matrix address {}", args[0]))?;
                 self.matrix = Some(slot);
-                self.out.matrices.push(slot);
             }
             "gsSPVertex" => {
                 Self::arity(args, 3)?;
@@ -279,10 +276,17 @@ impl Interp<'_> {
                         self.vertex_array
                     ));
                 }
-                let first = first.as_int().ok_or("vertex index is not an integer")? as usize;
-                let count = Self::int(args, 1)? as usize;
-                let slot = Self::int(args, 2)? as usize;
-                if slot + count > VERTEX_CACHE || first + count > vertex_count {
+                let index = |e: &Expr, what: &str| {
+                    e.as_int()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .ok_or_else(|| format!("vertex {what} {e} is not a non-negative integer"))
+                };
+                let first = index(first, "index")?;
+                let count = index(&args[1], "count")?;
+                let slot = index(&args[2], "slot")?;
+                if slot.saturating_add(count) > VERTEX_CACHE
+                    || first.saturating_add(count) > vertex_count
+                {
                     return Err(format!(
                         "loads vertices {first}..{} into slots {slot}..{}, past the array or cache",
                         first + count,
@@ -298,13 +302,12 @@ impl Interp<'_> {
             }
             "gsSPNTrianglesInit_5b" => {
                 Self::arity(args, 10)?;
-                if self.pending_triangles != 0 {
-                    return Err(format!(
-                        "{} triangles still expected",
-                        self.pending_triangles
-                    ));
+                // The macro stores the count minus one in 7 bits.
+                let count = Self::int(args, 0)?;
+                if !(1..=128).contains(&count) {
+                    return Err(format!("triangle count {count} is outside 1..=128"));
                 }
-                self.pending_triangles = Self::int(args, 0)? as usize;
+                self.pending_triangles = count as usize;
                 self.triangles(&args[1..])?;
             }
             "gsSPNTriangles_5b" => {
@@ -328,7 +331,7 @@ impl Interp<'_> {
                 });
             }
             "gsDPSetCombineLERP" => {
-                let names: Vec<String> = args.iter().map(arg_text).collect();
+                let names: Vec<String> = args.iter().map(Expr::to_string).collect();
                 if names != STANDARD_COMBINE {
                     return Err(
                         "unsupported color combiner; only TEXEL0*SHADE*PRIMITIVE is supported"
@@ -361,7 +364,7 @@ impl Interp<'_> {
                 self.tint = Rgba8::new(c[0], c[1], c[2], c[3]);
             }
             "gsSPTexture" => {
-                let v: Vec<String> = args.iter().map(arg_text).collect();
+                let v: Vec<String> = args.iter().map(Expr::to_string).collect();
                 if v != ["0", "0", "0", "0", "G_ON"] {
                     return Err("unsupported texture scale".into());
                 }
@@ -387,7 +390,10 @@ impl Interp<'_> {
             ("anime_1_txt", 0) => (TexSource::Eye, 15),
             ("anime_2_txt", 0) => (TexSource::Mouth, 15),
             ("anime_3_txt", 0) => (TexSource::Clothing, 14),
-            ("anime_4_txt", off) if off >= 0 => (TexSource::Body { offset: off as u32 }, 15),
+            ("anime_4_txt", off) => match u32::try_from(off) {
+                Ok(offset) => (TexSource::Body { offset }, 15),
+                Err(_) => return Err(format!("unsupported texture address {}", args[0])),
+            },
             _ => return Err(format!("unsupported texture address {}", args[0])),
         };
         if tlut != expected_tlut {
@@ -407,10 +413,18 @@ impl Interp<'_> {
         if Self::int(args, 7)? != 0 || Self::int(args, 8)? != 0 {
             return Err("texture shifts are not supported".into());
         }
+        // CI4 textures are tiled in 8x8 blocks.
+        let side = |i: usize| -> Result<u32, String> {
+            let v = Self::int(args, i)?;
+            u32::try_from(v)
+                .ok()
+                .filter(|v| (8..=1024).contains(v) && v % 8 == 0)
+                .ok_or_else(|| format!("texture side {v} is not a multiple of 8 in 8..=1024"))
+        };
         self.tex = Some(TexLoad {
             source,
-            width: Self::int(args, 2)? as u32,
-            height: Self::int(args, 3)? as u32,
+            width: side(2)?,
+            height: side(3)?,
             wrap: [wrap(&args[5])?, wrap(&args[6])?],
         });
         Ok(())
@@ -498,7 +512,6 @@ mod tests {
              gsSPEndDisplayList(),"
         ));
         let mesh = interpret(&dl, "v", 5).unwrap();
-        assert_eq!(mesh.matrices, vec![7, 12]);
         assert_eq!(mesh.triangles.len(), 5);
         let t = mesh.triangles[0];
         assert_eq!(
@@ -540,6 +553,19 @@ mod tests {
         );
         let err = interpret(&dl, "v", 3).unwrap_err();
         assert!(err.problem.contains("texture"), "{err}");
+    }
+
+    #[test]
+    fn refuses_commands_inside_a_triangle_group() {
+        let dl = list(&format!(
+            "{PRELUDE}
+             gsSPVertex(&v[0], 3, 0),
+             gsSPNTrianglesInit_5b(4, 0, 1, 2, 0, 1, 2, 0, 1, 2),
+             gsSPVertex(&v[0], 3, 0),
+             gsSPEndDisplayList(),"
+        ));
+        let err = interpret(&dl, "v", 3).unwrap_err();
+        assert!(err.problem.contains("still expected"), "{err}");
     }
 
     #[test]

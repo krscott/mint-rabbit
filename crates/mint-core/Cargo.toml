@@ -4,8 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-glam = { version = "0.34.3", features = ["serde"] }
-serde = { version = "1.0.229", features = ["derive"] }
+glam = "0.34.3"
 thiserror = "2.0.21"
 
 [lints]

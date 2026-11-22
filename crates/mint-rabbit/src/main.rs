@@ -9,13 +9,13 @@ mod texture_view;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: mint-rabbit [--decomp PATH] [--version GAFE01_00]";
+const USAGE: &str = "usage: mint-rabbit [--decomp PATH] [--game-version GAFE01_00]";
 
 /// Parsed command line: options to run with, or `None` after `--help`.
 fn parse_args() -> Result<Option<app::Options>, String> {
     let mut options = app::Options {
         decomp: None,
-        version: "GAFE01_00".into(),
+        game_version: "GAFE01_00".into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -25,7 +25,7 @@ fn parse_args() -> Result<Option<app::Options>, String> {
         };
         match arg.as_str() {
             "--decomp" => options.decomp = Some(PathBuf::from(value()?)),
-            "--version" => options.version = value()?,
+            "--game-version" => options.game_version = value()?,
             "-h" | "--help" => return Ok(None),
             _ => return Err(format!("unknown argument {arg:?}\n{USAGE}")),
         }

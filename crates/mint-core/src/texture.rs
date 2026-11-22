@@ -1,9 +1,7 @@
 //! Palette, textures, variants, and materials.
 
 use glam::UVec2;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgba8 {
     pub r: u8,
     pub g: u8,
@@ -24,11 +22,11 @@ impl Rgba8 {
 }
 
 /// Index of a palette entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PaletteIndex(pub u8);
 
 /// The project's ordered list of colors, at most 256 entries.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Palette {
     entries: Vec<Rgba8>,
 }
@@ -71,7 +69,7 @@ impl Palette {
 
 /// A raster image whose pixels are palette indices, row-major from the top
 /// left.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedImage {
     size: UVec2,
     pixels: Vec<PaletteIndex>,
@@ -115,7 +113,7 @@ impl IndexedImage {
 
 /// A raster image in direct color, used only for previews the project never
 /// exports.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RgbaImage {
     pub size: UVec2,
     pub pixels: Vec<Rgba8>,
@@ -133,11 +131,11 @@ impl RgbaImage {
 
 /// The place in an export target's format that a texture fills, named by
 /// that target.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Slot(pub String);
 
 /// Index of a texture within its project.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TextureId(pub u32);
 
 impl TextureId {
@@ -147,7 +145,9 @@ impl TextureId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A named image of fixed pixel size: painted variants, or the preview of an
+/// image the export target supplies.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Texture {
     pub name: String,
     pub slot: Slot,
@@ -155,7 +155,7 @@ pub struct Texture {
     content: TextureContent,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TextureContent {
     /// Painted in the project; always holds at least one variant.
     Painted(Vec<Variant>),
@@ -163,16 +163,16 @@ pub enum TextureContent {
     External { preview: RgbaImage },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Variant {
     pub name: String,
-    underlay: Option<IndexedImage>,
+    underlay: IndexedImage,
 }
 
 impl Variant {
     #[must_use]
-    pub fn underlay(&self) -> Option<&IndexedImage> {
-        self.underlay.as_ref()
+    pub fn underlay(&self) -> &IndexedImage {
+        &self.underlay
     }
 }
 
@@ -195,22 +195,25 @@ impl Texture {
         name: impl Into<String>,
         slot: Slot,
         size: UVec2,
-        variants: impl IntoIterator<Item = (String, Option<IndexedImage>)>,
+        variants: impl IntoIterator<Item = (String, IndexedImage)>,
     ) -> Result<Self, TextureError> {
         let name = name.into();
         let variants: Vec<Variant> = variants
             .into_iter()
-            .map(|(variant, underlay)| match &underlay {
-                Some(img) if img.size() != size => Err(TextureError::SizeMismatch {
-                    texture: name.clone(),
-                    variant,
-                    expected: size,
-                    actual: img.size(),
-                }),
-                _ => Ok(Variant {
-                    name: variant,
-                    underlay,
-                }),
+            .map(|(variant, underlay)| {
+                if underlay.size() == size {
+                    Ok(Variant {
+                        name: variant,
+                        underlay,
+                    })
+                } else {
+                    Err(TextureError::SizeMismatch {
+                        texture: name.clone(),
+                        variant,
+                        expected: size,
+                        actual: underlay.size(),
+                    })
+                }
             })
             .collect::<Result<_, _>>()?;
         if variants.is_empty() {
@@ -254,14 +257,14 @@ impl Texture {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Wrap {
     Clamp,
     Repeat,
     Mirror,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AlphaMode {
     Opaque,
     /// Pixels below half alpha are not drawn.
@@ -270,7 +273,7 @@ pub enum AlphaMode {
 }
 
 /// Index of a material within its project.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MaterialId(pub u32);
 
 impl MaterialId {
@@ -281,7 +284,7 @@ impl MaterialId {
 }
 
 /// How triangles draw with a texture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Material {
     pub texture: TextureId,
     /// Wrap mode along U, then V.
@@ -304,7 +307,7 @@ mod tests {
             "eye",
             Slot("eyes".into()),
             UVec2::new(4, 4),
-            [("1".to_owned(), Some(img))],
+            [("1".to_owned(), img)],
         )
         .unwrap_err();
         assert!(matches!(err, TextureError::SizeMismatch { .. }));

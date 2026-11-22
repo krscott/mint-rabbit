@@ -108,20 +108,19 @@ impl fmt::Display for Expr {
 }
 
 impl Expr {
-    /// Evaluates an integer constant expression, resolving identifiers with
-    /// `ident`.
-    pub fn eval_int(&self, ident: &dyn Fn(&str) -> Option<i64>) -> Option<i64> {
+    /// Evaluates an integer constant expression; identifiers have no value.
+    #[must_use]
+    pub fn as_int(&self) -> Option<i64> {
         Some(match self {
             Expr::Int(v) => *v,
             // Whole floats appear in address arithmetic, e.g.
             // `sizeof(Mtx) * 10.0` in rhn_1.
             Expr::Float(v) if v.fract() == 0.0 && v.abs() < 1e15 => *v as i64,
-            Expr::Ident(name) => ident(name)?,
             Expr::Sizeof(ty) => size_of_type(ty)?,
-            Expr::Unary('-', e) => -e.eval_int(ident)?,
-            Expr::Unary('~', e) => !e.eval_int(ident)?,
+            Expr::Unary('-', e) => -e.as_int()?,
+            Expr::Unary('~', e) => !e.as_int()?,
             Expr::Binary(op, l, r) => {
-                let (l, r) = (l.eval_int(ident)?, r.eval_int(ident)?);
+                let (l, r) = (l.as_int()?, r.as_int()?);
                 match op {
                     BinOp::Or => l | r,
                     BinOp::Xor => l ^ r,
@@ -137,11 +136,6 @@ impl Expr {
             }
             _ => return None,
         })
-    }
-
-    #[must_use]
-    pub fn as_int(&self) -> Option<i64> {
-        self.eval_int(&|_| None)
     }
 
     #[must_use]
@@ -239,22 +233,7 @@ impl CFile {
         let mut files = Vec::new();
         let mut tokens = Vec::new();
         tokenize_file(path, include_dirs, &mut files, &mut tokens)?;
-        let mut parser = Parser {
-            tokens: &tokens,
-            pos: 0,
-            files: &files,
-        };
-        let decls = parser.decls()?;
-        let by_name = decls
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (d.name.clone(), i))
-            .collect();
-        Ok(Self {
-            path: path.to_owned(),
-            decls,
-            by_name,
-        })
+        Self::parse(path, &files, &tokens)
     }
 
     /// Parses C source text that includes no files.
@@ -263,12 +242,16 @@ impl CFile {
         let mut files = vec![path.to_owned()];
         let mut tokens = Vec::new();
         tokenize(text, 0, &mut files, &[], &mut tokens)?;
-        let mut parser = Parser {
-            tokens: &tokens,
+        Self::parse(path, &files, &tokens)
+    }
+
+    fn parse(path: &Path, files: &[PathBuf], tokens: &[Token]) -> Result<Self, CError> {
+        let decls = Parser {
+            tokens,
             pos: 0,
-            files: &files,
-        };
-        let decls = parser.decls()?;
+            files,
+        }
+        .decls()?;
         let by_name = decls
             .iter()
             .enumerate()

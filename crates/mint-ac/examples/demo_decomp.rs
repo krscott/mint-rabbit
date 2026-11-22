@@ -99,7 +99,7 @@ fn main() {
                         2
                     }
                 });
-                (format!("{}", k + 1), Some(img))
+                (format!("{}", k + 1), img)
             }),
         )
         .unwrap(),
@@ -116,7 +116,7 @@ fn main() {
                         2
                     }
                 });
-                (format!("{}", k + 1), Some(img))
+                (format!("{}", k + 1), img)
             }),
         )
         .unwrap(),
@@ -131,9 +131,12 @@ fn main() {
             body_size,
             [(
                 "1".to_owned(),
-                Some(image(body_size, |x, y| {
-                    if (x / 4 + y / 4) % 2 == 0 { 6 } else { 13 }
-                })),
+                image(
+                    body_size,
+                    |x, y| {
+                        if (x / 4 + y / 4) % 2 == 0 { 6 } else { 13 }
+                    },
+                ),
             )],
         )
         .unwrap(),
@@ -143,7 +146,7 @@ fn main() {
             head_size,
             [(
                 "1".to_owned(),
-                Some(image(head_size, |x, y| {
+                image(head_size, |x, y| {
                     if y > 28 {
                         4
                     } else if (x + y) % 11 == 0 {
@@ -151,7 +154,7 @@ fn main() {
                     } else {
                         2
                     }
-                })),
+                }),
             )],
         )
         .unwrap(),
@@ -179,16 +182,28 @@ fn main() {
         MaterialId(4),
     );
 
+    // The villager skeleton: joint 13 is the chest and 24 the head; the
+    // other joints stay at their parent's origin.
+    let (body, head) = (NodeId(13), NodeId(24));
     let mut model = Model::new(
         "root",
         Transform::from_translation(Vec3::new(0.0, 300.0, 0.0)),
     );
-    let body = model.add_child(NodeId::ROOT, "body", Transform::default());
-    let head = model.add_child(
-        body,
-        "head",
-        Transform::from_translation(Vec3::new(0.0, 250.0, 0.0)),
-    );
+    let mut open: Vec<(NodeId, u8)> = vec![(NodeId::ROOT, mint_ac::VILLAGER_JOINT_CHILDREN[0])];
+    for (j, &children) in mint_ac::VILLAGER_JOINT_CHILDREN.iter().enumerate().skip(1) {
+        while open.last().is_some_and(|&(_, left)| left == 0) {
+            open.pop();
+        }
+        let (parent, left) = open.last_mut().expect("child counts form a tree");
+        *left -= 1;
+        let (name, offset) = match j {
+            13 => ("chest".to_owned(), Vec3::ZERO),
+            24 => ("head".to_owned(), Vec3::new(0.0, 250.0, 0.0)),
+            _ => (format!("joint{j}"), Vec3::ZERO),
+        };
+        let id = model.add_child(*parent, name, Transform::from_translation(offset));
+        open.push((id, children));
+    }
 
     // Body: a box whose sides wear the clothing texture.
     let mut mesh = Mesh::default();
@@ -322,27 +337,29 @@ fn main() {
     };
     save("src/data/npc/model/mdl/demo_1.c", &export.model_c);
     save("src/data/npc/model/tex/demo_1.c", &export.texture_c);
-    let entry: String = export
-        .draw_data
-        .lines()
-        .filter(|l| !l.starts_with("extern"))
-        .fold(String::new(), |mut s, l| {
-            s.push_str(l);
-            s.push('\n');
-            s
-        })
-        .replace("/* model bank */, /* texture bank */", "0, 0");
     save(
         "src/data/npc/npc_draw_data.c",
-        &format!("extern aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{entry}}};\n"),
+        &format!(
+            "extern aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};\n",
+            export.draw_data_entry
+        ),
     );
-    // Three joints: root translation, then a Z/Y/X rotation per joint, all
-    // fixed, tilting the head a little.
+    // The idle pose, all fixed values: the root translation, then each
+    // joint's x, y, z rotation in tenths of a degree; only the head turns.
+    let mut fixed = vec![0, 300, 0];
+    for j in 0..26 {
+        fixed.extend(if j == 24 { [0, 150, 80] } else { [0, 0, 0] });
+    }
+    let fixed: Vec<String> = fixed.iter().map(ToString::to_string).collect();
     save(
         "src/data/npc/npc_1_wait1.c",
-        "u8 flags[] = { 0, 0, 0 };\ns16 keys[] = { 0 };\ns16 data[] = { 0 };\n\
-         s16 fixed[] = { 0, 300, 0,  0, 0, 0,  0, 0, 0,  0, 150, 80 };\n\
-         aNPC_Animation_c cKF_ba_r_npc_1_wait1 = { { flags, data, keys, fixed, -1, 1 } };\n",
+        &format!(
+            "u8 flags[] = {{ {} }};\ns16 keys[] = {{ 0 }};\ns16 data[] = {{ 0 }};\n\
+             s16 fixed[] = {{ {} }};\n\
+             aNPC_Animation_c cKF_ba_r_npc_1_wait1 = {{ {{ flags, data, keys, fixed, -1, 1 }} }};\n",
+            ["0"; 26].join(", "),
+            fixed.join(", ")
+        ),
     );
     std::fs::create_dir_all(root.join("build/GAFE01_00/include/assets/npc")).unwrap();
     println!("wrote demo decomp to {}", root.display());

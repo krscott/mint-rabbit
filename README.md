@@ -8,7 +8,7 @@ checkout. See [GLOSSARY.md](GLOSSARY.md) for the domain language and
 ## Usage
 
 ```sh
-mint-rabbit --decomp PATH/TO/ac-decomp [--version GAFE01_00]
+mint-rabbit --decomp PATH/TO/ac-decomp [--game-version GAFE01_00]
 ```
 
 The decomp must be built once with your own disc image so its villager assets
@@ -31,8 +31,8 @@ just check
 ```
 
 - `just test-decomp [PATH]` also parses every model source in a decomp
-  checkout, and round-trips every villager (import, export, import) when its
-  assets are extracted.
+  checkout and round-trips every villager (import, export, import); the
+  round trip needs a built checkout.
 - `just snapshot [PATH]` renders the first villager of a decomp offscreen to
   `target/model-view.png`; it needs a GPU.
 

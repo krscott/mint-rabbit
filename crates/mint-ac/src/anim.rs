@@ -14,14 +14,6 @@ pub enum AnimError {
     Malformed { name: String, problem: String },
 }
 
-/// One sampled frame: the root translation and each joint's rotation in
-/// degrees, applied in Z, Y, X order.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Frame {
-    pub root_translation: [f32; 3],
-    pub rotations: Vec<[f32; 3]>,
-}
-
 struct Tables {
     flags: Vec<i64>,
     data: Vec<i64>,
@@ -62,8 +54,14 @@ fn tables(file: &CFile, name: &str) -> Result<Tables, AnimError> {
 }
 
 /// Samples animation `name` from `file` at `frame` for a skeleton of
-/// `joints` joints.
-pub fn sample(file: &CFile, name: &str, joints: usize, frame: f32) -> Result<Frame, AnimError> {
+/// `joints` joints, returning each joint's (x, y, z) rotation in degrees,
+/// applied in Z, Y, X order.
+pub fn sample(
+    file: &CFile,
+    name: &str,
+    joints: usize,
+    frame: f32,
+) -> Result<Vec<[f32; 3]>, AnimError> {
     let t = tables(file, name)?;
     let malformed = |problem: String| AnimError::Malformed {
         name: name.to_owned(),
@@ -96,9 +94,9 @@ pub fn sample(file: &CFile, name: &str, joints: usize, frame: f32) -> Result<Fra
         }
     };
 
-    let mut root_translation = [0.0; 3];
-    for (axis, out) in root_translation.iter_mut().enumerate() {
-        *out = value(t.flags[0] as u8 & (TRANS_X >> axis) != 0)?;
+    // The root translation comes first; display poses only use rotations.
+    for axis in 0..3 {
+        value(t.flags[0] as u8 & (TRANS_X >> axis) != 0)?;
     }
     let mut rotations = Vec::with_capacity(joints);
     for &flags in &t.flags[..joints] {
@@ -109,10 +107,7 @@ pub fn sample(file: &CFile, name: &str, joints: usize, frame: f32) -> Result<Fra
         }
         rotations.push(rot);
     }
-    Ok(Frame {
-        root_translation,
-        rotations,
-    })
+    Ok(rotations)
 }
 
 /// `cKF_KeyCalc`: Hermite interpolation over `(frame, value, tangent)` keys.
@@ -173,9 +168,8 @@ mod tests {
         .unwrap();
         let f = sample(&file, "anim", 2, 1.0).unwrap();
         let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4);
-        assert!(close(&f.root_translation, &[5.0, 1000.0, 7.0]), "{f:?}");
         assert!(
-            close(&f.rotations.concat(), &[90.0, 0.0, 45.0, 0.0, 0.0, 180.0]),
+            close(&f.concat(), &[90.0, 0.0, 45.0, 0.0, 0.0, 180.0]),
             "{f:?}"
         );
     }

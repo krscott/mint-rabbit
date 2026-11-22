@@ -27,8 +27,8 @@ nodes; a skeleton's joints are nodes too.
 _Avoid_: Joint, bone, part, object
 
 **Mesh**:
-Geometry owned by a node: vertices with UVs, and triangles that each draw with
-one material.
+Geometry owned by a node: vertices, and triangles that each draw with one
+material and give each corner a UV coordinate.
 _Avoid_: Display list, model, geometry
 
 **Pose**:
@@ -50,7 +50,8 @@ _Avoid_: Color table, TLUT, swatches
 
 **Texture**:
 A named image of fixed pixel size, mapped onto the model through UV
-coordinates and assigned a slot; it holds one or more variants.
+coordinates and assigned a slot; it holds one or more variants, or for an
+external texture only a preview.
 _Avoid_: Skin, image, map
 
 **Slot**:
@@ -66,7 +67,8 @@ _Avoid_: Placeholder, runtime texture
 
 **Material**:
 How triangles draw with a texture: the texture, a wrap mode per axis (clamp,
-repeat, or mirror), and an alpha mode (opaque, cutout, or translucent).
+repeat, or mirror), an alpha mode (opaque, cutout, or translucent), whether
+back faces show, and a tint.
 _Avoid_: Shader, render mode
 
 **Variant**:

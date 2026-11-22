@@ -1,12 +1,10 @@
 //! The node tree: nodes, their transforms, and the meshes they own.
 
-use glam::{Mat4, Quat, Vec2, Vec3};
-use serde::{Deserialize, Serialize};
-
 use crate::texture::MaterialId;
+use glam::{Mat4, Quat, Vec2, Vec3};
 
 /// Index of a node within its [`Model`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
 impl NodeId {
@@ -18,7 +16,7 @@ impl NodeId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,
@@ -50,7 +48,7 @@ impl Transform {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub name: String,
     parent: Option<NodeId>,
@@ -65,11 +63,12 @@ impl Node {
     }
 }
 
-/// A tree of nodes stored in depth-first order.
+/// A tree of nodes.
 ///
 /// Every node except the root has a parent with a smaller index, so the
-/// structure is always a tree and a forward pass visits parents first.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// structure is always a tree and a forward pass over ids visits parents
+/// first. Ids are not in depth-first order; use [`Model::preorder`] for that.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     nodes: Vec<Node>,
 }
@@ -137,6 +136,20 @@ impl Model {
         self.ids().filter(move |&c| self.node(c).parent == Some(id))
     }
 
+    /// Every node in depth-first pre-order, children in id order.
+    #[must_use]
+    pub fn preorder(&self) -> Vec<NodeId> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        let mut stack = vec![NodeId::ROOT];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            let mut children: Vec<_> = self.children(id).collect();
+            children.reverse();
+            stack.extend(children);
+        }
+        out
+    }
+
     /// Model-space matrix of every node, with each node's local transform
     /// followed by the pose rotation for that node.
     #[must_use]
@@ -155,13 +168,13 @@ impl Model {
 }
 
 /// Geometry owned by a node.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub triangles: Vec<Triangle>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
     /// Position in the local space of the node this vertex follows.
     pub position: Vec3,
@@ -179,7 +192,7 @@ impl Vertex {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Triangle {
     pub corners: [Corner; 3],
     pub material: MaterialId,
@@ -187,7 +200,7 @@ pub struct Triangle {
 
 /// One corner of a triangle. UVs live on corners rather than vertices so a
 /// vertex can sit on a UV seam or be shared by differently sized textures.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Corner {
     pub vertex: u32,
     /// Normalized texture coordinate; 0..1 spans the texture once.
@@ -231,5 +244,16 @@ mod tests {
         let b = model.add_child(NodeId::ROOT, "b", Transform::default());
 
         assert_eq!(model.children(NodeId::ROOT).collect::<Vec<_>>(), vec![a, b]);
+    }
+
+    #[test]
+    fn preorder_visits_subtrees_before_later_siblings() {
+        let mut model = Model::new("root", Transform::default());
+        let a = model.add_child(NodeId::ROOT, "a", Transform::default());
+        let b = model.add_child(NodeId::ROOT, "b", Transform::default());
+        // Added after b, but belongs before it in pre-order.
+        let a1 = model.add_child(a, "a1", Transform::default());
+
+        assert_eq!(model.preorder(), vec![NodeId::ROOT, a, a1, b]);
     }
 }

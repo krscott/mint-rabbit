@@ -4,19 +4,20 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use mint_core::{Project, TextureContent};
+use mint_core::{Model, NodeId, Palette, Project, Rgba8, TargetId, TextureContent, Transform};
 
 use crate::c::CFile;
 use crate::import::{build_project, parse_villagers};
-use crate::{Decomp, export, gx};
+use crate::{Decomp, ExportError, export, gx};
 
 /// Slot, size, variant pixels, and whether the texture is external.
 type CanonicalTexture = (String, [u32; 2], Vec<Vec<u8>>, bool);
 /// Name, parent, translation, and sorted triangle descriptions.
 type CanonicalNode = (String, Option<u32>, [i64; 3], Vec<String>);
 
-/// A comparable summary of a project that ignores names and orders the
-/// exporter is free to change.
+/// A comparable summary of a project that ignores what the exporter is free
+/// to change: triangle order, vertex layout, texture names and placement,
+/// and colors beyond what the target can show.
 #[derive(Debug, PartialEq)]
 struct Canonical {
     palette: Vec<[u8; 4]>,
@@ -39,11 +40,7 @@ fn canonical(p: &Project) -> Canonical {
             let variants = t
                 .variants()
                 .iter()
-                .map(|v| {
-                    v.underlay()
-                        .map(|u| u.pixels().iter().map(|i| i.0).collect())
-                        .unwrap_or_default()
-                })
+                .map(|v| v.underlay().pixels().iter().map(|i| i.0).collect())
                 .collect();
             let external = matches!(t.content(), TextureContent::External { .. });
             (t.slot.0.clone(), t.size().to_array(), variants, external)
@@ -108,13 +105,8 @@ fn reimport(project: &Project, pose_file: &CFile) -> Project {
     let table = CFile::parse_str(
         Path::new("table.c"),
         &format!(
-            "aNPC_draw_data_tbl npc_draw_data_tbl[] = {{\n{}\n}};",
-            out.draw_data
-                .lines()
-                .filter(|l| !l.starts_with("extern"))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .replace("/* model bank */, /* texture bank */", "0, 0")
+            "aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};",
+            out.draw_data_entry
         ),
     )
     .unwrap();
@@ -122,13 +114,50 @@ fn reimport(project: &Project, pose_file: &CFile) -> Project {
     build_project(&model, &tex, pose_file, &v).unwrap()
 }
 
-const SYNTHETIC_POSE: &str = "
-    u8 flags[] = { 0, 0, 0 };
-    s16 keys[] = { 0 };
-    s16 data[] = { 0 };
-    s16 fixed[] = { 0, 1000, 0,  0, 0, 900,  0, 0, 0,  300, 0, 0 };
-    aNPC_Animation_c cKF_ba_r_npc_1_wait1 = { { flags, data, keys, fixed, -1, 33 } };
-";
+/// Joints of the synthetic villager that have display lists: body (slot 0)
+/// and head (slot 1).
+const BODY_JOINT: usize = 13;
+const HEAD_JOINT: usize = 24;
+
+/// A pose for the 26-joint villager skeleton: fixed rotations only.
+fn synthetic_pose() -> String {
+    let mut fixed = vec![0, 1000, 0];
+    for j in 0..26 {
+        fixed.extend(match j {
+            0 => [0, 0, 900],
+            HEAD_JOINT => [300, 0, 0],
+            _ => [0, 0, 0],
+        });
+    }
+    let fixed: Vec<String> = fixed.iter().map(ToString::to_string).collect();
+    format!(
+        "u8 flags[] = {{ {} }};
+         s16 keys[] = {{ 0 }};
+         s16 data[] = {{ 0 }};
+         s16 fixed[] = {{ {} }};
+         aNPC_Animation_c cKF_ba_r_npc_1_wait1 = {{ {{ flags, data, keys, fixed, -1, 33 }} }};",
+        ["0"; 26].join(", "),
+        fixed.join(", ")
+    )
+}
+
+/// The villager joint table with display lists on the body and head.
+fn synthetic_joints() -> String {
+    crate::VILLAGER_JOINT_CHILDREN
+        .iter()
+        .enumerate()
+        .map(|(j, children)| {
+            let (dl, t) = match j {
+                0 => ("NULL", "0,1000,0"),
+                BODY_JOINT => ("body_t_model", "0,0,0"),
+                HEAD_JOINT => ("head_t_model", "500,0,0"),
+                _ => ("NULL", "0,0,0"),
+            };
+            format!("{{ {dl}, {children}, cKF_JOINT_FLAG_DISP_OPA, {t} }},")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn prelude(
     texture: &str,
@@ -182,11 +211,10 @@ fn synthetic() -> (CFile, CFile, CFile, CFile) {
             gsSPEndDisplayList(),
          }};
          static cKF_Joint_R_c cKF_je_r_t_1_tbl[] = {{
-            {{ NULL, 1, cKF_JOINT_FLAG_DISP_OPA, 0,1000,0 }},
-            {{ body_t_model, 1, cKF_JOINT_FLAG_DISP_OPA, 0,0,0 }},
-            {{ head_t_model, 0, cKF_JOINT_FLAG_DISP_OPA, 500,0,0 }},
+            {joints}
          }};
-         extern cKF_Skeleton_R_c cKF_bs_r_t_1 = {{ 3, 2, cKF_je_r_t_1_tbl }};",
+         extern cKF_Skeleton_R_c cKF_bs_r_t_1 = {{ 26, 2, cKF_je_r_t_1_tbl }};",
+        joints = synthetic_joints(),
         body = prelude("anime_4_txt", 16, 16, 15, "GX_CLAMP, GX_CLAMP", "G_RM_AA_ZB_OPA_SURF2", " | G_CULL_BACK"),
         eye = prelude("anime_1_txt", 32, 16, 15, "GX_CLAMP, GX_CLAMP", "G_RM_AA_ZB_OPA_SURF2", " | G_CULL_BACK"),
         mouth = prelude("anime_2_txt", 32, 16, 15, "GX_MIRROR, GX_CLAMP", "G_RM_AA_ZB_OPA_SURF2", " | G_CULL_BACK"),
@@ -238,20 +266,28 @@ fn synthetic() -> (CFile, CFile, CFile, CFile) {
         parse("t_1.c", &model),
         parse("t_1_tex.c", &tex),
         parse("table.c", &table),
-        parse("pose.c", SYNTHETIC_POSE),
+        parse("pose.c", &synthetic_pose()),
     )
+}
+
+fn synthetic_project() -> (Project, CFile) {
+    let (model, tex, table, pose) = synthetic();
+    let v = parse_villagers(&table).unwrap().remove(0);
+    (build_project(&model, &tex, &pose, &v).unwrap(), pose)
 }
 
 #[test]
 fn synthetic_villager_round_trips() {
-    let (model, tex, table, pose) = synthetic();
-    let v = parse_villagers(&table).unwrap().remove(0);
-    let original = build_project(&model, &tex, &pose, &v).unwrap();
+    let (original, pose) = synthetic_project();
 
     // The import itself: a seam vertex, five textures, five materials.
-    let head = original.model().node(mint_core::NodeId(2));
-    let mesh = head.mesh.as_ref().unwrap();
-    assert_eq!(mesh.vertices[0].follows, Some(mint_core::NodeId(1)));
+    let mesh = original
+        .model()
+        .node(NodeId(HEAD_JOINT as u32))
+        .mesh
+        .as_ref()
+        .unwrap();
+    assert_eq!(mesh.vertices[0].follows, Some(NodeId(BODY_JOINT as u32)));
     assert_eq!(mesh.triangles.len(), 7);
     assert_eq!(original.textures().len(), 5);
     assert_eq!(original.materials().len(), 5);
@@ -260,15 +296,96 @@ fn synthetic_villager_round_trips() {
     assert_eq!(canonical(&original), canonical(&again));
 }
 
+/// The synthetic project with some parts replaced.
+fn variant_of(p: &Project, target: &str, palette: Palette, model: Model) -> Project {
+    Project::new(
+        TargetId(target.into()),
+        palette,
+        model,
+        p.textures().to_vec(),
+        p.materials().to_vec(),
+        p.pose().clone(),
+    )
+    .unwrap()
+}
+
 #[test]
-fn export_refuses_large_palettes() {
-    let (model, tex, table, pose) = synthetic();
-    let v = parse_villagers(&table).unwrap().remove(0);
-    let p = build_project(&model, &tex, &pose, &v).unwrap();
-    // 16 colors is the limit; the synthetic palette is exactly 16.
-    assert_eq!(p.palette().len(), 16);
+fn export_refuses_what_ac_villagers_cannot_hold() {
+    let (p, _) = synthetic_project();
     assert!(export(&p, "rt_1", "rt_1").is_ok());
-    assert!(export(&p, "1bad", "rt_1").is_err());
+    assert_eq!(
+        export(&p, "1bad", "rt_1"),
+        Err(ExportError::BadName("1bad".into()))
+    );
+
+    let palette = p.palette().clone();
+    let other_target = variant_of(&p, "other", palette.clone(), p.model().clone());
+    assert!(matches!(
+        export(&other_target, "rt_1", "rt_1"),
+        Err(ExportError::WrongTarget(_))
+    ));
+
+    let seventeen = Palette::from_colors(
+        p.palette()
+            .colors()
+            .iter()
+            .copied()
+            .chain([Rgba8::new(1, 2, 3, 255)]),
+    )
+    .unwrap();
+    let big = variant_of(&p, crate::TARGET, seventeen, p.model().clone());
+    assert_eq!(
+        export(&big, "rt_1", "rt_1"),
+        Err(ExportError::PaletteTooLarge(17))
+    );
+
+    let mut extra = p.model().clone();
+    extra.add_child(NodeId::ROOT, "extra", Transform::default());
+    let extra = variant_of(&p, crate::TARGET, palette, extra);
+    assert!(matches!(
+        export(&extra, "rt_1", "rt_1"),
+        Err(ExportError::Skeleton(_))
+    ));
+}
+
+/// A node added after its later siblings still exports in depth-first
+/// order, so the game and the importer see the same tree.
+#[test]
+fn export_writes_joints_depth_first() {
+    let (p, pose) = synthetic_project();
+    // Rebuild the same tree, adding joint 5 (a leaf of the first leg) last,
+    // so its id comes after nodes it precedes depth-first.
+    let model = p.model();
+    let mut shuffled = Model::new(
+        model.node(NodeId::ROOT).name.clone(),
+        model.node(NodeId::ROOT).transform,
+    );
+    let mut map = vec![NodeId::ROOT; model.nodes().len()];
+    let order: Vec<NodeId> = model
+        .ids()
+        .filter(|&id| id.0 != 5)
+        .chain([NodeId(5)])
+        .skip(1)
+        .collect();
+    for id in order {
+        let n = model.node(id);
+        map[id.index()] = shuffled.add_child(
+            map[n.parent().unwrap().index()],
+            n.name.clone(),
+            n.transform,
+        );
+    }
+    for id in model.ids() {
+        let mut mesh = model.node(id).mesh.clone();
+        if let Some(m) = &mut mesh {
+            for v in &mut m.vertices {
+                v.follows = v.follows.map(|f| map[f.index()]);
+            }
+        }
+        shuffled.node_mut(map[id.index()]).mesh = mesh;
+    }
+    let shuffled = variant_of(&p, crate::TARGET, p.palette().clone(), shuffled);
+    assert_eq!(canonical(&p), canonical(&reimport(&shuffled, &pose)));
 }
 
 /// Round-trips every villager in a decomp built with extracted assets, named
@@ -277,14 +394,7 @@ fn export_refuses_large_palettes() {
 #[ignore = "needs a built ac-decomp checkout in MINT_AC_DECOMP"]
 fn every_built_villager_round_trips() {
     let root = PathBuf::from(std::env::var("MINT_AC_DECOMP").expect("MINT_AC_DECOMP"));
-    let decomp = match Decomp::open(&root, "GAFE01_00") {
-        Ok(d) => d,
-        Err(crate::ImportError::NotBuilt(_)) => {
-            eprintln!("skipping: {} has no extracted assets", root.display());
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let decomp = Decomp::open(&root, "GAFE01_00").unwrap_or_else(|e| panic!("{e}"));
     let pose = CFile::read(&root.join("src/data/npc/npc_1_wait1.c"), &[]).unwrap();
     let mut refused = Vec::new();
     let mut ok = 0;
@@ -299,12 +409,20 @@ fn every_built_villager_round_trips() {
                 );
                 ok += 1;
             }
-            Err(e) => refused.push(format!("{}: {e}", v.texture_set)),
+            Err(e) => refused.push((v.model.clone(), format!("{}: {e}", v.texture_set))),
         }
     }
-    eprintln!(
-        "{ok} villagers round-trip; refused:\n{}",
-        refused.join("\n")
+    eprintln!("{ok} villagers round-trip");
+    // Only the special NPC models the importer cannot represent may fail.
+    let unexpected: Vec<&str> = refused
+        .iter()
+        .filter(|(model, _)| !["fob_1", "gst_1", "hem_1", "mka_1"].contains(&model.as_str()))
+        .map(|(_, e)| e.as_str())
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected refusals:\n{}",
+        unexpected.join("\n")
     );
     assert!(ok > 0);
 }

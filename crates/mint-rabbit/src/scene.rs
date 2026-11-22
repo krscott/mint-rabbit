@@ -15,23 +15,16 @@ pub fn display_color(project: &Project, c: Rgba8) -> Rgba8 {
 
 /// The RGBA pixels of one variant (or the preview of an external texture).
 pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> Vec<Rgba8> {
-    let size = texture.size();
-    let blank = vec![Rgba8::new(0, 0, 0, 0); (size.x * size.y) as usize];
     match texture.content() {
         TextureContent::External { preview } => preview.pixels.clone(),
         TextureContent::Painted(variants) => {
-            let Some(underlay) = variants.get(variant).and_then(|v| v.underlay()) else {
-                return blank;
-            };
-            underlay
+            let colors = project.palette().colors();
+            variants[variant]
+                .underlay()
                 .pixels()
                 .iter()
-                .map(|&i| {
-                    project
-                        .palette()
-                        .get(i)
-                        .map_or(Rgba8::new(255, 0, 255, 255), |c| display_color(project, c))
-                })
+                // Projects guarantee underlay pixels name palette entries.
+                .map(|&i| display_color(project, colors[usize::from(i.0)]))
                 .collect()
         }
     }
@@ -95,13 +88,15 @@ pub fn posed_mesh(project: &Project) -> PosedMesh {
         });
         vertices.extend(vs);
     }
-    let (bounds_min, bounds_max) = vertices.iter().fold(
-        (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
-        |(lo, hi), v| {
-            let p = Vec3::from(v.position);
-            (lo.min(p), hi.max(p))
-        },
-    );
+    // An empty model frames the origin.
+    let bounds = |pick: fn(Vec3, Vec3) -> Vec3| {
+        vertices
+            .iter()
+            .map(|v| Vec3::from(v.position))
+            .reduce(pick)
+            .unwrap_or(Vec3::ZERO)
+    };
+    let (bounds_min, bounds_max) = (bounds(Vec3::min), bounds(Vec3::max));
     PosedMesh {
         vertices,
         batches,
@@ -163,13 +158,8 @@ mod tests {
         let mut pose = Pose::default();
         pose.set_rotation(child, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
         let img = IndexedImage::new(UVec2::new(1, 1), vec![PaletteIndex(0)]).unwrap();
-        let texture = Texture::painted(
-            "t",
-            Slot("body".into()),
-            UVec2::ONE,
-            [("1".into(), Some(img))],
-        )
-        .unwrap();
+        let texture =
+            Texture::painted("t", Slot("body".into()), UVec2::ONE, [("1".into(), img)]).unwrap();
         Project::new(
             TargetId(mint_ac::TARGET.into()),
             Palette::from_colors([Rgba8::new(255, 1, 2, 255)]).unwrap(),
