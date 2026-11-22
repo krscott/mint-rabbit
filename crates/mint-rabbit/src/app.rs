@@ -541,7 +541,7 @@ impl App {
                             .clicked()
                         {
                             doc.selection = Selection::default();
-                            self.texture_view.cancel();
+                            self.texture_view.clear_pen();
                         }
                         let count = t.variants().len();
                         if count > 1 {
@@ -556,7 +556,7 @@ impl App {
                                             && doc.selected == Some(id)
                                         {
                                             doc.selection = Selection::default();
-                                            self.texture_view.cancel();
+                                            self.texture_view.clear_pen();
                                         }
                                     }
                                 });
@@ -575,7 +575,7 @@ impl App {
                             .clicked()
                         {
                             self.tool = tool;
-                            self.texture_view.cancel();
+                            self.texture_view.clear_pen();
                         }
                     }
                 });
@@ -723,7 +723,7 @@ impl App {
         for (key, tool) in tools {
             if ctx.input(|i| i.key_pressed(key) && i.modifiers.is_none()) && self.tool != tool {
                 self.tool = tool;
-                self.texture_view.cancel();
+                self.texture_view.clear_pen();
             }
         }
     }

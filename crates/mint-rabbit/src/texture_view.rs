@@ -231,8 +231,10 @@ impl TextureView {
         self.drag.is_some()
     }
 
-    pub fn cancel(&mut self) {
-        self.drag = None;
+    /// Drops the pen path being drawn, as when the tool or texture
+    /// changes. No drag is in progress then: controls and shortcuts wait
+    /// for drags to end.
+    pub fn clear_pen(&mut self) {
         self.pen.clear();
     }
 
@@ -406,8 +408,14 @@ impl TextureView {
                 .input(|i| i.pointer.press_origin())
                 .map(|p| at.to_texture(p))
         {
-            // A canvas drag ends any other control's open edit.
+            // A canvas drag ends any other control's open edit and takes
+            // keyboard focus from it, so nothing typed mid-drag reaches it.
             editor.end_gesture();
+            ui.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
             self.targets = (selection.layer, selection.shapes.clone());
         } else if response.clicked()
