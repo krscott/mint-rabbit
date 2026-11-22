@@ -40,7 +40,14 @@
             shfmt
             shellcheck
             bash
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
           ];
+
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath package.runtimeLibs;
         };
 
         formatter = pkgs.nixfmt;

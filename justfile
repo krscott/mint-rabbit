@@ -4,22 +4,43 @@ default:
     just --list
 
 build:
-    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''Hello from hello.sh\n'\''' > hello.sh
-    chmod +x hello.sh
+    cargo build --locked
 
-run: build
-    ./hello.sh
+run *args:
+    cargo run --locked -p mint-rabbit -- "$@"
 
-# Test the locally built program.
-test: build
+test:
+    cargo test --locked --workspace
+
+# Parse every model source and the villager table of an ac-decomp checkout (built or not).
+test-decomp-sources decomp=".multi/repos/ac-decomp":
+    MINT_AC_DECOMP="$(realpath -- "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
+
+# Run every decomp test, including the round trip of every villager; needs a built checkout.
+test-decomp decomp:
+    MINT_AC_DECOMP="$(realpath -- "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
+
+# Write a generated demo villager as a decomp-shaped directory and open it.
+demo dir="target/demo-decomp":
+    cargo run --locked -q -p mint-ac --example demo_decomp -- "$1"
+    cargo run --locked -p mint-rabbit -- --decomp "$1"
+
+# Render the first villager of DECOMP (default: the demo) to target/model-view.png; needs a GPU.
+snapshot decomp="":
     #!/usr/bin/env bash
     set -euo pipefail
-    expected='Hello from hello.sh'
-    actual=$(./hello.sh)
-    if [[ "$actual" != "$expected" ]]; then
-        printf 'Expected: %s\nActual: %s\n' "$expected" "$actual" >&2
-        exit 1
+    decomp="$1"
+    if [[ -z "$decomp" ]]; then
+        decomp=target/demo-decomp
+        cargo run --locked -q -p mint-ac --example demo_decomp -- "$decomp"
     fi
+    MINT_AC_DECOMP="$(realpath -- "$decomp")"
+    MINT_SNAPSHOT="$PWD/target/model-view.png"
+    export MINT_AC_DECOMP MINT_SNAPSHOT
+    cargo test --locked -p mint-rabbit -- --ignored model_view_snapshot
+
+clippy:
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # Format files, or all tracked files when no files are provided.
 format *files:
@@ -64,6 +85,13 @@ _format mode *files:
                     nixfmt "$file"
                 fi
             ;;
+            *.rs)
+                if [[ "$mode" == check ]]; then
+                    rustfmt --edition 2024 --check "$file"
+                else
+                    rustfmt --edition 2024 "$file"
+                fi
+            ;;
             *.sh|.githooks/*|*/.githooks/*)
                 if [[ "$mode" == check ]]; then
                     shfmt -d -i 4 "$file"
@@ -86,7 +114,7 @@ lint:
     done < <(git ls-files -z)
 
 # Run non-mutating formatting, shell, and Nix checks.
-check: format-check lint
+check: format-check lint clippy
     nix flake check -L --no-update-lock-file
 
 # Format staged files for git pre-commit.
