@@ -212,9 +212,11 @@ pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
 /// A save whose images are written but whose project file is not.
 struct Staged {
     text: String,
-    images: Vec<PathBuf>,
-    /// Images the previous project file referred to.
-    previous: Vec<PathBuf>,
+    /// Names in the image directory of the images written.
+    images: Vec<String>,
+    /// Names in the image directory of the images the previous project file
+    /// referred to.
+    previous: Vec<String>,
 }
 
 /// Writes the images of `project` into `dir` and prepares its project file.
@@ -229,11 +231,12 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
     }
     let mut written = Vec::new();
     let mut image = |stem: String, png: Vec<u8>| -> Result<String, SaveError> {
-        let rel = format!("{IMAGE_DIR}/{stem}-{:016x}.png", fnv1a(&png));
-        let path = dir.join(&rel);
+        let name = format!("{stem}-{:016x}.png", fnv1a(&png));
+        let path = images.join(&name);
         // Written even when present, in case the file was changed since.
         write_atomic(&path, &png).map_err(|e| SaveError::Io(path.clone(), e))?;
-        written.push(path);
+        let rel = format!("{IMAGE_DIR}/{name}");
+        written.push(name);
         Ok(rel)
     };
     let mut textures = Vec::new();
@@ -315,9 +318,10 @@ fn is_saved_image_name(name: &str) -> bool {
     }
 }
 
-/// The images the project file in `dir` refers to that a save may later
-/// remove, or none if there is no readable project file.
-fn referenced_images(dir: &Path) -> Vec<PathBuf> {
+/// Names in the image directory of the images the project file in `dir`
+/// refers to that a save may later remove, or none if there is no readable
+/// project file.
+fn referenced_images(dir: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(dir.join(PROJECT_FILE)) else {
         return Vec::new();
     };
@@ -330,17 +334,12 @@ fn referenced_images(dir: &Path) -> Vec<PathBuf> {
             ContentFile::Painted(variants) => variants.iter().map(|v| v.underlay.clone()).collect(),
             ContentFile::External { preview } => vec![preview.clone()],
         })
-        // Only images saves write: PNGs directly in the image directory.
-        .filter(|rel| {
-            let path = Path::new(rel);
-            path.parent() == Some(Path::new(IMAGE_DIR))
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(is_saved_image_name)
+        // Only images saves write: their names, directly in the image
+        // directory. Such a name can't hold a path separator.
+        .filter_map(|rel| {
+            let name = rel.strip_prefix(IMAGE_DIR)?.strip_prefix('/')?;
+            is_saved_image_name(name).then(|| name.to_owned())
         })
-        // Resolved inside the project directory, as load requires.
-        .filter_map(|rel| image_path(dir, &rel).ok())
         .collect()
 }
 
@@ -351,10 +350,11 @@ impl Staged {
     fn commit(self, dir: &Path) -> Result<(), SaveError> {
         let manifest = dir.join(PROJECT_FILE);
         write_atomic(&manifest, self.text.as_bytes()).map_err(|e| SaveError::Io(manifest, e))?;
-        for old in self.previous.iter().filter(|p| !self.images.contains(p)) {
-            if std::fs::symlink_metadata(old).is_ok_and(|m| m.is_file()) {
-                let _ = std::fs::remove_file(old);
-            }
+        // Staging checked that the image directory is a real directory, and
+        // removing a link removes the link itself, never its target.
+        let images = dir.join(IMAGE_DIR);
+        for old in self.previous.iter().filter(|n| !self.images.contains(n)) {
+            let _ = std::fs::remove_file(images.join(old));
         }
         Ok(())
     }
@@ -634,10 +634,11 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
 
 /// Replaces the file at `path` with `bytes` all at once: they are written
 /// to a new, uniquely named file beside it (never one already there, such as
-/// a planted link), synced, and renamed over it, and the directory is synced
-/// where possible so the rename survives a power loss. The file keeps the permissions of
-/// the one it replaces, and a new file gets the usual ones for the umask. A
-/// failed write removes the new file and leaves the old one.
+/// a planted link), synced, and renamed over it, and the directory is
+/// synced where possible so the rename survives a power loss. The file keeps
+/// the permissions of the one it replaces, and a new file gets the usual
+/// ones for the umask. A failed write removes the new file and leaves the
+/// old one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = match path.parent() {
@@ -942,6 +943,43 @@ mod tests {
             0o664
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn saving_through_a_linked_path_keeps_its_images() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = sample();
+        save(&p, &link).unwrap();
+        save(&p, &link).unwrap();
+        assert_eq!(load(&link).unwrap(), p);
+    }
+
+    #[test]
+    fn cleanup_never_removes_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = sample();
+        save(&p, dir.path()).unwrap();
+        // A link with a saved image's name, pointing at the project file,
+        // that the project file names.
+        let name = "0-0-0123456789abcdef.png";
+        std::os::unix::fs::symlink("../project.ron", dir.path().join(IMAGE_DIR).join(name))
+            .unwrap();
+        let manifest = dir.path().join(PROJECT_FILE);
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let first = images(dir.path())
+            .into_iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+            .find(|f| f.starts_with("0-0-") && f != name)
+            .unwrap();
+        std::fs::write(&manifest, text.replace(&first, name)).unwrap();
+        p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
+            .unwrap();
+        save(&p, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), p);
     }
 
     #[test]
