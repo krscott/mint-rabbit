@@ -204,10 +204,10 @@ impl Shape {
 }
 
 /// Appends points along a cubic, excluding its start, enough of them that
-/// the lines between stay within [`TOLERANCE`] (Wang's formula). A segment
-/// with no handles is a straight line, appended exactly as its end.
+/// the lines between stay within [`TOLERANCE`] (Wang's formula). A straight
+/// segment is appended exactly, as its end alone.
 fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
-    if p1 == p0 && p2 == p3 {
+    if is_straight([p0, p1, p2, p3]) {
         out.push(p3);
         return;
     }
@@ -220,6 +220,23 @@ fn flatten_cubic([p0, p1, p2, p3]: [Vec2; 4], out: &mut Vec<Vec2>) {
         let u = 1.0 - t;
         out.push(u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3);
     }
+}
+
+/// Whether a cubic is a straight line from its start to its end: both
+/// controls lie on that segment.
+fn is_straight([p0, p1, p2, p3]: [Vec2; 4]) -> bool {
+    let line = p3 - p0;
+    let len2 = line.length_squared();
+    let on_segment = |c: Vec2| {
+        let d = c - p0;
+        if len2 == 0.0 {
+            return d == Vec2::ZERO;
+        }
+        // Within a millionth of a texel per texel of length, and between
+        // the ends.
+        line.perp_dot(d).abs() <= 1e-6 * len2 && (0.0..=len2).contains(&line.dot(d))
+    };
+    on_segment(p1) && on_segment(p2)
 }
 
 /// A shape flattened to lines, ready for coverage tests.
@@ -331,7 +348,9 @@ pub fn rectangle(a: Vec2, b: Vec2) -> Vec<Anchor> {
 
 /// Smooth anchors through a freehand stroke: the points are simplified to
 /// those within `tolerance` texels of the stroke, then joined by
-/// Catmull-Rom curves. Returns no anchors for no points.
+/// Catmull-Rom curves, except that ends and turns sharper than a right angle
+/// stay corners so the curve doesn't overshoot them. Returns no anchors for
+/// no points.
 #[must_use]
 pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
     let mut kept = Vec::new();
@@ -342,7 +361,7 @@ pub fn freehand(points: &[Vec2], tolerance: f32) -> Vec<Anchor> {
     let n = kept.len();
     (0..n)
         .map(|i| {
-            if i == 0 || i == n - 1 {
+            if i == 0 || i == n - 1 || (kept[i] - kept[i - 1]).dot(kept[i + 1] - kept[i]) < 0.0 {
                 return Anchor::corner(kept[i]);
             }
             Anchor::smooth(kept[i], (kept[i + 1] - kept[i - 1]) / 6.0)
@@ -477,6 +496,12 @@ mod tests {
         for x in 1..8 {
             assert!(o.covers(Vec2::new(x as f32 + 0.5, 0.5)), "{x}");
         }
+        // Handles along a straight edge leave it straight.
+        let mut anchors = rectangle(Vec2::splat(0.5), Vec2::new(8.5, 4.5));
+        anchors[0].handle_out = Vec2::new(0.25, 0.0);
+        anchors[1].handle_in = Vec2::new(-0.25, 0.0);
+        let o = fill(anchors).outline();
+        assert_eq!(o.points().len(), 4);
     }
 
     #[test]
@@ -520,9 +545,9 @@ mod tests {
         let anchors = freehand(&bend, 0.5);
         assert_eq!(anchors.len(), 3);
         assert_eq!(anchors[1].handle_out, Vec2::new(10.0 / 6.0, 0.0));
-        // A stroke that doubles back keeps its far end.
+        // A stroke that doubles back keeps its far end, as a corner.
         let back = [Vec2::ONE, Vec2::new(10.0, 1.0), Vec2::new(5.0, 1.0)];
-        assert_eq!(freehand(&back, 0.25).len(), 3);
+        assert_eq!(freehand(&back, 0.25), back.map(Anchor::corner).to_vec());
         assert!(freehand(&[], 0.5).is_empty());
         assert_eq!(freehand(&[Vec2::ONE], 0.5).len(), 1);
     }
