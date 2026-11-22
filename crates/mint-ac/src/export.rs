@@ -205,6 +205,16 @@ impl TextureExport {
         ))
     }
 
+    /// The files a folder export of texture set `set` writes into `dir`: its
+    /// source, and the notes for adding it to the decomp.
+    #[must_use]
+    pub fn folder_files(set: &str, dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+        [
+            dir.join(format!("{set}.c")),
+            dir.join(format!("{set}_draw_data.txt")),
+        ]
+    }
+
     /// Writes `<texture_set>.c`, and `<texture_set>_draw_data.txt` with the
     /// rest of what a new texture set needs in the decomp, into `dir`,
     /// returning their paths. [`crate::Decomp::write_texture_folder`] checks
@@ -220,8 +230,7 @@ impl TextureExport {
             move |e| crate::WriteError::Io(path, e)
         };
         std::fs::create_dir_all(dir).map_err(io(dir))?;
-        let c = dir.join(format!("{set}.c"));
-        let table = dir.join(format!("{set}_draw_data.txt"));
+        let [c, table] = Self::folder_files(set, dir);
         let entry = self.table_entry(Some(base))?;
         let notes = format!(
             "// To add texture set {set} to the decomp:

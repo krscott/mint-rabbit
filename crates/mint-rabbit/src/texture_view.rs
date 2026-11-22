@@ -82,7 +82,8 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// Drops picks that no longer exist, for example after an undo.
+    /// Drops picks that no longer exist, as after deleting a layer, and
+    /// picks on a locked or hidden layer.
     pub fn fit(&mut self, project: &Project, r: VariantRef) {
         let layers = project.variant(r).layers();
         if self.layer >= layers.len() {
@@ -434,9 +435,20 @@ impl TextureView {
             continue_drag(editor, drag, &self.targets, r, p, &mut self.pen, shift);
         }
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
-        if escape && self.drag.is_some() {
-            // Drawing is dropped; edits a drag already made stay one step.
-            self.drag = None;
+        let cancelled = escape && self.drag.is_some();
+        if let Some(drag) = self.drag.take_if(|_| cancelled) {
+            // A drawing is dropped, and a transform puts the shapes back.
+            match drag {
+                Drag::Move { original, .. }
+                | Drag::Scale { original, .. }
+                | Drag::Rotate { original, .. } => {
+                    replace_picked(editor, r, &self.targets, original);
+                }
+                Drag::Anchor { original, .. } => {
+                    replace_picked(editor, r, &self.targets, vec![original]);
+                }
+                Drag::PenHandle | Drag::Brush(_) | Drag::Box { .. } => {}
+            }
             editor.end_gesture();
         } else if response.drag_stopped() {
             // Only the primary button's release finishes a drawing.
@@ -451,7 +463,11 @@ impl TextureView {
 
         // Keys, while the view has the pointer.
         // Keys a text field is using are its own.
-        if (response.hovered() || !self.pen.is_empty()) && !ui.ctx().egui_wants_keyboard_input() {
+        // Keys a text field is using are its own, and none act mid-drag.
+        if (response.hovered() || !self.pen.is_empty())
+            && !ui.ctx().egui_wants_keyboard_input()
+            && self.drag.is_none()
+        {
             let (enter, delete) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),
@@ -472,7 +488,7 @@ impl TextureView {
                     message,
                 );
             }
-            if escape {
+            if escape && !cancelled {
                 if self.pen.is_empty() {
                     selection.shapes.clear();
                     selection.anchor = None;
@@ -508,6 +524,12 @@ impl TextureView {
         at: Placement,
         message: &mut Option<String>,
     ) -> Option<Drag> {
+        if matches!(tool, Tool::Brush | Tool::Ellipse | Tool::Rectangle)
+            && let Err(why) = drawable(editor.project(), r, selection)
+        {
+            *message = Some(why);
+            return None;
+        }
         match tool {
             Tool::Brush => Some(Drag::Brush(vec![p])),
             Tool::Ellipse | Tool::Rectangle => Some(Drag::Box {
@@ -535,6 +557,11 @@ impl TextureView {
         at: Placement,
         message: &mut Option<String>,
     ) {
+        if let Err(why) = drawable(editor.project(), r, selection) {
+            *message = Some(why);
+            self.pen.clear();
+            return;
+        }
         if self.pen.len() >= 2 && self.pen[0].point.distance(p) <= at.hit() {
             let anchors = std::mem::take(&mut self.pen);
             add_shape(
@@ -1038,6 +1065,15 @@ fn finish_drag(
     }
 }
 
+/// Whether new shapes can go on the selected layer, or why not.
+fn drawable(project: &Project, r: VariantRef, selection: &Selection) -> Result<(), String> {
+    match project.variant(r).layers().get(selection.layer) {
+        Some(l) if l.locked => Err(format!("{} is locked; unlock it to draw on it.", l.name)),
+        Some(l) if !l.visible => Err(format!("{} is hidden; show it to draw on it.", l.name)),
+        _ => Ok(()),
+    }
+}
+
 /// Adds a shape on top of the selected layer, creating a first layer if the
 /// variant has none, and picks it.
 pub fn add_shape(
@@ -1056,13 +1092,11 @@ pub fn add_shape(
             return;
         }
     };
-    let layers = editor.project().variant(r).layers();
-    if let Some(l) = layers.get(selection.layer)
-        && (l.locked || !l.visible)
-    {
-        *message = Some("The layer is locked or hidden.".into());
+    if let Err(why) = drawable(editor.project(), r, selection) {
+        *message = Some(why);
         return;
     }
+    let layers = editor.project().variant(r).layers();
     let layer = if layers.is_empty() {
         0
     } else {

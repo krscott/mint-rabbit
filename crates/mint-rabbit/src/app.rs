@@ -362,9 +362,9 @@ impl App {
             return;
         };
         let set = self.folder_set.trim();
-        let taken = [format!("{set}.c"), format!("{set}_draw_data.txt")]
+        let taken = mint_ac::TextureExport::folder_files(set, &dir)
             .iter()
-            .any(|f| dir.join(f).exists());
+            .any(|f| f.exists());
         if taken {
             self.confirm = Some(Confirm::OverwriteFolder(dir));
         } else {
@@ -471,7 +471,8 @@ impl App {
                 doc.redo();
             }
         });
-        // Undo, redo, and deletes can leave picks that no longer exist.
+        // Panel edits, such as deleting a layer or locking it, can leave
+        // picks that no longer apply.
         if let Some(r) = doc.variant() {
             doc.selection.fit(doc.editor.project(), r);
         }

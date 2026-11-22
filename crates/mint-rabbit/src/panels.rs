@@ -220,10 +220,11 @@ pub fn layers(
             .add_enabled(!locked, egui::Button::new("Delete"))
             .on_disabled_hover_text("The layer is locked")
             .clicked()
-        {
-            edit_variant(editor, r, message, |v| {
+            && edit_variant(editor, r, message, |v| {
                 v.remove_layer(i);
-            });
+            })
+            .is_some()
+        {
             *selection = Selection {
                 layer: i.saturating_sub(1),
                 ..Selection::default()

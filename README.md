@@ -28,8 +28,9 @@ them.
 - Pen: each click adds an anchor (drag to pull out handles), clicking the first
   anchor closes the path, Enter finishes it open, and Delete removes the last
   anchor.
-- Escape drops a drawing in progress. Scroll to zoom, middle-drag to pan, and
-  middle double-click to fit.
+- Escape drops a drawing in progress, puts shapes back during a transform, and
+  otherwise clears the picks. Backspace works like Delete. Scroll to zoom,
+  middle-drag to pan, and middle double-click to fit.
 - Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes, Ctrl+S saves, and Ctrl+D
   duplicates the picked shapes.
 
