@@ -400,6 +400,9 @@ impl TextureView {
             .map(|p| at.to_texture(p));
         let shift = ui.input(|i| i.modifiers.shift);
 
+        // A click ending a drag (egui can report both in one frame) is part
+        // of the drag, not a click.
+        let was_dragging = self.drag.is_some();
         // A drag, by the primary button only, starts where the button went
         // down.
         if response.drag_started_by(PointerButton::Primary)
@@ -408,16 +411,19 @@ impl TextureView {
                 .map(|p| at.to_texture(p))
         {
             // A canvas drag ends any other control's open edit and takes
-            // keyboard focus from it, so nothing typed mid-drag reaches it.
+            // keyboard focus from it and closes popups such as the color
+            // picker, so nothing typed mid-drag reaches them.
             editor.end_gesture();
             ui.memory_mut(|m| {
                 if let Some(id) = m.focused() {
                     m.surrender_focus(id);
                 }
             });
+            egui::Popup::close_all(ui.ctx());
             self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
             self.targets = (selection.layer, selection.shapes.clone());
         } else if response.clicked()
+            && !was_dragging
             && let Some(p) = pointer
         {
             match tool {
