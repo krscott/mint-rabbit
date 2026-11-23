@@ -3,11 +3,13 @@
 
 mod anim;
 mod c;
+mod disc;
 mod export;
 mod gbi;
 mod gx;
 mod import;
 
+pub use disc::NamesError;
 pub use export::{
     Export, ExportError, ImportedFrom, TextureExport, VILLAGER_JOINT_CHILDREN, export,
     export_textures, imported_from,

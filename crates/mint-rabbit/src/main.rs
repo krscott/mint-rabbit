@@ -4,6 +4,7 @@ mod app;
 mod camera;
 mod editor;
 mod panels;
+mod picker;
 mod render;
 mod scene;
 mod texture_view;
@@ -11,12 +12,16 @@ mod texture_view;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: mint-rabbit [--decomp PATH] [--game-version GAFE01_00] [--project DIR]";
+const USAGE: &str = "usage: mint-rabbit [--decomp PATH] [--game-version GAFE01_00] [--project DIR]
+
+--decomp defaults to the MINT_AC_DECOMP environment variable.";
 
 /// Parsed command line: options to run with, or `None` after `--help`.
 fn parse_args() -> Result<Option<app::Options>, String> {
     let mut options = app::Options {
-        decomp: None,
+        decomp: std::env::var_os("MINT_AC_DECOMP")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
         game_version: "GAFE01_00".into(),
         project: None,
     };

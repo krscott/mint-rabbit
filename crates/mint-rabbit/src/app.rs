@@ -13,6 +13,7 @@ use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
 use crate::camera::Orbit;
 use crate::editor::Editor;
 use crate::panels;
+use crate::picker::{self, Gpu, Picker};
 use crate::render::{ModelCallback, Renderer, SceneData};
 use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
 
@@ -131,7 +132,7 @@ enum Request {
 
 /// Where a replacing project comes from.
 enum Replace {
-    Import,
+    Import(VillagerRef),
     Open(PathBuf),
     /// Close the window.
     Quit,
@@ -140,9 +141,10 @@ enum Replace {
 pub struct App {
     decomp_path: String,
     version: String,
-    decomp: Option<Decomp>,
-    villagers: Vec<VillagerRef>,
-    villager: usize,
+    /// The open decomp, and its villagers to import.
+    picker: Option<Picker>,
+    /// The window's GPU, which also renders the picker's thumbnails.
+    gpu: Option<Gpu>,
     doc: Option<Doc>,
     /// Counts scene rebuilds, so the renderer uploads each new one.
     generation: u64,
@@ -170,6 +172,10 @@ impl App {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             Renderer::install(rs);
         }
+        let gpu = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|rs| (rs.device.clone(), rs.queue.clone()));
         // A press anywhere else, a drag included, leaves a text field, so
         // keys and edits go where the pointer went.
         cc.egui_ctx.options_mut(|o| {
@@ -182,9 +188,8 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             version: options.game_version,
-            decomp: None,
-            villagers: Vec::new(),
-            villager: 0,
+            picker: None,
+            gpu,
             doc: None,
             generation: 0,
             camera: Orbit::framing(Vec3::splat(-1.0), Vec3::ONE),
@@ -210,6 +215,7 @@ impl App {
         if let Some(dir) = options.project {
             app.open_project(&dir);
         }
+        app.offer_import();
         app
     }
 
@@ -224,18 +230,27 @@ impl App {
     fn open_decomp(&mut self) {
         self.status = None;
         let result = Decomp::open(self.decomp_path.trim(), self.version.trim())
-            .and_then(|d| d.villagers().map(|v| (d, v)));
+            .and_then(|d| Picker::new(d, self.gpu.clone()));
         match result {
-            Ok((d, v)) => {
-                self.decomp = Some(d);
-                self.villagers = v;
-                self.villager = 0;
-            }
+            Ok(picker) => self.picker = Some(picker),
             Err(e) => {
-                self.decomp = None;
-                self.villagers.clear();
+                self.picker = None;
                 self.fail(e.to_string());
             }
+        }
+    }
+
+    fn decomp(&self) -> Option<&Decomp> {
+        self.picker.as_ref().map(Picker::decomp)
+    }
+
+    /// Opens the picker when nothing is open yet, since importing is then
+    /// the next step.
+    fn offer_import(&mut self) {
+        if self.doc.is_none()
+            && let Some(picker) = &mut self.picker
+        {
+            picker.open();
         }
     }
 
@@ -266,7 +281,7 @@ impl App {
 
     fn do_replace(&mut self, replace: Replace, ctx: &egui::Context) {
         match replace {
-            Replace::Import => self.import(),
+            Replace::Import(v) => self.import(&v),
             Replace::Open(dir) => self.open_project(&dir),
             Replace::Quit => {
                 self.quitting = true;
@@ -275,14 +290,21 @@ impl App {
         }
     }
 
-    fn import(&mut self) {
+    fn import(&mut self, v: &VillagerRef) {
         self.status = None;
-        let (Some(decomp), Some(v)) = (&self.decomp, self.villagers.get(self.villager)) else {
+        let Some(decomp) = self.decomp() else {
             return;
         };
-        match decomp.import(v) {
-            Ok(project) => self.set_doc(project, None),
-            Err(e) => self.fail(e.to_string()),
+        // The scene is checked here and rebuilt for the open document.
+        match picker::import(decomp, v) {
+            Ok((project, _)) => {
+                self.set_doc(project, None);
+                if let Some(picker) = &mut self.picker {
+                    picker.imported(v);
+                }
+            }
+            // The picker stays open, to pick another.
+            Err(e) => self.fail(format!("Couldn't import {}: {e}", v.texture_set)),
         }
     }
 
@@ -336,7 +358,7 @@ impl App {
     /// Asks to replace the imported texture set's source in the decomp.
     fn export_in_place(&mut self) {
         self.status = None;
-        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
+        let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
         let project = doc.editor.project();
@@ -374,7 +396,7 @@ impl App {
 
     fn write_folder(&mut self, dir: &Path) {
         self.status = None;
-        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
+        let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
         let project = doc.editor.project();
@@ -432,20 +454,12 @@ impl App {
             let enter = path.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if ui.button("Open decomp").clicked() || enter {
                 self.open_decomp();
+                self.offer_import();
             }
-            if !self.villagers.is_empty() {
+            if let Some(picker) = &mut self.picker {
                 ui.separator();
-                let label = |v: &VillagerRef| format!("{} ({})", v.texture_set, v.model);
-                egui::ComboBox::from_id_salt("villager")
-                    .selected_text(label(&self.villagers[self.villager]))
-                    .height(400.0)
-                    .show_ui(ui, |ui| {
-                        for (i, v) in self.villagers.iter().enumerate() {
-                            ui.selectable_value(&mut self.villager, i, label(v));
-                        }
-                    });
-                if ui.button("Import").clicked() {
-                    self.replace(Replace::Import, ui.ctx());
+                if ui.button("Import…").clicked() {
+                    picker.open();
                 }
             }
         });
@@ -493,8 +507,9 @@ impl App {
                 }
                 None => {}
             }
-            let ready = matches!(doc.check, Some((_, Ok(())))) && self.decomp.is_some();
-            let why_not = if self.decomp.is_none() {
+            // The picker holds the open decomp.
+            let ready = matches!(doc.check, Some((_, Ok(())))) && self.picker.is_some();
+            let why_not = if self.picker.is_none() {
                 "Open the decomp this project came from"
             } else {
                 "Fix what the export check above reports"
@@ -783,14 +798,18 @@ impl App {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Discard(r)) => self.do_replace(r, ctx),
                 Some(Confirm::ReplaceInDecomp(export, _)) => {
-                    let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
+                    let result = self.decomp().map(|d| d.write_texture_set(&export));
                     match result {
-                        Some(Ok(path)) => {
-                            self.tell(format!(
+                        Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
+                            Ok(()) => self.tell(format!(
                                 "Wrote {}; build with `python configure.py --non-matching && ninja`",
                                 path.display()
-                            ));
-                        }
+                            )),
+                            Err(e) => self.fail(format!(
+                                "Wrote {}, but the import list couldn't be refreshed: {e}",
+                                path.display()
+                            )),
+                        },
                         Some(Err(e)) => self.fail(e.to_string()),
                         None => {}
                     }
@@ -869,6 +888,11 @@ impl eframe::App for App {
                 self.texture_view(ui);
             });
         });
+        if let Some(picker) = &mut self.picker
+            && let Some(v) = picker.show(&ctx)
+        {
+            self.replace(Replace::Import(v), &ctx);
+        }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
         self.confirm_dialog(&ctx);

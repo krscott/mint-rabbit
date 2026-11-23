@@ -13,8 +13,13 @@ mint-rabbit [--decomp PATH/TO/ac-decomp] [--game-version GAFE01_00] [--project D
 
 The decomp's villager assets must first be extracted from your own disc image
 in its `orig/` directory (`python configure.py && ninja pre-compile`, which
-`just run --decomp PATH` does for you). Pick a villager and press
-Import to see it in the Model View (left) and Texture View (right).
+`just run --decomp PATH` does for you). `--decomp` defaults to the
+`MINT_AC_DECOMP` environment variable.
+
+Press Import… to pick a villager by its thumbnail, in-game name, species, or
+texture set, and see it in the Model View (left) and Texture View (right).
+Names are read from the disc image in the decomp's `orig/<version>/`
+directory; without one, villagers show their texture set names.
 
 Paint in the Texture View with the tools in the Paint section: Select (V),
 Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on the picked
@@ -55,13 +60,19 @@ just format
 just check
 ```
 
+The decomp recipes take an ac-decomp checkout as PATH, which defaults to
+`MINT_AC_DECOMP`.
+
 - `just test-decomp-sources [PATH]` parses every model source and the
   villager table of a decomp checkout, built or not.
-- `just test-decomp PATH` also round-trips every villager (import, export,
-  import), saves and loads each as a project, and checks that each texture
-  export could replace its source in the decomp; it needs a built checkout.
-- `just snapshot [PATH]` renders the first villager of a decomp offscreen to
-  `target/model-view.png`; it needs a GPU.
+- `just test-decomp [PATH]` also round-trips every villager (import, export,
+  import), saves and loads each as a project, checks that each texture
+  export could replace its source in the decomp, and reads the villager names
+  from the disc image when there is an uncompressed one; it needs a built
+  checkout.
+- `just snapshot [PATH]` renders the first villager of a decomp (the demo
+  when neither is given) offscreen to `target/model-view.png`; it needs a
+  GPU.
 
 `just check` checks formatting, runs ShellCheck and Clippy, and validates the
 flake without rewriting source files. Formatting and shell checks cover tracked
