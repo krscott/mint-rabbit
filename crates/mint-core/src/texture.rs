@@ -135,19 +135,20 @@ impl IndexedImage {
             *p = f(*p);
         }
     }
+}
 
-    /// Sets each pixel whose center `shape` covers to its color.
-    fn paint(&mut self, shape: &Shape) {
-        let outline = shape.outline();
-        let (min, max) = outline.bounds();
-        // Pixels whose centers (x + 0.5) fall within the bounds.
-        let lo = |v: f32| (v - 0.5).ceil().max(0.0) as u32;
-        let hi = |v: f32, size: u32| ((v - 0.5).floor() + 1.0).clamp(0.0, size as f32) as u32;
-        for y in lo(min.y)..hi(max.y, self.size.y) {
-            for x in lo(min.x)..hi(max.x, self.size.x) {
-                if outline.covers(Vec2::new(x as f32 + 0.5, y as f32 + 0.5)) {
-                    self.pixels[(y * self.size.x + x) as usize] = shape.color();
-                }
+/// Calls `f` with the row-major index of each pixel of an image of `size`
+/// whose center `shape` covers.
+fn covered_pixels(shape: &Shape, size: UVec2, mut f: impl FnMut(usize)) {
+    let outline = shape.outline();
+    let (min, max) = outline.bounds();
+    // Pixels whose centers (x + 0.5) fall within the bounds.
+    let lo = |v: f32| (v - 0.5).ceil().max(0.0) as u32;
+    let hi = |v: f32, side: u32| ((v - 0.5).floor() + 1.0).clamp(0.0, side as f32) as u32;
+    for y in lo(min.y)..hi(max.y, size.y) {
+        for x in lo(min.x)..hi(max.x, size.x) {
+            if outline.covers(Vec2::new(x as f32 + 0.5, y as f32 + 0.5)) {
+                f((y * size.x + x) as usize);
             }
         }
     }
@@ -251,6 +252,18 @@ impl Layer {
         self.shapes.insert(to, shape);
     }
 
+    /// The palette entry each pixel of an image of `size` takes from this
+    /// layer's shapes, row-major: the topmost shape covering its center, or
+    /// `None` where none does. Visibility and opacity are not applied.
+    #[must_use]
+    pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
+        let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
+        for shape in &self.shapes {
+            covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
+        }
+        out
+    }
+
     pub fn insert_shape(&mut self, index: usize, shape: Shape) {
         self.shapes.insert(index, shape);
     }
@@ -304,9 +317,10 @@ impl Variant {
     #[must_use]
     pub fn rasterize(&self) -> IndexedImage {
         let mut image = self.underlay.clone();
+        let size = image.size;
         for layer in self.layers.iter().filter(|l| l.visible) {
             for shape in &layer.shapes {
-                image.paint(shape);
+                covered_pixels(shape, size, |i| image.pixels[i] = shape.color());
             }
         }
         image

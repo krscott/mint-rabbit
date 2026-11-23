@@ -3,7 +3,7 @@
 //! colors the target shows.
 
 use glam::{Mat3, Vec2, Vec3};
-use mint_core::{MaterialId, Project, Rgba8, Texture, TextureContent, TextureId};
+use mint_core::{MaterialId, PaletteIndex, Project, Rgba8, Texture, TextureContent, TextureId};
 
 /// Converts a palette color to what the export target displays.
 pub fn display_color(project: &Project, c: Rgba8) -> Rgba8 {
@@ -14,21 +14,61 @@ pub fn display_color(project: &Project, c: Rgba8) -> Rgba8 {
     }
 }
 
-/// The RGBA pixels of one variant (or the preview of an external texture).
+/// The RGBA pixels of one variant as the views show it, or the preview of an
+/// external texture: the export image, except that each layer blends over
+/// what is below it at its display opacity.
 pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> Vec<Rgba8> {
     match texture.content() {
         TextureContent::External { preview } => preview.pixels.clone(),
         TextureContent::Painted(variants) => {
-            let colors = project.palette().colors();
-            variants[variant]
-                .rasterize()
-                .pixels()
-                .iter()
-                // Projects guarantee every pixel names a palette entry.
-                .map(|&i| display_color(project, colors[usize::from(i.0)]))
-                .collect()
+            let v = &variants[variant];
+            // Projects guarantee every pixel and shape names a palette entry.
+            let color = |i: PaletteIndex| {
+                display_color(project, project.palette().colors()[usize::from(i.0)])
+            };
+            let mut out: Vec<Rgba8> = v.underlay().pixels().iter().map(|&i| color(i)).collect();
+            for layer in v.layers().iter().filter(|l| l.visible) {
+                let opacity = if layer.opacity.is_nan() {
+                    1.0
+                } else {
+                    layer.opacity.clamp(0.0, 1.0)
+                };
+                for (px, c) in out.iter_mut().zip(layer.coverage(texture.size())) {
+                    if let Some(c) = c {
+                        *px = blend(*px, color(c), opacity);
+                    }
+                }
+            }
+            out
         }
     }
+}
+
+/// `over` drawn on `under` at `opacity`, mixing premultiplied colors so a
+/// transparent pixel's color doesn't tint what fades in over it.
+fn blend(under: Rgba8, over: Rgba8, opacity: f32) -> Rgba8 {
+    if opacity >= 1.0 {
+        return over;
+    }
+    let premultiplied = |c: Rgba8| {
+        let a = f32::from(c.a) / 255.0;
+        [
+            f32::from(c.r) * a,
+            f32::from(c.g) * a,
+            f32::from(c.b) * a,
+            f32::from(c.a),
+        ]
+    };
+    let (u, o) = (premultiplied(under), premultiplied(over));
+    let [r, g, b, a]: [f32; 4] = std::array::from_fn(|i| u[i] + (o[i] - u[i]) * opacity);
+    let straight = |v: f32| {
+        if a > 0.0 {
+            (v * 255.0 / a).round() as u8
+        } else {
+            0
+        }
+    };
+    Rgba8::new(straight(r), straight(g), straight(b), a.round() as u8)
 }
 
 #[repr(C)]
