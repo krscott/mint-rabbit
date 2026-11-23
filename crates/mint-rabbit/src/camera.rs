@@ -25,18 +25,17 @@ impl Orbit {
     }
 
     /// A camera from the same side as [`Orbit::framing`], as close as it can
-    /// be while `points` fit in a square view with a small margin.
-    pub fn portrait(points: &[Vec3]) -> Self {
-        let min = points.iter().copied().fold(Vec3::INFINITY, Vec3::min);
-        let max = points.iter().copied().fold(Vec3::NEG_INFINITY, Vec3::max);
+    /// be while `points`, which lie between `min` and `max`, fit in a square
+    /// view with a small margin.
+    pub fn portrait(min: Vec3, max: Vec3, points: impl IntoIterator<Item = Vec3>) -> Self {
         let mut camera = Self::framing(min, max);
         let back = camera.direction();
         let right = (-back).cross(Vec3::Y).normalize();
         let up = right.cross(-back);
         let slope = (FOV_Y * 0.5).tan() / 1.08;
         camera.distance = points
-            .iter()
-            .map(|&p| {
+            .into_iter()
+            .map(|p| {
                 let p = p - camera.target;
                 let side = p.dot(right).abs().max(p.dot(up).abs());
                 p.dot(back) + side / slope

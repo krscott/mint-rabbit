@@ -51,14 +51,7 @@ pub(crate) fn villager_names(dir: &Path) -> Result<Vec<String>, NamesError> {
         path: path.clone(),
         problem: format!("{NAME_ARCHIVE}/{NAME_TABLE}: {p}"),
     };
-    if table.len() != VILLAGER_COUNT * NAME_LEN {
-        return Err(in_table(format!(
-            "it is {} bytes, but {VILLAGER_COUNT} villagers' names take {}",
-            table.len(),
-            VILLAGER_COUNT * NAME_LEN
-        )));
-    }
-    decode_names(table).map_err(in_table)
+    decode_names(table, VILLAGER_COUNT).map_err(in_table)
 }
 
 fn find_disc(dir: &Path) -> Result<PathBuf, NamesError> {
@@ -245,12 +238,14 @@ fn ascii_compatible(b: u8) -> bool {
     )
 }
 
-/// Splits a name table into names, trimming their space padding.
-fn decode_names(table: &[u8]) -> Result<Vec<String>, String> {
-    if !table.len().is_multiple_of(NAME_LEN) {
+/// Splits a name table of `count` names, trimming their space padding,
+/// and checking its size before decoding anything.
+fn decode_names(table: &[u8], count: usize) -> Result<Vec<String>, String> {
+    if table.len() != count * NAME_LEN {
         return Err(format!(
-            "its size, {}, is not a multiple of {NAME_LEN}",
-            table.len()
+            "it is {} bytes, but {count} names take {}",
+            table.len(),
+            count * NAME_LEN
         ));
     }
     table
@@ -275,7 +270,7 @@ mod tests {
     #[test]
     fn names_trim_padding() {
         assert_eq!(
-            decode_names(b"Bob     O'Hare  T-Bone  ").unwrap(),
+            decode_names(b"Bob     O'Hare  T-Bone  ", 3).unwrap(),
             ["Bob", "O'Hare", "T-Bone"]
         );
     }
@@ -283,9 +278,10 @@ mod tests {
     #[test]
     fn names_refuse_font_only_codes() {
         // 0x23 is an accented letter in the game's font, not '#'.
-        let e = decode_names(b"Bo#     ").unwrap_err();
+        let e = decode_names(b"Bo#     ", 1).unwrap_err();
         assert!(e.contains("0x23"), "{e}");
-        assert!(decode_names(b"Bob").is_err());
+        assert!(decode_names(b"Bob", 1).is_err());
+        assert!(decode_names(b"Bob     ", 2).is_err());
     }
 
     /// A RARC archive holding the files `files`.

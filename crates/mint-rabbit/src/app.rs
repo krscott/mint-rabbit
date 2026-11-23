@@ -13,7 +13,7 @@ use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
 use crate::camera::Orbit;
 use crate::editor::Editor;
 use crate::panels;
-use crate::picker::{Gpu, Picker};
+use crate::picker::{self, Gpu, Picker};
 use crate::render::{ModelCallback, Renderer, SceneData};
 use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
 
@@ -141,8 +141,7 @@ enum Replace {
 pub struct App {
     decomp_path: String,
     version: String,
-    decomp: Option<Decomp>,
-    /// Lists the open decomp's villagers to import.
+    /// The open decomp, and its villagers to import.
     picker: Option<Picker>,
     /// The window's GPU, which also renders the picker's thumbnails.
     gpu: Option<Gpu>,
@@ -189,7 +188,6 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             version: options.game_version,
-            decomp: None,
             picker: None,
             gpu,
             doc: None,
@@ -232,18 +230,18 @@ impl App {
     fn open_decomp(&mut self) {
         self.status = None;
         let result = Decomp::open(self.decomp_path.trim(), self.version.trim())
-            .and_then(|d| d.villagers().map(|v| (d, v)));
+            .and_then(|d| Picker::new(d, self.gpu.clone()));
         match result {
-            Ok((d, v)) => {
-                self.picker = Some(Picker::new(d.clone(), v, self.gpu.clone()));
-                self.decomp = Some(d);
-            }
+            Ok(picker) => self.picker = Some(picker),
             Err(e) => {
-                self.decomp = None;
                 self.picker = None;
                 self.fail(e.to_string());
             }
         }
+    }
+
+    fn decomp(&self) -> Option<&Decomp> {
+        self.picker.as_ref().map(Picker::decomp)
     }
 
     /// Opens the picker when nothing is open yet, since importing is then
@@ -254,15 +252,6 @@ impl App {
         {
             picker.open();
         }
-    }
-
-    /// Lists the decomp's villagers again, so thumbnails show what it holds
-    /// now.
-    fn reload_picker(&mut self) -> Result<(), mint_ac::ImportError> {
-        if let (Some(decomp), Some(picker)) = (&self.decomp, &mut self.picker) {
-            picker.reload(decomp.villagers()?);
-        }
-        Ok(())
     }
 
     fn set_doc(&mut self, project: Project, path: Option<PathBuf>) {
@@ -303,10 +292,10 @@ impl App {
 
     fn import(&mut self, v: &VillagerRef) {
         self.status = None;
-        let Some(decomp) = &self.decomp else {
+        let Some(decomp) = self.decomp() else {
             return;
         };
-        match decomp.import(v) {
+        match picker::import(decomp, v) {
             Ok(project) => {
                 self.set_doc(project, None);
                 if let Some(picker) = &mut self.picker {
@@ -314,7 +303,7 @@ impl App {
                 }
             }
             // The picker stays open, to pick another.
-            Err(e) => self.fail(e.to_string()),
+            Err(e) => self.fail(e),
         }
     }
 
@@ -368,7 +357,7 @@ impl App {
     /// Asks to replace the imported texture set's source in the decomp.
     fn export_in_place(&mut self) {
         self.status = None;
-        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
+        let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
         let project = doc.editor.project();
@@ -406,7 +395,7 @@ impl App {
 
     fn write_folder(&mut self, dir: &Path) {
         self.status = None;
-        let (Some(doc), Some(decomp)) = (&self.doc, &self.decomp) else {
+        let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
         let project = doc.editor.project();
@@ -517,8 +506,8 @@ impl App {
                 }
                 None => {}
             }
-            let ready = matches!(doc.check, Some((_, Ok(())))) && self.decomp.is_some();
-            let why_not = if self.decomp.is_none() {
+            let ready = matches!(doc.check, Some((_, Ok(())))) && self.picker.is_some();
+            let why_not = if self.picker.is_none() {
                 "Open the decomp this project came from"
             } else {
                 "Fix what the export check above reports"
@@ -807,9 +796,9 @@ impl App {
             Some(true) => match self.confirm.take() {
                 Some(Confirm::Discard(r)) => self.do_replace(r, ctx),
                 Some(Confirm::ReplaceInDecomp(export, _)) => {
-                    let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
+                    let result = self.decomp().map(|d| d.write_texture_set(&export));
                     match result {
-                        Some(Ok(path)) => match self.reload_picker() {
+                        Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
                             Ok(()) => self.tell(format!(
                                 "Wrote {}; build with `python configure.py --non-matching && ninja`",
                                 path.display()

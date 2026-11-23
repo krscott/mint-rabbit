@@ -1,16 +1,17 @@
 //! The import picker: a window of villager tiles, each with a rendered
-//! thumbnail, the villager's in-game name, and its species, grouped by
-//! species and filtered by a search.
+//! thumbnail, the villager's in-game name, and its texture set, grouped by
+//! species and filtered by a search. It holds the open decomp.
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, vec2};
 use eframe::egui_wgpu::wgpu;
 use glam::Vec3;
-use mint_ac::{Decomp, VillagerRef};
+use mint_ac::{Decomp, ImportError, VillagerRef};
+use mint_core::Project;
 
 use crate::camera::Orbit;
 use crate::render::{Offscreen, SceneData};
@@ -51,7 +52,7 @@ pub type Gpu = (wgpu::Device, wgpu::Queue);
 /// Progress of the thumbnail thread.
 enum Rendering {
     NotStarted,
-    Running(Receiver<Message>, JoinHandle<()>),
+    Running(Receiver<Message>),
     Done,
 }
 
@@ -77,7 +78,8 @@ pub struct Picker {
     others: Vec<usize>,
     entries: Vec<Entry>,
     thumbs: Vec<Thumb>,
-    /// Why names or islanders are missing, shown above the tiles.
+    /// Why names, islanders, or thumbnails are missing, shown above the
+    /// tiles.
     notes: Vec<String>,
     rendering: Rendering,
 }
@@ -86,7 +88,8 @@ impl Picker {
     /// Lists the villager table of `decomp`, naming entries from its disc
     /// image when it can be read. Thumbnails render with `gpu` once the
     /// picker first opens.
-    pub fn new(decomp: Decomp, villagers: Vec<VillagerRef>, gpu: Option<Gpu>) -> Self {
+    pub fn new(decomp: Decomp, gpu: Option<Gpu>) -> Result<Self, ImportError> {
+        let villagers = decomp.villagers()?;
         let mut notes = Vec::new();
         let names = decomp.villager_names().unwrap_or_else(|e| {
             notes.push(format!("No in-game names: {e}"));
@@ -134,7 +137,7 @@ impl Picker {
                 others.push(i);
             }
         }
-        Self {
+        Ok(Self {
             decomp,
             gpu,
             open: false,
@@ -146,7 +149,11 @@ impl Picker {
             entries,
             notes,
             rendering: Rendering::NotStarted,
-        }
+        })
+    }
+
+    pub fn decomp(&self) -> &Decomp {
+        &self.decomp
     }
 
     pub fn open(&mut self) {
@@ -158,13 +165,14 @@ impl Picker {
         self.open = false;
     }
 
-    /// Lists `villagers` again, from the same decomp, keeping the window
-    /// and search as they are.
-    pub fn reload(&mut self, villagers: Vec<VillagerRef>) {
-        let mut new = Self::new(self.decomp.clone(), villagers, self.gpu.clone());
+    /// Lists the decomp's villagers again, so thumbnails show what it holds
+    /// now, keeping the window and search as they are.
+    pub fn reload(&mut self) -> Result<(), ImportError> {
+        let mut new = Self::new(self.decomp.clone(), self.gpu.clone())?;
         new.open = self.open;
         new.search = std::mem::take(&mut self.search);
         *self = new;
+        Ok(())
     }
 
     /// Entries in the order shown: villagers by species, then the others.
@@ -189,15 +197,9 @@ impl Picker {
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("thumbnails".into())
-            .spawn(move || {
-                let reporter = Reporter {
-                    sender: Some(sender),
-                    ctx,
-                };
-                render_thumbnails(&decomp, &order, gpu, &reporter);
-            });
+            .spawn(move || render_thumbnails(&decomp, &order, gpu, &sender, &ctx));
         match spawned {
-            Ok(thread) => self.rendering = Rendering::Running(receiver, thread),
+            Ok(_) => self.rendering = Rendering::Running(receiver),
             Err(e) => self.stop_rendering(&format!("couldn't start rendering: {e}")),
         }
     }
@@ -215,7 +217,7 @@ impl Picker {
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
-        let Rendering::Running(receiver, _) = &self.rendering else {
+        let Rendering::Running(receiver) = &self.rendering else {
             return;
         };
         loop {
@@ -223,28 +225,11 @@ impl Picker {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    let Rendering::Running(_, thread) =
-                        std::mem::replace(&mut self.rendering, Rendering::Done)
-                    else {
-                        unreachable!("rendering was running");
-                    };
-                    // The thread sends every entry before it ends, unless
-                    // it panicked on the next one.
-                    if let Err(panic) = thread.join() {
-                        let why = panic
-                            .downcast_ref::<&str>()
-                            .map(|s| (*s).to_owned())
-                            .or_else(|| panic.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown error".into());
-                        let why = format!("importing crashed: {why}");
-                        let next = self
-                            .shown_order()
-                            .find(|&i| matches!(self.thumbs[i], Thumb::Pending));
-                        if let Some(i) = next {
-                            self.thumbs[i] = Thumb::Failed(why.clone());
-                        }
-                        self.stop_rendering(&why);
+                    // The thread reports every entry before it ends.
+                    if self.thumbs.iter().any(|t| matches!(t, Thumb::Pending)) {
+                        self.stop_rendering("the thumbnail thread stopped");
                     }
+                    self.rendering = Rendering::Done;
                     return;
                 }
             };
@@ -262,7 +247,8 @@ impl Picker {
     }
 
     /// Shows the window while it is open, and returns the entry clicked.
-    /// The window stays open until [`Picker::close`].
+    /// A click leaves the window open; the caller closes it once the entry
+    /// imports.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<VillagerRef> {
         if !self.open {
             return None;
@@ -363,7 +349,8 @@ impl Picker {
                     continue;
                 }
                 let visuals = ui.style().interact(&response);
-                let painter = ui.painter();
+                // Long text stays within its tile.
+                let painter = ui.painter_at(rect);
                 if response.hovered() {
                     painter.rect_filled(rect, 4.0, visuals.bg_fill);
                 }
@@ -427,75 +414,73 @@ impl Picker {
     }
 }
 
-/// Imports and renders each entry in `order`, sending each result until
-/// the picker is dropped. After a render fails, it only imports.
+/// Imports villager `v` from `decomp`, reporting a panic in the importer
+/// as an error instead of ending the app.
+pub fn import(decomp: &Decomp, v: &VillagerRef) -> Result<Project, String> {
+    catching("importing", || decomp.import(v))?.map_err(|e| e.to_string())
+}
+
+/// Runs `f`, turning a panic into an error that says what was `doing`.
+fn catching<T>(doing: &str, f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|panic| {
+        let why = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".into());
+        format!("{doing} crashed: {why}")
+    })
+}
+
+/// Imports and renders each entry in `order`, reporting each one until the
+/// picker is dropped. After rendering fails, it only imports.
 fn render_thumbnails(
     decomp: &Decomp,
     order: &[(usize, VillagerRef)],
     gpu: Option<Gpu>,
-    reporter: &Reporter,
+    sender: &Sender<Message>,
+    ctx: &egui::Context,
 ) {
-    let mut offscreen = gpu.map(|(device, queue)| Offscreen::new(device, queue, THUMB_PIXELS));
-    if offscreen.is_none() {
-        reporter.send(Message::NoRender("no GPU to render with".into()));
-    }
+    let send = |message| {
+        let sent = sender.send(message).is_ok();
+        ctx.request_repaint();
+        sent
+    };
+    let started = gpu
+        .ok_or_else(|| "no GPU to render with".to_owned())
+        .and_then(|(device, queue)| {
+            catching("rendering", || Offscreen::new(device, queue, THUMB_PIXELS))
+        });
+    let mut offscreen = started.map_err(|e| send(Message::NoRender(e))).ok();
     for (i, villager) in order {
-        let result = decomp.import(villager).map_err(|e| e.to_string());
-        let result = result.map(|project| {
+        let result = import(decomp, villager).map(|project| {
             let o = offscreen.as_mut()?;
-            let scene = Arc::new(SceneData::new(
-                &project,
-                &vec![0; project.textures().len()],
-                0,
-            ));
-            let points: Vec<Vec3> = scene
-                .mesh
-                .vertices
-                .iter()
-                .map(|v| Vec3::from(v.position))
-                .collect();
-            let camera = Orbit::portrait(&points);
-            match o.render(scene, camera.view_proj(1.0)) {
+            let rendered = catching("rendering", || {
+                let scene = Arc::new(SceneData::new(
+                    &project,
+                    &vec![0; project.textures().len()],
+                    0,
+                ));
+                let mesh = &scene.mesh;
+                let points = mesh.vertices.iter().map(|v| Vec3::from(v.position));
+                let camera = Orbit::portrait(mesh.bounds_min, mesh.bounds_max, points);
+                o.render(scene.clone(), camera.view_proj(1.0))
+            })
+            .and_then(|r| r);
+            match rendered {
                 Ok(pixels) => {
                     let size = THUMB_PIXELS as usize;
                     Some(ColorImage::from_rgba_unmultiplied([size, size], &pixels))
                 }
                 Err(e) => {
                     offscreen = None;
-                    reporter.send(Message::NoRender(e));
+                    send(Message::NoRender(e));
                     None
                 }
             }
         });
-        if !reporter.send(Message::Thumb(*i, result)) {
+        if !send(Message::Thumb(*i, result)) {
             return;
         }
-    }
-}
-
-/// Sends the thumbnail thread's messages to the picker, waking the UI for
-/// each. When the thread ends, however it ends, it closes the channel and
-/// wakes the UI once more, so the picker sees the end.
-struct Reporter {
-    sender: Option<Sender<Message>>,
-    ctx: egui::Context,
-}
-
-impl Reporter {
-    /// Whether the picker is still there to receive it.
-    fn send(&self, message: Message) -> bool {
-        let sent = self
-            .sender
-            .as_ref()
-            .is_some_and(|s| s.send(message).is_ok());
-        self.ctx.request_repaint();
-        sent
-    }
-}
-
-impl Drop for Reporter {
-    fn drop(&mut self) {
-        self.sender = None;
-        self.ctx.request_repaint();
     }
 }
