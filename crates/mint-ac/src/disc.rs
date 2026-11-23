@@ -14,6 +14,9 @@ const NAME_ARCHIVE: &str = "forest_2nd.arc";
 const NAME_TABLE: &str = "npc_name_str_table.bin";
 /// Bytes per name record, padded with spaces.
 const NAME_LEN: usize = 8;
+/// The most a read from the disc may take; the files names need are a few
+/// MiB.
+const MAX_READ: u32 = 64 << 20;
 /// Other disc image formats the decomp builds from.
 const COMPRESSED_DISCS: [&str; 5] = ["rvz", "wia", "wbfs", "ciso", "gcz"];
 
@@ -135,6 +138,11 @@ impl Disc {
 
     fn read(&mut self, offset: u32, len: u32) -> Result<Vec<u8>, NamesError> {
         // Checked first, so a bad size never allocates.
+        if len > MAX_READ {
+            return Err(self.malformed(format!(
+                "asks for {len} bytes at {offset:#x}, more than any file names are read from"
+            )));
+        }
         if u64::from(offset) + u64::from(len) > self.len {
             return Err(self.malformed(format!(
                 "ends before {len} bytes at {offset:#x}; is this an uncompressed GameCube disc image?"

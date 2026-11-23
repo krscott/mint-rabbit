@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, vec2};
 use eframe::egui_wgpu::wgpu;
+use glam::Vec3;
 use mint_ac::{Decomp, VillagerRef};
 
 use crate::camera::Orbit;
@@ -39,7 +40,7 @@ enum Thumb {
     Pending,
     /// Imported, with a thumbnail unless rendering failed.
     Ready(Option<TextureHandle>),
-    /// Why the entry can't be imported.
+    /// Why importing the entry failed.
     Failed(String),
 }
 
@@ -234,7 +235,7 @@ impl Picker {
             .open(&mut open)
             .default_size([760.0, 560.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                let searched = ui.horizontal(|ui| {
                     ui.label("Search");
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
@@ -244,6 +245,7 @@ impl Picker {
                     if std::mem::take(&mut self.focus_search) {
                         field.request_focus();
                     }
+                    field.changed()
                 });
                 for note in &self.notes {
                     ui.colored_label(Color32::from_rgb(255, 170, 90), note);
@@ -251,31 +253,30 @@ impl Picker {
                 ui.separator();
                 let search = self.search.trim().to_lowercase();
                 let matches = |i: &usize| self.entries[*i].haystack.contains(&search);
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let mut any = false;
-                        for (species, list) in &self.groups {
-                            let shown: Vec<usize> = list.iter().copied().filter(matches).collect();
-                            if shown.is_empty() {
-                                continue;
-                            }
-                            any = true;
-                            ui.strong(*species);
-                            if let Some(v) = self.tiles(ui, &shown) {
-                                picked = Some(v);
-                            }
-                            ui.add_space(6.0);
+                let mut results = egui::ScrollArea::vertical().auto_shrink(false);
+                // New results start from their top.
+                if searched.inner {
+                    results = results.vertical_scroll_offset(0.0);
+                }
+                results.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let mut any = false;
+                    for (species, list) in &self.groups {
+                        let shown: Vec<usize> = list.iter().copied().filter(matches).collect();
+                        if shown.is_empty() {
+                            continue;
                         }
-                        let others: Vec<usize> =
-                            self.others.iter().copied().filter(matches).collect();
-                        if !others.is_empty() {
-                            any = true;
-                            egui::CollapsingHeader::new(format!(
-                                "Other entries ({})",
-                                others.len()
-                            ))
+                        any = true;
+                        ui.strong(*species);
+                        if let Some(v) = self.tiles(ui, &shown) {
+                            picked = Some(v);
+                        }
+                        ui.add_space(6.0);
+                    }
+                    let others: Vec<usize> = self.others.iter().copied().filter(matches).collect();
+                    if !others.is_empty() {
+                        any = true;
+                        egui::CollapsingHeader::new(format!("Other entries ({})", others.len()))
                             .id_salt("other entries")
                             // Search results don't hide behind the header.
                             .open((!search.is_empty()).then_some(true))
@@ -285,11 +286,11 @@ impl Picker {
                                     picked = Some(v);
                                 }
                             });
-                        }
-                        if !any {
-                            ui.label("Nothing matches the search.");
-                        }
-                    });
+                    }
+                    if !any {
+                        ui.label("Nothing matches the search.");
+                    }
+                });
             });
         self.open = open;
         picked
@@ -307,7 +308,7 @@ impl Picker {
                 let (rect, response) =
                     ui.allocate_exact_size(vec2(TILE_WIDTH, TILE_HEIGHT), Sense::click());
                 let response = match thumb {
-                    Thumb::Failed(e) => response.on_hover_text(format!("Can't import: {e}")),
+                    Thumb::Failed(e) => response.on_hover_text(format!("Failed to import: {e}")),
                     _ => response.on_hover_text(&entry.hover),
                 };
                 if !ui.is_rect_visible(rect) {
@@ -315,7 +316,7 @@ impl Picker {
                 }
                 let visuals = ui.style().interact(&response);
                 let painter = ui.painter();
-                if response.hovered() && !failed {
+                if response.hovered() {
                     painter.rect_filled(rect, 4.0, visuals.bg_fill);
                 }
                 let image_rect = egui::Rect::from_min_size(
@@ -368,7 +369,8 @@ impl Picker {
                     11.0,
                     ui.visuals().weak_text_color(),
                 );
-                if response.clicked() && !failed {
+                // A failed entry may import now, and says why if not.
+                if response.clicked() {
                     picked = Some(entry.villager.clone());
                 }
             }
@@ -399,7 +401,9 @@ fn render_thumbnails(
                 &vec![0; project.textures().len()],
                 0,
             ));
-            let camera = Orbit::portrait(scene.mesh.bounds_min, scene.mesh.bounds_max);
+            let mesh = &scene.mesh;
+            let points = mesh.vertices.iter().map(|v| Vec3::from(v.position));
+            let camera = Orbit::portrait(mesh.bounds_min, mesh.bounds_max, points);
             match o.render(scene, camera.view_proj(1.0)) {
                 Ok(pixels) => {
                     let size = THUMB_PIXELS as usize;

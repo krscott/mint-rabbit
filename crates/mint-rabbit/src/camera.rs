@@ -2,6 +2,9 @@
 
 use glam::{Mat4, Vec3};
 
+/// Vertical field of view, in radians.
+const FOV_Y: f32 = 0.7;
+
 pub struct Orbit {
     pub yaw: f32,
     pub pitch: f32,
@@ -21,29 +24,45 @@ impl Orbit {
         }
     }
 
-    /// A camera that frames the box from `min` to `max` closely, from
-    /// slightly to the side of the front.
-    pub fn portrait(min: Vec3, max: Vec3) -> Self {
-        let radius = ((max - min).length() * 0.5).max(1.0);
-        Self {
+    /// A camera, from slightly to the side of the front, as close as it
+    /// can be while `points`, which lie between `min` and `max`, fit in a
+    /// square view with a small margin.
+    pub fn portrait(min: Vec3, max: Vec3, points: impl Iterator<Item = Vec3>) -> Self {
+        let mut camera = Self {
             yaw: 0.3,
             pitch: 0.15,
-            distance: radius * 2.1,
+            distance: 0.0,
             target: (min + max) * 0.5,
-        }
+        };
+        let back = camera.direction();
+        let right = (-back).cross(Vec3::Y).normalize();
+        let up = right.cross(-back);
+        let slope = (FOV_Y * 0.5).tan() / 1.08;
+        camera.distance = points
+            .map(|p| {
+                let p = p - camera.target;
+                let side = p.dot(right).abs().max(p.dot(up).abs());
+                p.dot(back) + side / slope
+            })
+            .fold(1.0, f32::max);
+        camera
     }
 
-    pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let dir = Vec3::new(
+    /// From the target toward the eye.
+    fn direction(&self) -> Vec3 {
+        Vec3::new(
             self.yaw.sin() * self.pitch.cos(),
             self.pitch.sin(),
             self.yaw.cos() * self.pitch.cos(),
-        );
-        let eye = self.target + dir * self.distance;
+        )
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        let eye = self.target + self.direction() * self.distance;
         let view = glam::camera::rh::view::look_at_mat4(eye, self.target, Vec3::Y);
         // wgpu clip space matches the DirectX convention: depth 0..1.
         let proj = glam::camera::rh::proj::directx::perspective(
-            0.7,
+            FOV_Y,
             aspect,
             self.distance * 0.01,
             self.distance * 10.0,
