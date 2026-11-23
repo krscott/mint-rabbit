@@ -352,7 +352,10 @@ mod tests {
         let root = PathBuf::from(std::env::var("MINT_AC_DECOMP").expect("MINT_AC_DECOMP"));
         let names = match villager_names(&root.join("orig/GAFE01_00")) {
             Err(e @ NamesError::Compressed(_)) => {
-                eprintln!("skipped: {e}");
+                // Straight to stderr: the test harness hides a passing
+                // test's eprintln! output.
+                use std::io::Write as _;
+                writeln!(std::io::stderr(), "disc_names_read skipped: {e}").unwrap();
                 return;
             }
             names => names.unwrap(),
