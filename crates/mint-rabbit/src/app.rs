@@ -295,15 +295,16 @@ impl App {
         let Some(decomp) = self.decomp() else {
             return;
         };
+        // The scene is checked here and rebuilt for the open document.
         match picker::import(decomp, v) {
-            Ok(project) => {
+            Ok((project, _)) => {
                 self.set_doc(project, None);
                 if let Some(picker) = &mut self.picker {
                     picker.imported(v);
                 }
             }
             // The picker stays open, to pick another.
-            Err(e) => self.fail(e),
+            Err(e) => self.fail(format!("Couldn't import {}: {e}", v.texture_set)),
         }
     }
 

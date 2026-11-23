@@ -430,10 +430,16 @@ impl Picker {
     }
 }
 
-/// Imports villager `v` from `decomp`, reporting a panic in the importer
-/// as an error instead of ending the app.
-pub fn import(decomp: &Decomp, v: &VillagerRef) -> Result<Project, String> {
-    catching(|| decomp.import(v))?.map_err(|e| e.to_string())
+/// Imports villager `v` from `decomp` and builds its scene as the Model
+/// View first shows it. Failures, panics included, become errors, so an
+/// entry that can't be shown never ends the app.
+pub fn import(decomp: &Decomp, v: &VillagerRef) -> Result<(Project, Arc<SceneData>), String> {
+    catching(|| {
+        let project = decomp.import(v).map_err(|e| e.to_string())?;
+        let variants = vec![0; project.textures().len()];
+        let scene = Arc::new(SceneData::new(&project, &variants, 0));
+        Ok((project, scene))
+    })?
 }
 
 /// Runs `f`, turning a panic into an error.
@@ -474,19 +480,14 @@ fn render_thumbnails(
     };
     for (i, villager) in order {
         // What depends only on the entry: a failure here marks just its tile.
-        let staged = import(decomp, villager).and_then(|project| {
-            catching(|| {
-                let scene = Arc::new(SceneData::new(
-                    &project,
-                    &vec![0; project.textures().len()],
-                    0,
-                ));
+        let staged = import(decomp, villager).and_then(|(_, scene)| {
+            let view_proj = catching(|| {
                 let mesh = &scene.mesh;
                 let points = mesh.vertices.iter().map(|v| Vec3::from(v.position));
                 let camera = Orbit::portrait(mesh.bounds_min, mesh.bounds_max, points);
-                let view_proj = camera.view_proj(1.0);
-                (scene, view_proj)
-            })
+                camera.view_proj(1.0)
+            })?;
+            Ok((scene, view_proj))
         });
         // A GPU failure stops thumbnails for every entry.
         let result = staged.map(|(scene, view_proj)| {
