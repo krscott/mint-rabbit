@@ -189,7 +189,13 @@ impl Picker {
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("thumbnails".into())
-            .spawn(move || render_thumbnails(&decomp, &order, gpu, &sender, &ctx));
+            .spawn(move || {
+                let reporter = Reporter {
+                    sender: Some(sender),
+                    ctx,
+                };
+                render_thumbnails(&decomp, &order, gpu, &reporter);
+            });
         match spawned {
             Ok(thread) => self.rendering = Rendering::Running(receiver, thread),
             Err(e) => self.stop_rendering(&format!("couldn't start rendering: {e}")),
@@ -427,12 +433,11 @@ fn render_thumbnails(
     decomp: &Decomp,
     order: &[(usize, VillagerRef)],
     gpu: Option<Gpu>,
-    sender: &Sender<Message>,
-    ctx: &egui::Context,
+    reporter: &Reporter,
 ) {
     let mut offscreen = gpu.map(|(device, queue)| Offscreen::new(device, queue, THUMB_PIXELS));
     if offscreen.is_none() {
-        let _ = sender.send(Message::NoRender("no GPU to render with".into()));
+        reporter.send(Message::NoRender("no GPU to render with".into()));
     }
     for (i, villager) in order {
         let result = decomp.import(villager).map_err(|e| e.to_string());
@@ -457,14 +462,40 @@ fn render_thumbnails(
                 }
                 Err(e) => {
                     offscreen = None;
-                    let _ = sender.send(Message::NoRender(e));
+                    reporter.send(Message::NoRender(e));
                     None
                 }
             }
         });
-        if sender.send(Message::Thumb(*i, result)).is_err() {
+        if !reporter.send(Message::Thumb(*i, result)) {
             return;
         }
-        ctx.request_repaint();
+    }
+}
+
+/// Sends the thumbnail thread's messages to the picker, waking the UI for
+/// each. When the thread ends, however it ends, it closes the channel and
+/// wakes the UI once more, so the picker sees the end.
+struct Reporter {
+    sender: Option<Sender<Message>>,
+    ctx: egui::Context,
+}
+
+impl Reporter {
+    /// Whether the picker is still there to receive it.
+    fn send(&self, message: Message) -> bool {
+        let sent = self
+            .sender
+            .as_ref()
+            .is_some_and(|s| s.send(message).is_ok());
+        self.ctx.request_repaint();
+        sent
+    }
+}
+
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        self.sender = None;
+        self.ctx.request_repaint();
     }
 }

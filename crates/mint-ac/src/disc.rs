@@ -51,14 +51,14 @@ pub(crate) fn villager_names(dir: &Path) -> Result<Vec<String>, NamesError> {
         path: path.clone(),
         problem: format!("{NAME_ARCHIVE}/{NAME_TABLE}: {p}"),
     };
-    let names = decode_names(table).map_err(in_table)?;
-    if names.len() != VILLAGER_COUNT {
+    if table.len() != VILLAGER_COUNT * NAME_LEN {
         return Err(in_table(format!(
-            "it holds {} names, but there are {VILLAGER_COUNT} villagers",
-            names.len()
+            "it is {} bytes, but {VILLAGER_COUNT} villagers' names take {}",
+            table.len(),
+            VILLAGER_COUNT * NAME_LEN
         )));
     }
-    Ok(names)
+    decode_names(table).map_err(in_table)
 }
 
 fn find_disc(dir: &Path) -> Result<PathBuf, NamesError> {

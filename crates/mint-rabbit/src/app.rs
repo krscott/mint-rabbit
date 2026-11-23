@@ -292,12 +292,7 @@ impl App {
 
     fn do_replace(&mut self, replace: Replace, ctx: &egui::Context) {
         match replace {
-            Replace::Import(v) => {
-                if let Some(picker) = &mut self.picker {
-                    picker.close();
-                }
-                self.import(&v);
-            }
+            Replace::Import(v) => self.import(&v),
             Replace::Open(dir) => self.open_project(&dir),
             Replace::Quit => {
                 self.quitting = true;
@@ -312,7 +307,13 @@ impl App {
             return;
         };
         match decomp.import(v) {
-            Ok(project) => self.set_doc(project, None),
+            Ok(project) => {
+                self.set_doc(project, None);
+                if let Some(picker) = &mut self.picker {
+                    picker.close();
+                }
+            }
+            // The picker stays open, to pick another.
             Err(e) => self.fail(e.to_string()),
         }
     }
