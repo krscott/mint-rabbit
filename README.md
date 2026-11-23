@@ -68,7 +68,7 @@ The decomp recipes take an ac-decomp checkout as PATH, which defaults to
 - `just test-decomp [PATH]` also round-trips every villager (import, export,
   import), saves and loads each as a project, checks that each texture
   export could replace its source in the decomp, and reads the villager names
-  from the disc image; it needs a built checkout with its disc image.
+  from the disc image when it is uncompressed; it needs a built checkout.
 - `just snapshot [PATH]` renders the first villager of a decomp (the demo
   when neither is given) offscreen to `target/model-view.png`; it needs a
   GPU.

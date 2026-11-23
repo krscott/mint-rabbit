@@ -72,6 +72,8 @@ pub struct Picker {
     /// Focus the search on the next frame shown.
     focus_search: bool,
     search: String,
+    /// Show the results from their top on the next frame shown.
+    scroll_to_top: bool,
     /// Villagers grouped by species, in species order.
     groups: Vec<(&'static str, Vec<usize>)>,
     /// Special characters and test entries.
@@ -145,6 +147,7 @@ impl Picker {
             open: false,
             focus_search: false,
             search: String::new(),
+            scroll_to_top: false,
             groups: groups.into_iter().collect(),
             others,
             thumbs: entries.iter().map(|_| Thumb::Pending).collect(),
@@ -168,6 +171,7 @@ impl Picker {
     pub fn imported(&mut self, v: &VillagerRef) {
         self.open = false;
         self.search.clear();
+        self.scroll_to_top = true;
         let entry = self
             .entries
             .iter()
@@ -278,7 +282,7 @@ impl Picker {
             .open(&mut open)
             .default_size([760.0, 560.0])
             .show(ctx, |ui| {
-                let searched = ui.horizontal(|ui| {
+                ui.horizontal(|ui| {
                     ui.label("Search");
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
@@ -288,7 +292,8 @@ impl Picker {
                     if std::mem::take(&mut self.focus_search) {
                         field.request_focus();
                     }
-                    field.changed()
+                    // New results start from their top.
+                    self.scroll_to_top |= field.changed();
                 });
                 for note in &self.notes {
                     ui.colored_label(Color32::from_rgb(255, 170, 90), note);
@@ -297,8 +302,7 @@ impl Picker {
                 let search = self.search.trim().to_lowercase();
                 let matches = |i: &usize| self.entries[*i].haystack.contains(&search);
                 let mut results = egui::ScrollArea::vertical().auto_shrink(false);
-                // New results start from their top.
-                if searched.inner {
+                if std::mem::take(&mut self.scroll_to_top) {
                     results = results.vertical_scroll_offset(0.0);
                 }
                 results.show(ui, |ui| {

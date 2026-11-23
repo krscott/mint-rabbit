@@ -34,7 +34,7 @@ test:
 test-decomp-sources decomp=env("MINT_AC_DECOMP", ""):
     MINT_AC_DECOMP="$(realpath -- "${1:?pass an ac-decomp checkout, or set MINT_AC_DECOMP to one}")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
 
-# Run every decomp test, including the round trip of every villager; needs a built checkout and its disc image (default $MINT_AC_DECOMP).
+# Run every decomp test, including the round trip of every villager; needs a built checkout (default $MINT_AC_DECOMP).
 test-decomp decomp=env("MINT_AC_DECOMP", ""):
     MINT_AC_DECOMP="$(realpath -- "${1:?pass an ac-decomp checkout, or set MINT_AC_DECOMP to one}")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
 
