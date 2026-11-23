@@ -28,9 +28,9 @@ struct Entry {
     villager: VillagerRef,
     /// The in-game name, or the texture set name when names are unknown.
     title: String,
-    /// The texture set, or the model and table position when the title is
-    /// the texture set (which some entries share), and whether it is an
-    /// islander.
+    /// The texture set, or the model when the title is the texture set,
+    /// and whether it is an islander. Entries other than villagers add
+    /// their table position, since some share a texture set.
     detail: String,
     /// Species and detail.
     hover: String,
@@ -107,6 +107,8 @@ impl Picker {
                 let islander = v.is_villager() && islanders.get(v.index) == Some(&true);
                 let mut detail = if name.is_some() {
                     v.texture_set.clone()
+                } else if v.is_villager() {
+                    v.model.clone()
                 } else {
                     format!("{} · entry {}", v.model, v.index)
                 };
