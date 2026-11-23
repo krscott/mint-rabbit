@@ -97,8 +97,8 @@ fn be16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes([b[0], b[1]]))
 }
 
-/// Whether the NUL-terminated name at `at` is `name`. It reads only as far
-/// as `name` is long, however the table is laid out.
+/// Whether the NUL-terminated name at `at` is `name`, reading at most
+/// `name.len() + 1` bytes.
 fn name_at(bytes: &[u8], at: usize, name: &str) -> bool {
     let end = at.saturating_add(name.len());
     bytes.get(at..end) == Some(name.as_bytes()) && bytes.get(end) == Some(&0)

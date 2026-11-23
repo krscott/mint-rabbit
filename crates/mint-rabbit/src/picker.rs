@@ -162,9 +162,10 @@ impl Picker {
     }
 
     /// Closes the window after `v` imported, clearing any earlier failure
-    /// to import it.
+    /// to import it; the next search starts empty.
     pub fn imported(&mut self, v: &VillagerRef) {
         self.open = false;
+        self.search.clear();
         let entry = self
             .entries
             .iter()
@@ -236,7 +237,8 @@ impl Picker {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    // The thread reports every entry before it ends.
+                    // Unless a panic escaped an entry's catch, every entry
+                    // was reported before the thread ended.
                     if self.thumbs.iter().any(|t| matches!(t, Thumb::Pending)) {
                         self.stop_rendering("the thumbnail thread stopped");
                     }
@@ -252,7 +254,7 @@ impl Picker {
                     self.thumbs[i] = Thumb::Ready(texture);
                 }
                 Message::Thumb(i, Err(e)) => self.thumbs[i] = Thumb::Failed(e),
-                Message::NoRender(e) => self.notes.push(format!("No thumbnails: {e}")),
+                Message::NoRender(e) => self.notes.push(format!("No more thumbnails: {e}")),
             }
         }
     }
@@ -360,8 +362,7 @@ impl Picker {
                     continue;
                 }
                 let visuals = ui.style().interact(&response);
-                // Long text stays within its tile.
-                let painter = ui.painter_at(rect);
+                let painter = ui.painter();
                 if response.hovered() {
                     painter.rect_filled(rect, 4.0, visuals.bg_fill);
                 }
@@ -400,11 +401,13 @@ impl Picker {
                     visuals.text_color()
                 };
                 let line = |y: f32, text: &str, size: f32, color: Color32| {
-                    let galley = painter.layout_no_wrap(
+                    let mut job = egui::text::LayoutJob::simple_singleline(
                         text.to_owned(),
                         egui::FontId::proportional(size),
                         color,
                     );
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(TILE_WIDTH - 8.0);
+                    let galley = painter.layout_job(job);
                     let x = rect.center().x - galley.size().x * 0.5;
                     painter.galley(egui::pos2(x, rect.min.y + y), galley, color);
                 };
@@ -428,18 +431,18 @@ impl Picker {
 /// Imports villager `v` from `decomp`, reporting a panic in the importer
 /// as an error instead of ending the app.
 pub fn import(decomp: &Decomp, v: &VillagerRef) -> Result<Project, String> {
-    catching("importing", || decomp.import(v))?.map_err(|e| e.to_string())
+    catching(|| decomp.import(v))?.map_err(|e| e.to_string())
 }
 
-/// Runs `f`, turning a panic into an error that says what was `doing`.
-fn catching<T>(doing: &str, f: impl FnOnce() -> T) -> Result<T, String> {
+/// Runs `f`, turning a panic into an error.
+fn catching<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(f)).map_err(|panic| {
         let why = panic
             .downcast_ref::<&str>()
             .map(|s| (*s).to_owned())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown error".into());
-        format!("{doing} crashed: {why}")
+        format!("crashed: {why}")
     })
 }
 
@@ -459,14 +462,18 @@ fn render_thumbnails(
     };
     let started = gpu
         .ok_or_else(|| "no GPU to render with".to_owned())
-        .and_then(|(device, queue)| {
-            catching("rendering", || Offscreen::new(device, queue, THUMB_PIXELS))
-        });
-    let mut offscreen = started.map_err(|e| send(Message::NoRender(e))).ok();
+        .and_then(|(device, queue)| catching(|| Offscreen::new(device, queue, THUMB_PIXELS)));
+    let mut offscreen = match started {
+        Ok(o) => Some(o),
+        Err(e) => {
+            send(Message::NoRender(e));
+            None
+        }
+    };
     for (i, villager) in order {
-        let result = import(decomp, villager).map(|project| {
-            let o = offscreen.as_mut()?;
-            let rendered = catching("rendering", || {
+        // What depends only on the entry: a failure here marks just its tile.
+        let staged = import(decomp, villager).and_then(|project| {
+            catching(|| {
                 let scene = Arc::new(SceneData::new(
                     &project,
                     &vec![0; project.textures().len()],
@@ -475,10 +482,14 @@ fn render_thumbnails(
                 let mesh = &scene.mesh;
                 let points = mesh.vertices.iter().map(|v| Vec3::from(v.position));
                 let camera = Orbit::portrait(mesh.bounds_min, mesh.bounds_max, points);
-                o.render(scene.clone(), camera.view_proj(1.0))
+                let view_proj = camera.view_proj(1.0);
+                (scene, view_proj)
             })
-            .and_then(|r| r);
-            match rendered {
+        });
+        // A GPU failure stops thumbnails for every entry.
+        let result = staged.map(|(scene, view_proj)| {
+            let o = offscreen.as_mut()?;
+            match catching(|| o.render(scene, view_proj)).and_then(|r| r) {
                 Ok(pixels) => {
                     let size = THUMB_PIXELS as usize;
                     Some(ColorImage::from_rgba_unmultiplied([size, size], &pixels))

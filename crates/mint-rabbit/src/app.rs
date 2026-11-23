@@ -506,6 +506,7 @@ impl App {
                 }
                 None => {}
             }
+            // The picker holds the open decomp.
             let ready = matches!(doc.check, Some((_, Ok(())))) && self.picker.is_some();
             let why_not = if self.picker.is_none() {
                 "Open the decomp this project came from"
