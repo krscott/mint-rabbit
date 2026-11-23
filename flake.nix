@@ -45,6 +45,9 @@
             rustfmt
             clippy
             rust-analyzer
+            # `just run --decomp` builds the decomp's assets.
+            python3
+            ninja
           ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath package.runtimeLibs;

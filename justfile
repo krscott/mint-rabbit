@@ -6,7 +6,25 @@ default:
 build:
     cargo build --locked
 
+# Run the app. With --decomp PATH, first extract that decomp's assets from its disc image.
 run *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    decomp=''
+    version=GAFE01_00
+    args=("$@")
+    for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            --decomp) decomp="${args[i + 1]}" ;;
+            --game-version) version="${args[i + 1]}" ;;
+        esac
+    done
+    if [[ -n "$decomp" ]]; then
+        if [[ ! -f "$decomp/build.ninja" ]]; then
+            (cd -- "$decomp" && python3 configure.py --version "$version")
+        fi
+        ninja -C "$decomp" pre-compile
+    fi
     cargo run --locked -p mint-rabbit -- "$@"
 
 test:

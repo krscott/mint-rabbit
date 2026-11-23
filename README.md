@@ -11,8 +11,9 @@ checkout. See [GLOSSARY.md](GLOSSARY.md) for the domain language and
 mint-rabbit [--decomp PATH/TO/ac-decomp] [--game-version GAFE01_00] [--project DIR]
 ```
 
-The decomp must be built once with your own disc image so its villager assets
-are extracted (`python configure.py && ninja`). Pick a villager and press
+The decomp's villager assets must first be extracted from your own disc image
+in its `orig/` directory (`python configure.py && ninja pre-compile`, which
+`just run --decomp PATH` does for you). Pick a villager and press
 Import to see it in the Model View (left) and Texture View (right).
 
 Paint in the Texture View with the tools in the Paint section: Select (V),
@@ -48,7 +49,7 @@ Enter the development shell with `nix develop`, then run:
 
 ```sh
 just build
-just run -- --decomp PATH
+just run --decomp PATH
 just test
 just format
 just check
