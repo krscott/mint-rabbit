@@ -258,12 +258,11 @@ impl App {
 
     /// Lists the decomp's villagers again, so thumbnails show what it holds
     /// now.
-    fn reload_picker(&mut self) {
-        let Some(decomp) = &self.decomp else { return };
-        match decomp.villagers() {
-            Ok(v) => self.picker = Some(Picker::new(decomp.clone(), v, self.gpu.clone())),
-            Err(e) => self.fail(e.to_string()),
+    fn reload_picker(&mut self) -> Result<(), mint_ac::ImportError> {
+        if let (Some(decomp), Some(picker)) = (&self.decomp, &mut self.picker) {
+            picker.reload(decomp.villagers()?);
         }
+        Ok(())
     }
 
     fn set_doc(&mut self, project: Project, path: Option<PathBuf>) {
@@ -809,13 +808,16 @@ impl App {
                 Some(Confirm::ReplaceInDecomp(export, _)) => {
                     let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
                     match result {
-                        Some(Ok(path)) => {
-                            self.reload_picker();
-                            self.tell(format!(
+                        Some(Ok(path)) => match self.reload_picker() {
+                            Ok(()) => self.tell(format!(
                                 "Wrote {}; build with `python configure.py --non-matching && ninja`",
                                 path.display()
-                            ));
-                        }
+                            )),
+                            Err(e) => self.fail(format!(
+                                "Wrote {}, but the import list couldn't be refreshed: {e}",
+                                path.display()
+                            )),
+                        },
                         Some(Err(e)) => self.fail(e.to_string()),
                         None => {}
                     }

@@ -16,7 +16,7 @@ pub use export::{
 };
 /// The color the game shows for a palette entry.
 pub use gx::quantize_rgb5a3 as quantize_color;
-pub use import::{Decomp, ImportError, VILLAGER_COUNT, VillagerRef, WriteError};
+pub use import::{Decomp, ImportError, VillagerRef, WriteError};
 
 #[cfg(test)]
 mod roundtrip;

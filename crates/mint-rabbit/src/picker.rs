@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, vec2};
 use eframe::egui_wgpu::wgpu;
@@ -50,7 +51,7 @@ pub type Gpu = (wgpu::Device, wgpu::Queue);
 /// Progress of the thumbnail thread.
 enum Rendering {
     NotStarted,
-    Running(Receiver<Message>),
+    Running(Receiver<Message>, JoinHandle<()>),
     Done,
 }
 
@@ -157,17 +158,31 @@ impl Picker {
         self.open = false;
     }
 
-    /// Starts rendering thumbnails, villagers first in the order shown, on
-    /// a background thread. Dropping the picker stops it.
-    fn start_rendering(&mut self, ctx: &egui::Context) {
-        let (sender, receiver) = channel();
-        self.rendering = Rendering::Running(receiver);
-        let order: Vec<(usize, VillagerRef)> = self
-            .groups
+    /// Lists `villagers` again, from the same decomp, keeping the window
+    /// and search as they are.
+    pub fn reload(&mut self, villagers: Vec<VillagerRef>) {
+        let mut new = Self::new(self.decomp.clone(), villagers, self.gpu.clone());
+        new.open = self.open;
+        new.search = std::mem::take(&mut self.search);
+        *self = new;
+    }
+
+    /// Entries in the order shown: villagers by species, then the others.
+    fn shown_order(&self) -> impl Iterator<Item = usize> + '_ {
+        self.groups
             .iter()
             .flat_map(|(_, list)| list)
             .chain(&self.others)
-            .map(|&i| (i, self.entries[i].villager.clone()))
+            .copied()
+    }
+
+    /// Starts rendering thumbnails, in the order shown, on a background
+    /// thread. Dropping the picker stops it.
+    fn start_rendering(&mut self, ctx: &egui::Context) {
+        let (sender, receiver) = channel();
+        let order: Vec<(usize, VillagerRef)> = self
+            .shown_order()
+            .map(|i| (i, self.entries[i].villager.clone()))
             .collect();
         let decomp = self.decomp.clone();
         let gpu = self.gpu.clone();
@@ -175,13 +190,26 @@ impl Picker {
         let spawned = std::thread::Builder::new()
             .name("thumbnails".into())
             .spawn(move || render_thumbnails(&decomp, &order, gpu, &sender, &ctx));
-        if let Err(e) = spawned {
-            self.notes.push(format!("No thumbnails: {e}"));
+        match spawned {
+            Ok(thread) => self.rendering = Rendering::Running(receiver, thread),
+            Err(e) => self.stop_rendering(&format!("couldn't start rendering: {e}")),
         }
     }
 
+    /// Ends rendering early: entries still pending stay importable, without
+    /// a thumbnail.
+    fn stop_rendering(&mut self, why: &str) {
+        for t in &mut self.thumbs {
+            if matches!(t, Thumb::Pending) {
+                *t = Thumb::Ready(None);
+            }
+        }
+        self.notes.push(format!("No more thumbnails: {why}"));
+        self.rendering = Rendering::Done;
+    }
+
     fn receive(&mut self, ctx: &egui::Context) {
-        let Rendering::Running(receiver) = &self.rendering else {
+        let Rendering::Running(receiver, _) = &self.rendering else {
             return;
         };
         loop {
@@ -189,20 +217,28 @@ impl Picker {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    // The thread finished, or died before reporting every
-                    // entry; those stay importable, without a thumbnail.
-                    let mut stopped = false;
-                    for t in &mut self.thumbs {
-                        if matches!(t, Thumb::Pending) {
-                            *t = Thumb::Ready(None);
-                            stopped = true;
+                    let Rendering::Running(_, thread) =
+                        std::mem::replace(&mut self.rendering, Rendering::Done)
+                    else {
+                        unreachable!("rendering was running");
+                    };
+                    // The thread sends every entry before it ends, unless
+                    // it panicked on the next one.
+                    if let Err(panic) = thread.join() {
+                        let why = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_owned())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown error".into());
+                        let why = format!("importing crashed: {why}");
+                        let next = self
+                            .shown_order()
+                            .find(|&i| matches!(self.thumbs[i], Thumb::Pending));
+                        if let Some(i) = next {
+                            self.thumbs[i] = Thumb::Failed(why.clone());
                         }
+                        self.stop_rendering(&why);
                     }
-                    if stopped {
-                        self.notes
-                            .push("No more thumbnails: the thumbnail thread stopped".into());
-                    }
-                    self.rendering = Rendering::Done;
                     return;
                 }
             };
@@ -276,16 +312,22 @@ impl Picker {
                     let others: Vec<usize> = self.others.iter().copied().filter(matches).collect();
                     if !others.is_empty() {
                         any = true;
-                        egui::CollapsingHeader::new(format!("Other entries ({})", others.len()))
-                            .id_salt("other entries")
-                            // Search results don't hide behind the header.
-                            .open((!search.is_empty()).then_some(true))
-                            .show(ui, |ui| {
-                                ui.label("Special characters and test entries.");
-                                if let Some(v) = self.tiles(ui, &others) {
-                                    picked = Some(v);
-                                }
-                            });
+                        let title = format!("Other entries ({})", others.len());
+                        let mut show = |ui: &mut egui::Ui| {
+                            ui.label("Special characters and test entries.");
+                            if let Some(v) = self.tiles(ui, &others) {
+                                picked = Some(v);
+                            }
+                        };
+                        // Search results don't hide behind a collapsed header.
+                        if search.is_empty() {
+                            egui::CollapsingHeader::new(title)
+                                .id_salt("other entries")
+                                .show(ui, show);
+                        } else {
+                            ui.strong(title);
+                            show(ui);
+                        }
                     }
                     if !any {
                         ui.label("Nothing matches the search.");
@@ -401,9 +443,13 @@ fn render_thumbnails(
                 &vec![0; project.textures().len()],
                 0,
             ));
-            let mesh = &scene.mesh;
-            let points = mesh.vertices.iter().map(|v| Vec3::from(v.position));
-            let camera = Orbit::portrait(mesh.bounds_min, mesh.bounds_max, points);
+            let points: Vec<Vec3> = scene
+                .mesh
+                .vertices
+                .iter()
+                .map(|v| Vec3::from(v.position))
+                .collect();
+            let camera = Orbit::portrait(&points);
             match o.render(scene, camera.view_proj(1.0)) {
                 Ok(pixels) => {
                     let size = THUMB_PIXELS as usize;

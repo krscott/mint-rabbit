@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::VILLAGER_COUNT;
+use crate::import::VILLAGER_COUNT;
 
 /// The archive at the disc root that holds the name table.
 const NAME_ARCHIVE: &str = "forest_2nd.arc";
@@ -140,12 +140,13 @@ impl Disc {
         // Checked first, so a bad size never allocates.
         if len > MAX_READ {
             return Err(self.malformed(format!(
-                "asks for {len} bytes at {offset:#x}, more than any file names are read from"
+                "asks for {len} bytes at {offset:#x}, more than the {MAX_READ} allowed"
             )));
         }
         if u64::from(offset) + u64::from(len) > self.len {
             return Err(self.malformed(format!(
-                "ends before {len} bytes at {offset:#x}; is this an uncompressed GameCube disc image?"
+                "is {} bytes, too short for {len} bytes at {offset:#x}; is this an uncompressed GameCube disc image?",
+                self.len
             )));
         }
         let mut buf = vec![0; len as usize];
