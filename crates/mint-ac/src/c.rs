@@ -86,8 +86,10 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Int(v) => write!(f, "{v}"),
-            Expr::Float(v) => write!(f, "{v}"),
-            Expr::Str(s) => write!(f, "{s:?}"),
+            // Debug keeps a decimal point on whole numbers.
+            Expr::Float(v) => write!(f, "{v:?}"),
+            // The text keeps its source escapes.
+            Expr::Str(s) => write!(f, "\"{s}\""),
             Expr::Ident(s) => f.write_str(s),
             Expr::Call(name, args) => {
                 write!(f, "{name}(")?;
@@ -99,8 +101,24 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(")")
             }
+            // A space keeps `- -x` from reading as `--x`.
+            Expr::Unary(op, e) if matches!(**e, Expr::Unary(..)) => write!(f, "{op} {e}"),
             Expr::Unary(op, e) => write!(f, "{op}{e}"),
-            Expr::Binary(op, l, r) => write!(f, "({l} {op:?} {r})"),
+            Expr::Binary(op, l, r) => {
+                let op = match op {
+                    BinOp::Or => "|",
+                    BinOp::Xor => "^",
+                    BinOp::And => "&",
+                    BinOp::Shl => "<<",
+                    BinOp::Shr => ">>",
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Rem => "%",
+                };
+                write!(f, "({l} {op} {r})")
+            }
             Expr::AddrOf(e) => write!(f, "&{e}"),
             Expr::Index(a, i) => write!(f, "{a}[{i}]"),
             Expr::Sizeof(t) => write!(f, "sizeof({t})"),
@@ -177,6 +195,22 @@ fn size_of_type(ty: &str) -> Option<i64> {
 pub enum Init {
     List(Vec<Init>),
     Expr(Expr),
+}
+
+/// Prints the initializer back as C.
+impl fmt::Display for Init {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Init::Expr(e) => write!(f, "{e}"),
+            Init::List(items) => {
+                f.write_str("{ ")?;
+                for item in items {
+                    write!(f, "{item}, ")?;
+                }
+                f.write_str("}")
+            }
+        }
+    }
 }
 
 impl Init {
@@ -639,6 +673,16 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initializers_print_back_as_equivalent_c() {
+        let file = parse(r#"int x[] = { 1.0 / 2, - -3, "a\n", 0.008999999612569809, -1 };"#);
+        let printed = file.get("x").unwrap().init.to_string();
+        assert_eq!(
+            printed,
+            r#"{ (1.0 / 2), - -3, "a\n", 0.008999999612569809, -1, }"#
+        );
+    }
 
     fn parse(text: &str) -> CFile {
         CFile::parse_str(Path::new("test.c"), text).unwrap()

@@ -1,19 +1,23 @@
-//! Builds a project from a villager in a built decomp checkout.
+//! Reads villagers from a built decomp checkout as projects, and writes
+//! exported texture sets back into it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use glam::{EulerRot, Quat, UVec2, Vec2, Vec3};
 use mint_core::{
-    Corner, IndexedImage, Material, MaterialId, Mesh, Model, NodeId, Palette, Pose, Project, Rgba8,
-    RgbaImage, Slot, Texture, TextureId, Transform, Triangle, Vertex,
+    Corner, ExportTarget, IndexedImage, Material, MaterialId, Mesh, Model, NodeId, Palette, Pose,
+    Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle, Vertex,
 };
 
+use crate::TextureExport;
 use crate::anim;
 use crate::c::{CError, CFile, Expr, Init};
 use crate::gbi::{self, DrawState, RawVtx, TexSource};
 use crate::gx;
-use crate::{SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET};
+use crate::{
+    OPTION_MODEL, OPTION_TEXTURE_SET, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET,
+};
 
 /// The animation whose first frame poses imported models.
 const POSE_ANIMATION: &str = "cKF_ba_r_npc_1_wait1";
@@ -53,6 +57,53 @@ pub enum ImportError {
     Gx { name: String, source: gx::GxError },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    #[error("texture set {0} is not in the villager table")]
+    NotInTable(String),
+    #[error(
+        "texture set {0} already exists at {1}; replace it in place with write_texture_set, or choose a new name"
+    )]
+    Exists(String, PathBuf),
+    #[error(
+        "texture set {texture_set} is drawn on model {actual}, but the project's model is {expected}"
+    )]
+    OtherModel {
+        texture_set: String,
+        actual: String,
+        expected: String,
+    },
+    #[error(
+        "the textures differ in slot or size from those model {model} reads for {texture_set}: it reads {expected:?}, the export has {actual:?}"
+    )]
+    TextureSizes {
+        model: String,
+        texture_set: String,
+        expected: Vec<(Slot, UVec2)>,
+        actual: Vec<(Slot, UVec2)>,
+    },
+    #[error(
+        "the villager table lists {texture_set}'s arrays as {table:?}, but the export names them {export:?}"
+    )]
+    TableNames {
+        texture_set: String,
+        table: Vec<String>,
+        export: Vec<String>,
+    },
+    #[error(
+        "{path} defines different arrays than the export would; missing from the export: {missing:?}; only in the export: {extra:?}"
+    )]
+    Symbols {
+        path: PathBuf,
+        missing: Vec<String>,
+        extra: Vec<String>,
+    },
+    #[error(transparent)]
+    Read(#[from] ImportError),
+    #[error("{0}: {1}")]
+    Io(PathBuf, std::io::Error),
+}
+
 /// A built ac-decomp checkout.
 #[derive(Clone, Debug)]
 pub struct Decomp {
@@ -73,6 +124,17 @@ pub struct VillagerRef {
     palette: String,
     eyes: Vec<String>,
     mouths: Vec<String>,
+    pub(crate) fields: TableFields,
+}
+
+/// The parts of a villager table entry besides its model and textures, as C.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableFields {
+    pub model_bank: String,
+    /// Texture data fields after the mouth list.
+    pub texture_extra: Vec<String>,
+    /// Entry fields after the texture data: scale, talk type, and so on.
+    pub extra: Vec<String>,
 }
 
 impl Decomp {
@@ -116,10 +178,126 @@ impl Decomp {
         parse_villagers(&file)
     }
 
+    /// The villager table entry for texture set `texture_set`.
+    pub fn villager(&self, texture_set: &str) -> Result<VillagerRef, WriteError> {
+        self.villagers()?
+            .into_iter()
+            .find(|v| v.texture_set == texture_set)
+            .ok_or_else(|| WriteError::NotInTable(texture_set.to_owned()))
+    }
+
+    fn texture_path(texture_set: &str) -> String {
+        format!("src/data/npc/model/tex/{texture_set}.c")
+    }
+
+    /// Checks that `export` can replace the source of an existing texture
+    /// set: the set must be in the villager table on the export's model,
+    /// listing the export's arrays in the same order; its textures must have
+    /// the slots and sizes the model reads; and its file must define the same
+    /// arrays, so the table still links. Returns the path of that file.
+    pub fn check_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
+        let set = &export.texture_set;
+        let v = self.villager(set)?;
+        if v.model != export.model {
+            return Err(WriteError::OtherModel {
+                texture_set: set.clone(),
+                actual: v.model,
+                expected: export.model.clone(),
+            });
+        }
+        let s = &export.symbols;
+        let names = |v: &VillagerRef| {
+            let mut out = vec![v.tmem.clone(), v.palette.clone()];
+            out.extend(v.eyes.iter().chain(&v.mouths).cloned());
+            out
+        };
+        let mut ours = vec![s.body.clone(), s.palette.clone()];
+        ours.extend(s.eyes.iter().chain(&s.mouths).cloned());
+        if names(&v) != ours {
+            return Err(WriteError::TableNames {
+                texture_set: set.clone(),
+                table: names(&v),
+                export: ours,
+            });
+        }
+        self.check_sizes(export, &v)?;
+        let rel = Self::texture_path(set);
+        let existing: BTreeSet<String> =
+            self.read(&rel)?.decls.into_iter().map(|d| d.name).collect();
+        let exported: BTreeSet<String> = export.symbols.all().cloned().collect();
+        let path = self.root.join(rel);
+        if existing != exported {
+            return Err(WriteError::Symbols {
+                path,
+                missing: existing.difference(&exported).cloned().collect(),
+                extra: exported.difference(&existing).cloned().collect(),
+            });
+        }
+        Ok(path)
+    }
+
+    /// Checks that `export`'s textures have the slots and sizes the model of
+    /// villager `v` reads.
+    fn check_sizes(&self, export: &TextureExport, v: &VillagerRef) -> Result<(), WriteError> {
+        let expected = crate::export::texture_sizes(&self.import(v)?);
+        if expected == export.texture_sizes {
+            Ok(())
+        } else {
+            Err(WriteError::TextureSizes {
+                model: v.model.clone(),
+                texture_set: v.texture_set.clone(),
+                expected,
+                actual: export.texture_sizes.clone(),
+            })
+        }
+    }
+
+    /// Writes `export` as a new texture set into folder `dir`, with the table
+    /// entry and steps for adding it to the decomp, based on the row of
+    /// texture set `base` (the villager it replaces). The export's name must
+    /// not already be a texture set in the decomp, and the base must be on
+    /// the export's model, whose loads the textures must match. Returns the
+    /// paths written.
+    pub fn write_texture_folder(
+        &self,
+        export: &TextureExport,
+        base: &str,
+        dir: &Path,
+    ) -> Result<[PathBuf; 2], WriteError> {
+        let existing = self.root.join(Self::texture_path(&export.texture_set));
+        // Anything at that path counts, a dangling link included.
+        if std::fs::symlink_metadata(&existing).is_ok() {
+            return Err(WriteError::Exists(export.texture_set.clone(), existing));
+        }
+        let v = self.villager(base)?;
+        if v.model != export.model {
+            return Err(WriteError::OtherModel {
+                texture_set: v.texture_set,
+                actual: v.model,
+                expected: export.model.clone(),
+            });
+        }
+        self.check_sizes(export, &v)?;
+        export.write_to(dir, &v)
+    }
+
+    /// Replaces the source of an existing texture set with `export`, after
+    /// [`Self::check_texture_set`], so the next build draws that villager
+    /// with the exported textures. Returns the path written.
+    ///
+    /// The game then no longer matches the original, so the decomp must be
+    /// configured with `python configure.py --non-matching` to build it.
+    pub fn write_texture_set(&self, export: &TextureExport) -> Result<PathBuf, WriteError> {
+        let path = self.check_texture_set(export)?;
+        mint_core::file::write_atomic(&path, export.texture_c.as_bytes())
+            .map_err(|e| WriteError::Io(path.clone(), e))?;
+        Ok(path)
+    }
+
     /// Imports one villager as a project.
     pub fn import(&self, v: &VillagerRef) -> Result<Project, ImportError> {
         let model_file = self.read(format!("src/data/npc/model/mdl/{}.c", v.model))?;
-        let tex_file = self.read(format!("src/data/npc/model/tex/{}.c", v.texture_set))?;
+        let tex_file = self.read(Self::texture_path(&v.texture_set))?;
         let pose_file = self.read(POSE_FILE)?;
         build_project(&model_file, &tex_file, &pose_file, v)
     }
@@ -176,6 +354,7 @@ pub(crate) fn parse_villagers(file: &CFile) -> Result<Vec<VillagerRef>, ImportEr
                 .map(|v| v.into_iter().filter(|n| n != "NULL").collect::<Vec<_>>())
                 .ok_or_else(|| bad("eye or mouth list is malformed"))
         };
+        let c = |fields: &[Init]| fields.iter().map(ToString::to_string).collect();
         out.push(VillagerRef {
             index,
             model,
@@ -184,6 +363,11 @@ pub(crate) fn parse_villagers(file: &CFile) -> Result<Vec<VillagerRef>, ImportEr
             palette: palette.to_owned(),
             eyes: names(2)?,
             mouths: names(3)?,
+            fields: TableFields {
+                model_bank: fields[0].to_string(),
+                texture_extra: c(tex.get(4..).unwrap_or_default()),
+                extra: c(fields.get(4..).unwrap_or_default()),
+            },
         });
     }
     Ok(out)
@@ -378,7 +562,10 @@ pub(crate) fn build_project(
 
     let mut textures = Vec::new();
     let mut texture_ids: HashMap<TexSource, TextureId> = HashMap::new();
-    let mut body_ranges: Vec<(u32, u32)> = Vec::new();
+    // Export packs body textures in offset order from 0, and a texture-only
+    // export must land each where the model loads it, so imports need that
+    // layout. Sources iterate in offset order.
+    let mut body_end = 0u32;
     for (&source, &size) in &loads {
         let texture = match source {
             TexSource::Eye | TexSource::Mouth => {
@@ -407,12 +594,12 @@ pub(crate) fn build_project(
                 let end = offset.checked_add(len).ok_or_else(|| {
                     model_err(format!("body texture offset {offset:#x} is out of range"))
                 })?;
-                if let Some(&(o, e)) = body_ranges.iter().find(|&&(o, e)| offset < e && o < end) {
+                if offset != body_end {
                     return Err(model_err(format!(
-                        "body textures at {offset:#x}..{end:#x} and {o:#x}..{e:#x} overlap"
+                        "a body texture starts at {offset:#x}, not {body_end:#x}; only body textures packed from 0 without gaps or overlaps are supported"
                     )));
                 }
-                body_ranges.push((offset, end));
+                body_end = end;
                 let data = tmem.get(offset as usize..end as usize).ok_or_else(|| {
                     malformed(
                         tex_file,
@@ -515,13 +702,15 @@ pub(crate) fn build_project(
         );
     }
 
+    let mut target = ExportTarget::new(TARGET);
+    target
+        .options
+        .insert(OPTION_MODEL.to_owned(), model_name.clone());
+    target
+        .options
+        .insert(OPTION_TEXTURE_SET.to_owned(), v.texture_set.clone());
     Ok(Project::new(
-        mint_core::TargetId(TARGET.into()),
-        palette,
-        model,
-        textures,
-        materials,
-        pose,
+        target, palette, model, textures, materials, pose,
     )?)
 }
 

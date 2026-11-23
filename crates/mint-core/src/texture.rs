@@ -104,7 +104,7 @@ pub struct PixelCountMismatch {
 
 impl IndexedImage {
     pub fn new(size: UVec2, pixels: Vec<PaletteIndex>) -> Result<Self, PixelCountMismatch> {
-        if pixels.len() != (size.x * size.y) as usize {
+        if pixels.len() as u64 != u64::from(size.x) * u64::from(size.y) {
             return Err(PixelCountMismatch {
                 width: size.x,
                 height: size.y,

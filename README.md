@@ -33,7 +33,8 @@ just check
 - `just test-decomp-sources [PATH]` parses every model source and the
   villager table of a decomp checkout, built or not.
 - `just test-decomp PATH` also round-trips every villager (import, export,
-  import); it needs a built checkout.
+  import), saves and loads each as a project, and checks that each texture
+  export could replace its source in the decomp; it needs a built checkout.
 - `just snapshot [PATH]` renders the first villager of a decomp offscreen to
   `target/model-view.png`; it needs a GPU.
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::{
@@ -5,9 +6,24 @@ use crate::{
     Texture, TextureId, Variant,
 };
 
-/// Names the export target a project is built for, such as `ac-villager`.
+/// The export target a project is built for: its id, such as `ac-villager`,
+/// and settings that target's adapter defines and reads, such as the name of
+/// the game model the project is drawn on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TargetId(pub String);
+pub struct ExportTarget {
+    pub id: String,
+    pub options: BTreeMap<String, String>,
+}
+
+impl ExportTarget {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            options: BTreeMap::new(),
+        }
+    }
+}
 
 /// A painted variant of one of a project's textures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,7 +38,7 @@ pub struct VariantRef {
 /// its palette; the editing methods keep it so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
-    target: TargetId,
+    target: ExportTarget,
     palette: Palette,
     /// Shared between clones, so snapshots of a project for undo are cheap.
     model: Arc<Model>,
@@ -86,7 +102,7 @@ impl Project {
     /// Builds a project, checking that every reference between its parts
     /// resolves.
     pub fn new(
-        target: TargetId,
+        target: ExportTarget,
         palette: Palette,
         model: Model,
         textures: Vec<Texture>,
@@ -158,7 +174,7 @@ impl Project {
     }
 
     #[must_use]
-    pub fn target(&self) -> &TargetId {
+    pub fn target(&self) -> &ExportTarget {
         &self.target
     }
 
@@ -312,7 +328,7 @@ mod tests {
         .unwrap();
         t.variants_mut()[0].insert_layer(0, Layer::new("paint"));
         Project::new(
-            TargetId("test".into()),
+            ExportTarget::new("test"),
             palette,
             Model::new("root", Transform::default()),
             vec![t],

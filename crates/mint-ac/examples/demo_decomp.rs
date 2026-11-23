@@ -12,8 +12,8 @@ use std::path::Path;
 use glam::{UVec2, Vec2, Vec3};
 use mint_core::{
     AlphaMode, Corner, IndexedImage, Material, MaterialId, Mesh, Model, NodeId, Palette,
-    PaletteIndex, Pose, Project, Rgba8, RgbaImage, Slot, TargetId, Texture, TextureId, Transform,
-    Triangle, Vertex, Wrap,
+    PaletteIndex, Pose, Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle,
+    Vertex, Wrap,
 };
 
 const PALETTE: [[u8; 3]; 16] = [
@@ -320,7 +320,7 @@ fn main() {
 
     let palette = Palette::from_colors(PALETTE.map(|[r, g, b]| Rgba8::new(r, g, b, 255))).unwrap();
     let project = Project::new(
-        TargetId(mint_ac::TARGET.into()),
+        mint_core::ExportTarget::new(mint_ac::TARGET),
         palette,
         model,
         textures,
@@ -336,12 +336,15 @@ fn main() {
         std::fs::write(path, text).unwrap();
     };
     save("src/data/npc/model/mdl/demo_1.c", &export.model_c);
-    save("src/data/npc/model/tex/demo_1.c", &export.texture_c);
+    save(
+        "src/data/npc/model/tex/demo_1.c",
+        export.textures.texture_c(),
+    );
     save(
         "src/data/npc/npc_draw_data.c",
         &format!(
             "extern aNPC_draw_data_c npc_draw_data_tbl[] = {{\n{}}};\n",
-            export.draw_data_entry
+            export.textures.table_entry(None).unwrap()
         ),
     );
     // The idle pose, all fixed values: the root translation, then each

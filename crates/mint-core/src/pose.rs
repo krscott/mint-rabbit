@@ -17,6 +17,11 @@ impl Pose {
         self.rotations.get(&node).copied().unwrap_or(Quat::IDENTITY)
     }
 
+    /// The rotations that are not the identity, by node.
+    pub fn rotations(&self) -> impl Iterator<Item = (NodeId, Quat)> + '_ {
+        self.rotations.iter().map(|(&n, &q)| (n, q))
+    }
+
     pub fn set_rotation(&mut self, node: NodeId, rotation: Quat) {
         if rotation == Quat::IDENTITY {
             self.rotations.remove(&node);
