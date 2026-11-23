@@ -347,6 +347,10 @@ fn main() {
             export.textures.table_entry(None).unwrap()
         ),
     );
+    save(
+        "src/data/npc/grow_list.c",
+        "s8 npc_grow_list[] = { mNpc_GROW_STARTER };\n",
+    );
     // The idle pose, all fixed values: the root translation, then each
     // joint's x, y, z rotation in tenths of a degree; only the head turns.
     let mut fixed = vec![0, 300, 0];

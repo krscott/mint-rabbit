@@ -6,11 +6,11 @@ default:
 build:
     cargo build --locked
 
-# Run the app. With --decomp PATH, first extract that decomp's assets from its disc image.
+# Run the app. With --decomp PATH, or MINT_AC_DECOMP, first extract that decomp's assets from its disc image.
 run *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    decomp=''
+    decomp="${MINT_AC_DECOMP:-}"
     version=GAFE01_00
     args=("$@")
     for ((i = 0; i + 1 < ${#args[@]}; i++)); do
@@ -30,21 +30,32 @@ run *args:
 test:
     cargo test --locked --workspace
 
-# Parse every model source and the villager table of an ac-decomp checkout (built or not).
-test-decomp-sources decomp=".multi/repos/ac-decomp":
-    MINT_AC_DECOMP="$(realpath -- "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
+# Parse every model source and the villager table of an ac-decomp checkout (built or not; default $MINT_AC_DECOMP).
+test-decomp-sources decomp=env("MINT_AC_DECOMP", ""):
+    MINT_AC_DECOMP="$(just _decomp "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
 
-# Run every decomp test, including the round trip of every villager; needs a built checkout.
-test-decomp decomp:
-    MINT_AC_DECOMP="$(realpath -- "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
+# Run every decomp test, including the round trip of every villager; needs a built checkout and its disc image (default $MINT_AC_DECOMP).
+test-decomp decomp=env("MINT_AC_DECOMP", ""):
+    MINT_AC_DECOMP="$(just _decomp "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
+
+# Print the absolute path of the decomp checkout DECOMP, or fail when none is given.
+[private]
+_decomp decomp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "$1" ]]; then
+        echo "error: pass an ac-decomp checkout, or set MINT_AC_DECOMP to one" >&2
+        exit 1
+    fi
+    realpath -- "$1"
 
 # Write a generated demo villager as a decomp-shaped directory and open it.
 demo dir="target/demo-decomp":
     cargo run --locked -q -p mint-ac --example demo_decomp -- "$1"
     cargo run --locked -p mint-rabbit -- --decomp "$1"
 
-# Render the first villager of DECOMP (default: the demo) to target/model-view.png; needs a GPU.
-snapshot decomp="":
+# Render the first villager of DECOMP (default: $MINT_AC_DECOMP, else the demo) to target/model-view.png; needs a GPU.
+snapshot decomp=env("MINT_AC_DECOMP", ""):
     #!/usr/bin/env bash
     set -euo pipefail
     decomp="$1"

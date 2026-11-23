@@ -1,0 +1,390 @@
+//! The import picker: a window of villager tiles, each with a rendered
+//! thumbnail, the villager's in-game name, and its species, grouped by
+//! species and filtered by a search.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, vec2};
+use eframe::egui_wgpu::wgpu;
+use mint_ac::{Decomp, VillagerRef};
+
+use crate::camera::Orbit;
+use crate::render::{Offscreen, SceneData};
+
+/// Pixel size of rendered thumbnails.
+const THUMB_PIXELS: u32 = 128;
+/// Size a thumbnail shows at.
+const THUMB_SIZE: f32 = 96.0;
+const TILE_WIDTH: f32 = THUMB_SIZE + 16.0;
+const TILE_HEIGHT: f32 = THUMB_SIZE + 44.0;
+
+/// A table entry as the picker shows it.
+struct Entry {
+    villager: VillagerRef,
+    /// The in-game name, or the texture set name when names are unknown.
+    title: String,
+    /// The texture set, or the model when the title is the texture set,
+    /// and whether it is an islander.
+    detail: String,
+    /// Species and detail.
+    hover: String,
+    /// Lowercase text a search matches against.
+    haystack: String,
+}
+
+enum Thumb {
+    Pending,
+    /// Imported, with a thumbnail unless rendering failed.
+    Ready(Option<TextureHandle>),
+    /// Why the entry can't be imported.
+    Failed(String),
+}
+
+/// What the thumbnail thread reports.
+enum Message {
+    /// An entry, by position, imported (with its thumbnail when it
+    /// rendered) or failed to import.
+    Thumb(usize, Result<Option<ColorImage>, String>),
+    /// Why thumbnails stopped rendering.
+    NoRender(String),
+}
+
+pub struct Picker {
+    open: bool,
+    /// Focus the search on the next frame shown.
+    focus_search: bool,
+    search: String,
+    /// Villagers grouped by species, in species order.
+    groups: Vec<(String, Vec<usize>)>,
+    /// Special characters and test entries.
+    others: Vec<usize>,
+    entries: Vec<Entry>,
+    thumbs: Vec<Thumb>,
+    /// Why names or islanders are missing, shown above the tiles.
+    notes: Vec<String>,
+    rendered: Option<Receiver<Message>>,
+}
+
+impl Picker {
+    /// Lists the villager table of `decomp`, naming entries from its disc
+    /// image when it can be read.
+    pub fn new(decomp: &Decomp, villagers: Vec<VillagerRef>) -> Self {
+        let mut notes = Vec::new();
+        let names = decomp.villager_names().unwrap_or_else(|e| {
+            notes.push(format!("No in-game names: {e}"));
+            Vec::new()
+        });
+        let islanders = decomp.islanders().unwrap_or_else(|e| {
+            notes.push(format!("Islanders unknown: {e}"));
+            Vec::new()
+        });
+        let entries: Vec<Entry> = villagers
+            .into_iter()
+            .filter(|v| !v.is_unused())
+            .map(|v| {
+                let name = v.is_villager().then(|| names.get(v.index)).flatten();
+                let islander = v.is_villager() && islanders.get(v.index) == Some(&true);
+                let mut detail = if name.is_some() {
+                    v.texture_set.clone()
+                } else {
+                    v.model.clone()
+                };
+                if islander {
+                    detail.push_str(" · Islander");
+                }
+                let hover = v
+                    .species()
+                    .map_or_else(|| detail.clone(), |s| format!("{s} · {detail}"));
+                let title = name.cloned().unwrap_or_else(|| v.texture_set.clone());
+                let haystack = format!("{title} {hover} {}", v.model).to_lowercase();
+                Entry {
+                    villager: v,
+                    title,
+                    detail,
+                    hover,
+                    haystack,
+                }
+            })
+            .collect();
+        let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut others = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.villager.is_villager() {
+                let species = e.villager.species().unwrap_or("Unknown species");
+                groups.entry(species).or_default().push(i);
+            } else {
+                others.push(i);
+            }
+        }
+        let groups = groups
+            .into_iter()
+            .map(|(s, list)| (s.to_owned(), list))
+            .collect();
+        Self {
+            open: false,
+            focus_search: false,
+            search: String::new(),
+            groups,
+            others,
+            thumbs: entries.iter().map(|_| Thumb::Pending).collect(),
+            entries,
+            notes,
+            rendered: None,
+        }
+    }
+
+    pub fn open(&mut self) {
+        self.open = true;
+        self.focus_search = true;
+    }
+
+    /// Starts rendering thumbnails, villagers first in the order shown, on
+    /// a background thread. Dropping the picker stops it.
+    fn start_rendering(
+        &mut self,
+        decomp: &Decomp,
+        gpu: Option<&(wgpu::Device, wgpu::Queue)>,
+        ctx: &egui::Context,
+    ) {
+        let (sender, receiver) = channel();
+        self.rendered = Some(receiver);
+        let order: Vec<(usize, VillagerRef)> = self
+            .groups
+            .iter()
+            .flat_map(|(_, list)| list)
+            .chain(&self.others)
+            .map(|&i| (i, self.entries[i].villager.clone()))
+            .collect();
+        let decomp = decomp.clone();
+        let gpu = gpu.cloned();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("thumbnails".into())
+            .spawn(move || render_thumbnails(&decomp, &order, gpu, &sender, &ctx));
+        if let Err(e) = spawned {
+            self.notes.push(format!("No thumbnails: {e}"));
+        }
+    }
+
+    fn receive(&mut self, ctx: &egui::Context) {
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        for message in rendered.try_iter() {
+            match message {
+                Message::Thumb(i, Ok(image)) => {
+                    let texture = image.map(|image| {
+                        ctx.load_texture(format!("thumbnail {i}"), image, TextureOptions::LINEAR)
+                    });
+                    self.thumbs[i] = Thumb::Ready(texture);
+                }
+                Message::Thumb(i, Err(e)) => self.thumbs[i] = Thumb::Failed(e),
+                Message::NoRender(e) => self.notes.push(format!("No thumbnails: {e}")),
+            }
+        }
+    }
+
+    /// Shows the window while it is open, and returns the entry clicked.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        decomp: &Decomp,
+        gpu: Option<&(wgpu::Device, wgpu::Queue)>,
+    ) -> Option<VillagerRef> {
+        if !self.open {
+            return None;
+        }
+        if self.rendered.is_none() {
+            self.start_rendering(decomp, gpu, ctx);
+        }
+        self.receive(ctx);
+        let mut picked = None;
+        let mut open = self.open;
+        egui::Window::new("Import villager")
+            .open(&mut open)
+            .default_size([760.0, 560.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("name, species, or texture set")
+                            .desired_width(240.0),
+                    );
+                    if std::mem::take(&mut self.focus_search) {
+                        field.request_focus();
+                    }
+                });
+                for note in &self.notes {
+                    ui.colored_label(Color32::from_rgb(255, 170, 90), note);
+                }
+                ui.separator();
+                let search = self.search.trim().to_lowercase();
+                let matches = |i: &usize| self.entries[*i].haystack.contains(&search);
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let mut any = false;
+                        for (species, list) in &self.groups {
+                            let shown: Vec<usize> = list.iter().copied().filter(matches).collect();
+                            if shown.is_empty() {
+                                continue;
+                            }
+                            any = true;
+                            ui.strong(species);
+                            if let Some(v) = self.tiles(ui, &shown) {
+                                picked = Some(v);
+                            }
+                            ui.add_space(6.0);
+                        }
+                        let others: Vec<usize> =
+                            self.others.iter().copied().filter(matches).collect();
+                        if !others.is_empty() {
+                            any = true;
+                            egui::CollapsingHeader::new(format!(
+                                "Other entries ({})",
+                                others.len()
+                            ))
+                            .id_salt("other entries")
+                            .show(ui, |ui| {
+                                ui.label("Special characters and test entries.");
+                                if let Some(v) = self.tiles(ui, &others) {
+                                    picked = Some(v);
+                                }
+                            });
+                        }
+                        if !any {
+                            ui.label("Nothing matches the search.");
+                        }
+                    });
+            });
+        self.open = open && picked.is_none();
+        picked
+    }
+
+    /// Lays out tiles for `entries`, and returns the one clicked.
+    fn tiles(&self, ui: &mut egui::Ui, entries: &[usize]) -> Option<VillagerRef> {
+        let mut picked = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for &i in entries {
+                let entry = &self.entries[i];
+                let thumb = &self.thumbs[i];
+                let failed = matches!(thumb, Thumb::Failed(_));
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(TILE_WIDTH, TILE_HEIGHT), Sense::click());
+                let response = match thumb {
+                    Thumb::Failed(e) => response.on_hover_text(format!("Can't import: {e}")),
+                    _ => response.on_hover_text(&entry.hover),
+                };
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let visuals = ui.style().interact(&response);
+                let painter = ui.painter();
+                if response.hovered() && !failed {
+                    painter.rect_filled(rect, 4.0, visuals.bg_fill);
+                }
+                let image_rect = egui::Rect::from_min_size(
+                    rect.min + vec2((TILE_WIDTH - THUMB_SIZE) * 0.5, 4.0),
+                    vec2(THUMB_SIZE, THUMB_SIZE),
+                );
+                match thumb {
+                    Thumb::Ready(Some(texture)) => {
+                        painter.image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                    Thumb::Pending | Thumb::Ready(None) | Thumb::Failed(_) => {
+                        painter.rect_filled(image_rect, 4.0, ui.visuals().faint_bg_color);
+                        let mark = match thumb {
+                            Thumb::Pending => "…",
+                            Thumb::Failed(_) => "×",
+                            Thumb::Ready(_) => "",
+                        };
+                        painter.text(
+                            image_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            mark,
+                            egui::FontId::proportional(20.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+                }
+                let text_color = if failed {
+                    ui.visuals().weak_text_color()
+                } else {
+                    visuals.text_color()
+                };
+                let line = |y: f32, text: &str, size: f32, color: Color32| {
+                    let galley = painter.layout_no_wrap(
+                        text.to_owned(),
+                        egui::FontId::proportional(size),
+                        color,
+                    );
+                    let x = rect.center().x - galley.size().x * 0.5;
+                    painter.galley(egui::pos2(x, rect.min.y + y), galley, color);
+                };
+                line(THUMB_SIZE + 8.0, &entry.title, 14.0, text_color);
+                line(
+                    THUMB_SIZE + 26.0,
+                    &entry.detail,
+                    11.0,
+                    ui.visuals().weak_text_color(),
+                );
+                if response.clicked() && !failed {
+                    picked = Some(entry.villager.clone());
+                }
+            }
+        });
+        picked
+    }
+}
+
+/// Imports and renders each entry in `order`, sending each result until
+/// the picker is dropped. After a render fails, it only imports.
+fn render_thumbnails(
+    decomp: &Decomp,
+    order: &[(usize, VillagerRef)],
+    gpu: Option<(wgpu::Device, wgpu::Queue)>,
+    sender: &Sender<Message>,
+    ctx: &egui::Context,
+) {
+    let mut offscreen = gpu.map(|(device, queue)| Offscreen::new(device, queue, THUMB_PIXELS));
+    if offscreen.is_none() {
+        let _ = sender.send(Message::NoRender("no GPU to render with".into()));
+    }
+    for (generation, (i, villager)) in order.iter().enumerate() {
+        let result = decomp.import(villager).map_err(|e| e.to_string());
+        let result = result.map(|project| {
+            let o = offscreen.as_mut()?;
+            let scene = Arc::new(SceneData::new(
+                &project,
+                &vec![0; project.textures().len()],
+                generation as u64 + 1,
+            ));
+            let camera = Orbit::portrait(scene.mesh.bounds_min, scene.mesh.bounds_max);
+            match o.render(scene, camera.view_proj(1.0)) {
+                Ok(pixels) => {
+                    let size = THUMB_PIXELS as usize;
+                    Some(ColorImage::from_rgba_unmultiplied([size, size], &pixels))
+                }
+                Err(e) => {
+                    offscreen = None;
+                    let _ = sender.send(Message::NoRender(e));
+                    None
+                }
+            }
+        });
+        if sender.send(Message::Thumb(*i, result)).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}

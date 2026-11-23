@@ -470,6 +470,147 @@ impl CallbackTrait for ModelCallback {
     }
 }
 
+/// Draws scenes into a square image away from the window, with the Model
+/// View pipeline.
+pub struct Offscreen {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    renderer: Renderer,
+    size: u32,
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    readback: wgpu::Buffer,
+}
+
+impl Offscreen {
+    /// Background of rendered images.
+    const CLEAR: wgpu::Color = wgpu::Color {
+        r: 0.1,
+        g: 0.1,
+        b: 0.12,
+        a: 1.0,
+    };
+
+    /// An offscreen target of `size` by `size` pixels; `size` must be a
+    /// multiple of 64, so rows copy out without padding.
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, size: u32) -> Self {
+        assert!(
+            size > 0 && size.is_multiple_of(64),
+            "size {size} is not a multiple of 64"
+        );
+        // Unorm, as egui images and PNGs hold sRGB-encoded bytes directly.
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let target = |format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let color = target(
+            format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth = target(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen readback"),
+            size: u64::from(size * size * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self {
+            renderer: Renderer::new(&device, format),
+            color_view: color.create_view(&wgpu::TextureViewDescriptor::default()),
+            depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+            color,
+            readback,
+            size,
+            device,
+            queue,
+        }
+    }
+
+    /// Draws `scene` and returns the image's RGBA8 pixels, top row first.
+    /// Each scene drawn needs its own generation.
+    pub fn render(&mut self, scene: Arc<SceneData>, view_proj: Mat4) -> Result<Vec<u8>, String> {
+        let frame = ModelCallback {
+            scene,
+            view_proj,
+            linear_filter: true,
+        };
+        self.renderer.prepare(&self.device, &self.queue, &frame);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(Self::CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            self.renderer.draw(&mut pass);
+        }
+        encoder.copy_texture_to_buffer(
+            self.color.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.size * 4),
+                    rows_per_image: Some(self.size),
+                },
+            },
+            self.color.size(),
+        );
+        self.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.readback.map_async(wgpu::MapMode::Read, .., move |r| {
+            // The receiver waits below, so it is still there.
+            let _ = sender.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("rendering failed: {e}"))?;
+        receiver
+            .recv()
+            .map_err(|_| "rendering failed: the GPU dropped the readback".to_owned())?
+            .map_err(|e| format!("rendering failed: {e}"))?;
+        let pixels = self
+            .readback
+            .get_mapped_range(..)
+            .map_err(|e| format!("rendering failed: {e}"))?
+            .to_vec();
+        self.readback.unmap();
+        Ok(pixels)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,90 +643,9 @@ mod tests {
                 .unwrap();
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let target = |format, usage| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: SIZE,
-                    height: SIZE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            })
-        };
-        let color = target(
-            format,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        );
-        let depth = target(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut renderer = Renderer::new(&device, format);
-        let frame = ModelCallback {
-            scene,
-            view_proj: camera.view_proj(1.0),
-            linear_filter: true,
-        };
-        renderer.prepare(&device, &queue, &frame);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.12,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..wgpu::RenderPassDescriptor::default()
-            });
-            renderer.draw(&mut pass);
-        }
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: u64::from(SIZE * SIZE * 4),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            color.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(SIZE * 4),
-                    rows_per_image: Some(SIZE),
-                },
-            },
-            color.size(),
-        );
-        queue.submit([encoder.finish()]);
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.unwrap());
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        let pixels = readback.get_mapped_range(..).unwrap().to_vec();
+        let pixels = Offscreen::new(device, queue, SIZE)
+            .render(scene, camera.view_proj(1.0))
+            .unwrap();
 
         let file = std::fs::File::create(&out).unwrap();
         let mut png = png::Encoder::new(std::io::BufWriter::new(file), SIZE, SIZE);

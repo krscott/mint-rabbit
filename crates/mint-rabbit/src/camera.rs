@@ -21,6 +21,18 @@ impl Orbit {
         }
     }
 
+    /// A camera that frames the box from `min` to `max` closely, from
+    /// slightly to the side of the front.
+    pub fn portrait(min: Vec3, max: Vec3) -> Self {
+        let radius = ((max - min).length() * 0.5).max(1.0);
+        Self {
+            yaw: 0.3,
+            pitch: 0.15,
+            distance: radius * 2.1,
+            target: (min + max) * 0.5,
+        }
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let dir = Vec3::new(
             self.yaw.sin() * self.pitch.cos(),

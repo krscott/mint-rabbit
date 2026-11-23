@@ -13,6 +13,7 @@ use mint_core::{
 use crate::TextureExport;
 use crate::anim;
 use crate::c::{CError, CFile, Expr, Init};
+use crate::disc::{self, NamesError};
 use crate::gbi::{self, DrawState, RawVtx, TexSource};
 use crate::gx;
 use crate::{
@@ -24,6 +25,51 @@ const POSE_ANIMATION: &str = "cKF_ba_r_npc_1_wait1";
 const POSE_FILE: &str = "src/data/npc/npc_1_wait1.c";
 const DRAW_DATA_FILE: &str = "src/data/npc/npc_draw_data.c";
 const DRAW_DATA_TABLE: &str = "npc_draw_data_tbl";
+/// How each villager joins a town, in villager table order.
+const GROW_FILE: &str = "src/data/npc/grow_list.c";
+const GROW_LIST: &str = "npc_grow_list";
+const GROW_ISLANDER: &str = "mNpc_GROW_ISLANDER";
+/// The placeholder model of unused villager table entries.
+const UNUSED_MODEL: &str = "end_1";
+/// Species by model prefix (`cat` of `cat_1`).
+const SPECIES: [(&str, &str); 32] = [
+    ("ant", "Anteater"),
+    ("bea", "Bear"),
+    ("brd", "Bird"),
+    ("bul", "Bull"),
+    ("cat", "Cat"),
+    ("cbr", "Cub"),
+    ("chn", "Chicken"),
+    ("cow", "Cow"),
+    ("crd", "Alligator"),
+    ("dog", "Dog"),
+    ("duk", "Duck"),
+    ("elp", "Elephant"),
+    ("flg", "Frog"),
+    ("goa", "Goat"),
+    ("gor", "Gorilla"),
+    ("hip", "Hippo"),
+    ("hrs", "Horse"),
+    ("kal", "Koala"),
+    ("kgr", "Kangaroo"),
+    ("lon", "Lion"),
+    ("mus", "Mouse"),
+    ("oct", "Octopus"),
+    ("ost", "Ostrich"),
+    ("pbr", "Eagle"),
+    ("pgn", "Penguin"),
+    ("pig", "Pig"),
+    ("rbt", "Rabbit"),
+    ("rhn", "Rhino"),
+    ("shp", "Sheep"),
+    ("squ", "Squirrel"),
+    ("tig", "Tiger"),
+    ("wol", "Wolf"),
+];
+
+/// Villagers come first in the villager table; special characters, test
+/// entries, and unused entries follow.
+pub const VILLAGER_COUNT: usize = 236;
 const CLOTHING_PREVIEW: Rgba8 = Rgba8::new(200, 200, 210, 255);
 
 #[derive(Debug, thiserror::Error)]
@@ -111,7 +157,9 @@ pub struct Decomp {
     version: String,
 }
 
-/// One entry of the villager table: a texture set drawn on a model.
+/// One entry of the villager table: a texture set drawn on a model. Most
+/// entries are villagers; the rest are special characters, test entries,
+/// and unused entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VillagerRef {
     /// Position in `npc_draw_data_tbl`.
@@ -135,6 +183,28 @@ pub(crate) struct TableFields {
     pub texture_extra: Vec<String>,
     /// Entry fields after the texture data: scale, talk type, and so on.
     pub extra: Vec<String>,
+}
+
+impl VillagerRef {
+    /// Whether the entry is a villager, rather than a special character,
+    /// test entry, or unused entry.
+    #[must_use]
+    pub fn is_villager(&self) -> bool {
+        self.index < VILLAGER_COUNT
+    }
+
+    /// Whether the entry is unused, drawing only a placeholder model.
+    #[must_use]
+    pub fn is_unused(&self) -> bool {
+        self.model == UNUSED_MODEL
+    }
+
+    /// The species of the entry's model, such as `Cat` for `cat_1`.
+    #[must_use]
+    pub fn species(&self) -> Option<&'static str> {
+        let (prefix, _) = self.model.split_once('_')?;
+        SPECIES.iter().find(|(p, _)| *p == prefix).map(|(_, s)| *s)
+    }
 }
 
 impl Decomp {
@@ -176,6 +246,22 @@ impl Decomp {
     pub fn villagers(&self) -> Result<Vec<VillagerRef>, ImportError> {
         let file = self.read(DRAW_DATA_FILE)?;
         parse_villagers(&file)
+    }
+
+    /// The in-game names of the villagers, in villager table order, read
+    /// from the disc image in `orig/<version>`.
+    pub fn villager_names(&self) -> Result<Vec<String>, NamesError> {
+        disc::villager_names(&self.root.join("orig").join(&self.version))
+    }
+
+    /// Which villagers live on the island, by villager table index.
+    pub fn islanders(&self) -> Result<Vec<bool>, ImportError> {
+        let file = self.read(GROW_FILE)?;
+        let list = file
+            .get(GROW_LIST)
+            .and_then(|d| ident_list(&d.init))
+            .ok_or_else(|| malformed(&file, format!("{GROW_LIST} is not a list of names")))?;
+        Ok(list.iter().map(|g| g == GROW_ISLANDER).collect())
     }
 
     /// The villager table entry for texture set `texture_set`.
@@ -830,10 +916,41 @@ mod tests {
         assert_eq!(cat.eyes.len(), 8);
         assert_eq!(cat.mouths.len(), 6);
 
+        assert!(
+            villagers[..VILLAGER_COUNT]
+                .iter()
+                .all(|v| v.species().is_some())
+        );
+        let grow = CFile::read(&root.join(GROW_FILE), &[]).unwrap();
+        let grow = ident_list(&grow.get(GROW_LIST).unwrap().init).unwrap();
+        assert!(grow.len() >= VILLAGER_COUNT);
+        assert_eq!(grow.iter().filter(|g| *g == GROW_ISLANDER).count(), 18);
+
         let pose = CFile::read(&root.join(POSE_FILE), &[]).unwrap();
         let rotations = anim::sample(&pose, POSE_ANIMATION, 26, 1.0).unwrap();
         assert_eq!(rotations.len(), 26);
         eprintln!("{rotations:?}");
+    }
+
+    #[test]
+    fn species_come_from_model_prefixes() {
+        let mut v = parse_villagers(
+            &CFile::parse_str(
+                Path::new("t.c"),
+                "aNPC_draw_data_c npc_draw_data_tbl[] = {
+                    { 0, 0, &cKF_bs_r_cat_1, { cat_2_tmem_txt, cat_2_pal, { NULL }, { NULL } } },
+                };",
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(v.species(), Some("Cat"));
+        assert!(v.is_villager() && !v.is_unused());
+        v.model = "end_1".into();
+        v.index = VILLAGER_COUNT;
+        assert_eq!(v.species(), None);
+        assert!(!v.is_villager() && v.is_unused());
     }
 
     #[test]

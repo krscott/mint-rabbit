@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
-use eframe::egui_wgpu;
+use eframe::egui_wgpu::{self, wgpu};
 use glam::Vec3;
 use mint_ac::{Decomp, VillagerRef};
 use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
@@ -13,6 +13,7 @@ use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
 use crate::camera::Orbit;
 use crate::editor::Editor;
 use crate::panels;
+use crate::picker::Picker;
 use crate::render::{ModelCallback, Renderer, SceneData};
 use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
 
@@ -131,7 +132,7 @@ enum Request {
 
 /// Where a replacing project comes from.
 enum Replace {
-    Import,
+    Import(VillagerRef),
     Open(PathBuf),
     /// Close the window.
     Quit,
@@ -141,8 +142,10 @@ pub struct App {
     decomp_path: String,
     version: String,
     decomp: Option<Decomp>,
-    villagers: Vec<VillagerRef>,
-    villager: usize,
+    /// Lists the open decomp's villagers to import.
+    picker: Option<Picker>,
+    /// The window's GPU, which also renders the picker's thumbnails.
+    gpu: Option<(wgpu::Device, wgpu::Queue)>,
     doc: Option<Doc>,
     /// Counts scene rebuilds, so the renderer uploads each new one.
     generation: u64,
@@ -170,6 +173,10 @@ impl App {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             Renderer::install(rs);
         }
+        let gpu = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|rs| (rs.device.clone(), rs.queue.clone()));
         // A press anywhere else, a drag included, leaves a text field, so
         // keys and edits go where the pointer went.
         cc.egui_ctx.options_mut(|o| {
@@ -183,8 +190,8 @@ impl App {
                 .unwrap_or_default(),
             version: options.game_version,
             decomp: None,
-            villagers: Vec::new(),
-            villager: 0,
+            picker: None,
+            gpu,
             doc: None,
             generation: 0,
             camera: Orbit::framing(Vec3::splat(-1.0), Vec3::ONE),
@@ -227,13 +234,17 @@ impl App {
             .and_then(|d| d.villagers().map(|v| (d, v)));
         match result {
             Ok((d, v)) => {
+                let mut picker = Picker::new(&d, v);
+                // With nothing open yet, importing is the next step.
+                if self.doc.is_none() {
+                    picker.open();
+                }
+                self.picker = Some(picker);
                 self.decomp = Some(d);
-                self.villagers = v;
-                self.villager = 0;
             }
             Err(e) => {
                 self.decomp = None;
-                self.villagers.clear();
+                self.picker = None;
                 self.fail(e.to_string());
             }
         }
@@ -266,7 +277,7 @@ impl App {
 
     fn do_replace(&mut self, replace: Replace, ctx: &egui::Context) {
         match replace {
-            Replace::Import => self.import(),
+            Replace::Import(v) => self.import(&v),
             Replace::Open(dir) => self.open_project(&dir),
             Replace::Quit => {
                 self.quitting = true;
@@ -275,9 +286,9 @@ impl App {
         }
     }
 
-    fn import(&mut self) {
+    fn import(&mut self, v: &VillagerRef) {
         self.status = None;
-        let (Some(decomp), Some(v)) = (&self.decomp, self.villagers.get(self.villager)) else {
+        let Some(decomp) = &self.decomp else {
             return;
         };
         match decomp.import(v) {
@@ -433,19 +444,10 @@ impl App {
             if ui.button("Open decomp").clicked() || enter {
                 self.open_decomp();
             }
-            if !self.villagers.is_empty() {
+            if let Some(picker) = &mut self.picker {
                 ui.separator();
-                let label = |v: &VillagerRef| format!("{} ({})", v.texture_set, v.model);
-                egui::ComboBox::from_id_salt("villager")
-                    .selected_text(label(&self.villagers[self.villager]))
-                    .height(400.0)
-                    .show_ui(ui, |ui| {
-                        for (i, v) in self.villagers.iter().enumerate() {
-                            ui.selectable_value(&mut self.villager, i, label(v));
-                        }
-                    });
-                if ui.button("Import").clicked() {
-                    self.replace(Replace::Import, ui.ctx());
+                if ui.button("Import…").clicked() {
+                    picker.open();
                 }
             }
         });
@@ -869,6 +871,11 @@ impl eframe::App for App {
                 self.texture_view(ui);
             });
         });
+        if let (Some(picker), Some(decomp)) = (&mut self.picker, &self.decomp)
+            && let Some(v) = picker.show(&ctx, decomp, self.gpu.as_ref())
+        {
+            self.replace(Replace::Import(v), &ctx);
+        }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
         self.confirm_dialog(&ctx);

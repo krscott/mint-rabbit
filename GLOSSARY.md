@@ -15,8 +15,7 @@ _Avoid_: File, scene, workspace
 
 **Model**:
 The node tree a project edits, with the meshes its nodes own.
-_Avoid_: Character, scene; villager and species are Animal Crossing export
-terms
+_Avoid_: Character, scene; villager and species are Animal Crossing terms
 
 **Base Model**:
 The model and textures a project was imported from.
@@ -122,3 +121,28 @@ A destination format together with its constraints, such as an Animal Crossing
 villager; each project records one, and its constraints are checked while
 editing.
 _Avoid_: Platform, backend
+
+### Animal Crossing
+
+The first export target's own language. The rest of the glossary stays
+independent of it.
+
+**Villager**:
+An animal who can live in an Animal Crossing town or on its island, with an
+in-game name, drawn as a texture set on a model of its species. Special
+characters, such as Tom Nook, are not villagers.
+_Avoid_: NPC, character
+
+**Species**:
+The kind of animal a villager is, such as Cat or Wolf; each villager model
+belongs to one species.
+_Avoid_: Animal type, race
+
+**Texture Set**:
+The textures a villager is drawn with (body, eyes, and mouth), named after the
+villager, such as `cat_2`; an export replaces one or adds a new one.
+_Avoid_: Skin, villager textures
+
+**Islander**:
+A villager who lives on the island instead of moving into town.
+_Avoid_: Island villager

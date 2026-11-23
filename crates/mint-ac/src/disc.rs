@@ -1,0 +1,311 @@
+//! Reads villagers' in-game names from the disc image a decomp was set up
+//! from. The decomp's sources don't hold them, and asset extraction leaves
+//! them on the disc.
+
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::{Path, PathBuf};
+
+/// The archive at the disc root that holds the name table.
+const NAME_ARCHIVE: &str = "forest_2nd.arc";
+/// One fixed-width record per villager, in villager id order.
+const NAME_TABLE: &str = "npc_name_str_table.bin";
+/// Bytes per name record, padded with spaces.
+const NAME_LEN: usize = 8;
+
+#[derive(Debug, thiserror::Error)]
+pub enum NamesError {
+    #[error("no disc image (.iso or .gcm) in {0}, so villagers show texture set names")]
+    NoDisc(PathBuf),
+    #[error("{0} holds several disc images, so it's unclear which to read names from: {1:?}")]
+    ManyDiscs(PathBuf, Vec<PathBuf>),
+    #[error("{0}: {1}")]
+    Io(PathBuf, std::io::Error),
+    #[error("{path}: {problem}")]
+    Malformed { path: PathBuf, problem: String },
+}
+
+/// The names of the villagers, in villager table order, read from the one
+/// disc image (`.iso` or `.gcm`) in `dir`.
+pub(crate) fn villager_names(dir: &Path) -> Result<Vec<String>, NamesError> {
+    let path = find_disc(dir)?;
+    let mut disc = Disc::open(&path)?;
+    let arc = disc.root_file(NAME_ARCHIVE)?;
+    let malformed = |problem: String| NamesError::Malformed {
+        path: path.clone(),
+        problem: format!("{NAME_ARCHIVE}: {problem}"),
+    };
+    let table = rarc_file(&arc, NAME_TABLE).map_err(malformed)?;
+    decode_names(table).map_err(|p| NamesError::Malformed {
+        path: path.clone(),
+        problem: format!("{NAME_ARCHIVE}/{NAME_TABLE}: {p}"),
+    })
+}
+
+fn find_disc(dir: &Path) -> Result<PathBuf, NamesError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => NamesError::NoDisc(dir.to_owned()),
+        _ => NamesError::Io(dir.to_owned(), e),
+    })?;
+    let mut discs = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| NamesError::Io(dir.to_owned(), e))?.path();
+        let disc = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("iso") || e.eq_ignore_ascii_case("gcm"));
+        if disc && path.is_file() {
+            discs.push(path);
+        }
+    }
+    discs.sort();
+    match discs.len() {
+        0 => Err(NamesError::NoDisc(dir.to_owned())),
+        1 => Ok(discs.remove(0)),
+        _ => Err(NamesError::ManyDiscs(dir.to_owned(), discs)),
+    }
+}
+
+fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let b = bytes.get(at..at.checked_add(4)?)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn be16(bytes: &[u8], at: usize) -> Option<u16> {
+    let b = bytes.get(at..at.checked_add(2)?)?;
+    Some(u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// The NUL-terminated name at `at`.
+fn c_str(bytes: &[u8], at: usize) -> Option<&[u8]> {
+    let rest = bytes.get(at..)?;
+    rest.iter().position(|&b| b == 0).map(|end| &rest[..end])
+}
+
+/// An uncompressed `GameCube` disc image (GCM).
+struct Disc {
+    path: PathBuf,
+    file: File,
+}
+
+impl Disc {
+    fn open(path: &Path) -> Result<Self, NamesError> {
+        let file = File::open(path).map_err(|e| NamesError::Io(path.to_owned(), e))?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+        })
+    }
+
+    fn malformed(&self, problem: impl Into<String>) -> NamesError {
+        NamesError::Malformed {
+            path: self.path.clone(),
+            problem: problem.into(),
+        }
+    }
+
+    fn read(&mut self, offset: u32, len: u32) -> Result<Vec<u8>, NamesError> {
+        let mut buf = vec![0; len as usize];
+        self.file
+            .seek(SeekFrom::Start(u64::from(offset)))
+            .and_then(|_| self.file.read_exact(&mut buf))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => self.malformed(format!(
+                    "ends before {len} bytes at {offset:#x}; is this an uncompressed disc image?"
+                )),
+                _ => NamesError::Io(self.path.clone(), e),
+            })?;
+        Ok(buf)
+    }
+
+    /// The contents of the file `name` in the disc's root directory.
+    fn root_file(&mut self, name: &str) -> Result<Vec<u8>, NamesError> {
+        // The disc header gives the file system table's offset and size.
+        let header = self.read(0x424, 8)?;
+        let (fst_offset, fst_size) = (be32(&header, 0).unwrap(), be32(&header, 4).unwrap());
+        let fst = self.read(fst_offset, fst_size)?;
+        // Entry 0 is the root directory; its size field counts every entry.
+        let count = be32(&fst, 8).ok_or_else(|| self.malformed("file system table is empty"))?;
+        let names = count as usize * 12;
+        let mut i = 1;
+        while i < count as usize {
+            let entry = |field: usize| be32(&fst, i * 12 + field);
+            let (Some(kind_name), Some(offset), Some(size)) = (entry(0), entry(4), entry(8)) else {
+                return Err(self.malformed(format!("file system table entry {i} is cut off")));
+            };
+            let is_dir = kind_name >> 24 != 0;
+            let entry_name = c_str(&fst, names + (kind_name & 0x00ff_ffff) as usize)
+                .ok_or_else(|| self.malformed(format!("file system name {i} is cut off")))?;
+            if is_dir {
+                // A directory's size field is the index after its last entry.
+                let next = size as usize;
+                if next <= i {
+                    return Err(self.malformed(format!("directory entry {i} ends before itself")));
+                }
+                i = next;
+                continue;
+            }
+            if entry_name == name.as_bytes() {
+                return self.read(offset, size);
+            }
+            i += 1;
+        }
+        Err(self.malformed(format!(
+            "{name} is not in the disc's root directory; is this an Animal Crossing disc?"
+        )))
+    }
+}
+
+/// The contents of the file `name` in a RARC archive.
+fn rarc_file<'a>(arc: &'a [u8], name: &str) -> Result<&'a [u8], String> {
+    if arc.starts_with(b"Yaz0") {
+        return Err("the archive is compressed, which is not supported".into());
+    }
+    if !arc.starts_with(b"RARC") {
+        return Err("not a RARC archive".into());
+    }
+    // Offsets in the info block are relative to its start, just after the
+    // 0x20-byte header.
+    let base = 0x20;
+    let cut = || "the archive is cut off".to_owned();
+    let data = base + be32(arc, 0x0c).ok_or_else(cut)? as usize;
+    let count = be32(arc, base + 0x08).ok_or_else(cut)? as usize;
+    let entries = base + be32(arc, base + 0x0c).ok_or_else(cut)? as usize;
+    let strings = base + be32(arc, base + 0x14).ok_or_else(cut)? as usize;
+    for i in 0..count {
+        let at = entries + i * 0x14;
+        let (Some(flags_name), Some(offset), Some(size)) =
+            (be32(arc, at + 4), be32(arc, at + 8), be32(arc, at + 12))
+        else {
+            return Err(cut());
+        };
+        let flags = flags_name >> 24;
+        let is_file = flags & 0x01 != 0;
+        let entry_name = be16(arc, at + 6)
+            .and_then(|n| c_str(arc, strings + usize::from(n)))
+            .ok_or_else(cut)?;
+        if !is_file || entry_name != name.as_bytes() {
+            continue;
+        }
+        if flags & 0x04 != 0 {
+            return Err(format!("{name} is compressed, which is not supported"));
+        }
+        let start = data + offset as usize;
+        return arc
+            .get(start..start + size as usize)
+            .ok_or_else(|| format!("{name} runs past the end of the archive"));
+    }
+    Err(format!("{name} is missing"))
+}
+
+/// Whether the game's font draws `b` as the same character as ASCII. The
+/// font reuses the other codes below 0x80 for accented letters and symbols.
+fn ascii_compatible(b: u8) -> bool {
+    matches!(b,
+        b' ' | b'!' | b'"' | b'%'..=b')' | b','..=b'.' | b'0'..=b':' | b'<'..=b'Z' | b'_' | b'a'..=b'z'
+    )
+}
+
+/// Splits a name table into names, trimming their space padding.
+fn decode_names(table: &[u8]) -> Result<Vec<String>, String> {
+    if !table.len().is_multiple_of(NAME_LEN) {
+        return Err(format!(
+            "its size, {}, is not a multiple of {NAME_LEN}",
+            table.len()
+        ));
+    }
+    table
+        .chunks(NAME_LEN)
+        .enumerate()
+        .map(|(i, record)| {
+            if let Some(&b) = record.iter().find(|&&b| !ascii_compatible(b)) {
+                return Err(format!(
+                    "name {i} has character code {b:#04x}, which is not plain ASCII in the game's font"
+                ));
+            }
+            Ok(String::from_utf8_lossy(record).trim_end().to_owned())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_trim_padding() {
+        assert_eq!(
+            decode_names(b"Bob     O'Hare  T-Bone  ").unwrap(),
+            ["Bob", "O'Hare", "T-Bone"]
+        );
+    }
+
+    #[test]
+    fn names_refuse_font_only_codes() {
+        // 0x23 is an accented letter in the game's font, not '#'.
+        let e = decode_names(b"Bo#     ").unwrap_err();
+        assert!(e.contains("0x23"), "{e}");
+        assert!(decode_names(b"Bob").is_err());
+    }
+
+    /// A RARC archive holding the files `files`.
+    fn rarc(files: &[(&str, &[u8], u8)]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut data = Vec::new();
+        let mut entries = Vec::new();
+        for (name, bytes, flags) in files {
+            let name_at = strings.len() as u16;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            entries.extend_from_slice(&[0, 0, 0, 0]);
+            entries.push(*flags);
+            entries.push(0);
+            entries.extend_from_slice(&name_at.to_be_bytes());
+            entries.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            entries.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            entries.extend_from_slice(&[0; 4]);
+            data.extend_from_slice(bytes);
+        }
+        let info_len = 0x20;
+        let entries_at = info_len;
+        let strings_at = entries_at + entries.len();
+        let data_at = strings_at + strings.len();
+        let mut arc = b"RARC".to_vec();
+        arc.extend_from_slice(&[0; 8]);
+        arc.extend_from_slice(&(data_at as u32).to_be_bytes());
+        arc.resize(0x20, 0);
+        let mut info = vec![0; info_len];
+        info[8..12].copy_from_slice(&(files.len() as u32).to_be_bytes());
+        info[12..16].copy_from_slice(&(entries_at as u32).to_be_bytes());
+        info[20..24].copy_from_slice(&(strings_at as u32).to_be_bytes());
+        arc.extend(info);
+        arc.extend(entries);
+        arc.extend(strings);
+        arc.extend(data);
+        arc
+    }
+
+    #[test]
+    fn rarc_finds_files_by_name() {
+        let arc = rarc(&[("a.bin", b"first", 0x01), (NAME_TABLE, b"Bob     ", 0x21)]);
+        assert_eq!(rarc_file(&arc, NAME_TABLE).unwrap(), b"Bob     ");
+        assert!(rarc_file(&arc, "c.bin").unwrap_err().contains("missing"));
+        let packed = rarc(&[(NAME_TABLE, b"x", 0x05)]);
+        assert!(
+            rarc_file(&packed, NAME_TABLE)
+                .unwrap_err()
+                .contains("compressed")
+        );
+    }
+
+    /// Reads the names from the disc image in the decomp named by
+    /// `MINT_AC_DECOMP`.
+    #[test]
+    #[ignore = "needs an ac-decomp checkout with a US disc image in MINT_AC_DECOMP"]
+    fn disc_names_read() {
+        let root = PathBuf::from(std::env::var("MINT_AC_DECOMP").expect("MINT_AC_DECOMP"));
+        let names = villager_names(&root.join("orig/GAFE01_00")).unwrap();
+        assert_eq!(names.len(), crate::VILLAGER_COUNT);
+        assert_eq!(names[..3], ["Bob", "Olivia", "Mitzi"]);
+        assert!(names.iter().any(|n| n == "O'Hare"), "{names:?}");
+    }
+}

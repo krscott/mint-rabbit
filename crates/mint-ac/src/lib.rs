@@ -3,18 +3,20 @@
 
 mod anim;
 mod c;
+mod disc;
 mod export;
 mod gbi;
 mod gx;
 mod import;
 
+pub use disc::NamesError;
 pub use export::{
     Export, ExportError, ImportedFrom, TextureExport, VILLAGER_JOINT_CHILDREN, export,
     export_textures, imported_from,
 };
 /// The color the game shows for a palette entry.
 pub use gx::quantize_rgb5a3 as quantize_color;
-pub use import::{Decomp, ImportError, VillagerRef, WriteError};
+pub use import::{Decomp, ImportError, VILLAGER_COUNT, VillagerRef, WriteError};
 
 #[cfg(test)]
 mod roundtrip;
