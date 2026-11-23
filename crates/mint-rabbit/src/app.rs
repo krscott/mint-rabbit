@@ -299,7 +299,7 @@ impl App {
             Ok(project) => {
                 self.set_doc(project, None);
                 if let Some(picker) = &mut self.picker {
-                    picker.close();
+                    picker.imported(v);
                 }
             }
             // The picker stays open, to pick another.

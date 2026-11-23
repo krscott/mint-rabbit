@@ -97,10 +97,11 @@ fn be16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes([b[0], b[1]]))
 }
 
-/// The NUL-terminated name at `at`.
-fn c_str(bytes: &[u8], at: usize) -> Option<&[u8]> {
-    let rest = bytes.get(at..)?;
-    rest.iter().position(|&b| b == 0).map(|end| &rest[..end])
+/// Whether the NUL-terminated name at `at` is `name`. It reads only as far
+/// as `name` is long, however the table is laid out.
+fn name_at(bytes: &[u8], at: usize, name: &str) -> bool {
+    let end = at.saturating_add(name.len());
+    bytes.get(at..end) == Some(name.as_bytes()) && bytes.get(end) == Some(&0)
 }
 
 /// An uncompressed `GameCube` disc image (GCM).
@@ -166,8 +167,6 @@ impl Disc {
                 return Err(self.malformed(format!("file system table entry {i} is cut off")));
             };
             let is_dir = kind_name >> 24 != 0;
-            let entry_name = c_str(&fst, names + (kind_name & 0x00ff_ffff) as usize)
-                .ok_or_else(|| self.malformed(format!("file system name {i} is cut off")))?;
             if is_dir {
                 // A directory's size field is the index after its last entry.
                 let next = size as usize;
@@ -177,7 +176,7 @@ impl Disc {
                 i = next;
                 continue;
             }
-            if entry_name == name.as_bytes() {
+            if name_at(&fst, names + (kind_name & 0x00ff_ffff) as usize, name) {
                 return self.read(offset, size);
             }
             i += 1;
@@ -213,10 +212,8 @@ fn rarc_file<'a>(arc: &'a [u8], name: &str) -> Result<&'a [u8], String> {
         };
         let flags = flags_name >> 24;
         let is_file = flags & 0x01 != 0;
-        let entry_name = be16(arc, at + 6)
-            .and_then(|n| c_str(arc, strings + usize::from(n)))
-            .ok_or_else(cut)?;
-        if !is_file || entry_name != name.as_bytes() {
+        let name_offset = be16(arc, at + 6).ok_or_else(cut)?;
+        if !is_file || !name_at(arc, strings + usize::from(name_offset), name) {
             continue;
         }
         if flags & 0x04 != 0 {

@@ -161,8 +161,19 @@ impl Picker {
         self.focus_search = true;
     }
 
-    pub fn close(&mut self) {
+    /// Closes the window after `v` imported, clearing any earlier failure
+    /// to import it.
+    pub fn imported(&mut self, v: &VillagerRef) {
         self.open = false;
+        let entry = self
+            .entries
+            .iter()
+            .position(|e| e.villager.index == v.index);
+        if let Some(i) = entry
+            && matches!(self.thumbs[i], Thumb::Failed(_))
+        {
+            self.thumbs[i] = Thumb::Ready(None);
+        }
     }
 
     /// Lists the decomp's villagers again, so thumbnails show what it holds
@@ -247,8 +258,8 @@ impl Picker {
     }
 
     /// Shows the window while it is open, and returns the entry clicked.
-    /// A click leaves the window open; the caller closes it once the entry
-    /// imports.
+    /// A click leaves the window open until the caller reports the import
+    /// with [`Picker::imported`].
     pub fn show(&mut self, ctx: &egui::Context) -> Option<VillagerRef> {
         if !self.open {
             return None;
