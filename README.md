@@ -60,16 +60,18 @@ just format
 just check
 ```
 
+The decomp recipes take an ac-decomp checkout as PATH, which defaults to
+`MINT_AC_DECOMP`.
+
 - `just test-decomp-sources [PATH]` parses every model source and the
   villager table of a decomp checkout, built or not.
 - `just test-decomp [PATH]` also round-trips every villager (import, export,
   import), saves and loads each as a project, checks that each texture
   export could replace its source in the decomp, and reads the villager names
   from the disc image; it needs a built checkout with its disc image.
-- PATH defaults to `MINT_AC_DECOMP`.
-- `just snapshot [PATH]` renders the first villager of a decomp (default
-  `MINT_AC_DECOMP`, else the demo) offscreen to `target/model-view.png`; it
-  needs a GPU.
+- `just snapshot [PATH]` renders the first villager of a decomp (the demo
+  when neither is given) offscreen to `target/model-view.png`; it needs a
+  GPU.
 
 `just check` checks formatting, runs ShellCheck and Clippy, and validates the
 flake without rewriting source files. Formatting and shell checks cover tracked

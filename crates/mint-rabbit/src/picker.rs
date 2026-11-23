@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, vec2};
 use eframe::egui_wgpu::wgpu;
@@ -25,8 +25,9 @@ struct Entry {
     villager: VillagerRef,
     /// The in-game name, or the texture set name when names are unknown.
     title: String,
-    /// The texture set, or the model when the title is the texture set,
-    /// and whether it is an islander.
+    /// The texture set, or the model and table position when the title is
+    /// the texture set (which some entries share), and whether it is an
+    /// islander.
     detail: String,
     /// Species and detail.
     hover: String,
@@ -42,6 +43,16 @@ enum Thumb {
     Failed(String),
 }
 
+/// GPU handles to render thumbnails with.
+pub type Gpu = (wgpu::Device, wgpu::Queue);
+
+/// Progress of the thumbnail thread.
+enum Rendering {
+    NotStarted,
+    Running(Receiver<Message>),
+    Done,
+}
+
 /// What the thumbnail thread reports.
 enum Message {
     /// An entry, by position, imported (with its thumbnail when it
@@ -52,25 +63,28 @@ enum Message {
 }
 
 pub struct Picker {
+    decomp: Decomp,
+    gpu: Option<Gpu>,
     open: bool,
     /// Focus the search on the next frame shown.
     focus_search: bool,
     search: String,
     /// Villagers grouped by species, in species order.
-    groups: Vec<(String, Vec<usize>)>,
+    groups: Vec<(&'static str, Vec<usize>)>,
     /// Special characters and test entries.
     others: Vec<usize>,
     entries: Vec<Entry>,
     thumbs: Vec<Thumb>,
     /// Why names or islanders are missing, shown above the tiles.
     notes: Vec<String>,
-    rendered: Option<Receiver<Message>>,
+    rendering: Rendering,
 }
 
 impl Picker {
     /// Lists the villager table of `decomp`, naming entries from its disc
-    /// image when it can be read.
-    pub fn new(decomp: &Decomp, villagers: Vec<VillagerRef>) -> Self {
+    /// image when it can be read. Thumbnails render with `gpu` once the
+    /// picker first opens.
+    pub fn new(decomp: Decomp, villagers: Vec<VillagerRef>, gpu: Option<Gpu>) -> Self {
         let mut notes = Vec::new();
         let names = decomp.villager_names().unwrap_or_else(|e| {
             notes.push(format!("No in-game names: {e}"));
@@ -89,7 +103,7 @@ impl Picker {
                 let mut detail = if name.is_some() {
                     v.texture_set.clone()
                 } else {
-                    v.model.clone()
+                    format!("{} · entry {}", v.model, v.index)
                 };
                 if islander {
                     detail.push_str(" · Islander");
@@ -118,20 +132,18 @@ impl Picker {
                 others.push(i);
             }
         }
-        let groups = groups
-            .into_iter()
-            .map(|(s, list)| (s.to_owned(), list))
-            .collect();
         Self {
+            decomp,
+            gpu,
             open: false,
             focus_search: false,
             search: String::new(),
-            groups,
+            groups: groups.into_iter().collect(),
             others,
             thumbs: entries.iter().map(|_| Thumb::Pending).collect(),
             entries,
             notes,
-            rendered: None,
+            rendering: Rendering::NotStarted,
         }
     }
 
@@ -140,16 +152,15 @@ impl Picker {
         self.focus_search = true;
     }
 
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
     /// Starts rendering thumbnails, villagers first in the order shown, on
     /// a background thread. Dropping the picker stops it.
-    fn start_rendering(
-        &mut self,
-        decomp: &Decomp,
-        gpu: Option<&(wgpu::Device, wgpu::Queue)>,
-        ctx: &egui::Context,
-    ) {
+    fn start_rendering(&mut self, ctx: &egui::Context) {
         let (sender, receiver) = channel();
-        self.rendered = Some(receiver);
+        self.rendering = Rendering::Running(receiver);
         let order: Vec<(usize, VillagerRef)> = self
             .groups
             .iter()
@@ -157,8 +168,8 @@ impl Picker {
             .chain(&self.others)
             .map(|&i| (i, self.entries[i].villager.clone()))
             .collect();
-        let decomp = decomp.clone();
-        let gpu = gpu.cloned();
+        let decomp = self.decomp.clone();
+        let gpu = self.gpu.clone();
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("thumbnails".into())
@@ -169,10 +180,31 @@ impl Picker {
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
-        let Some(rendered) = &self.rendered else {
+        let Rendering::Running(receiver) = &self.rendering else {
             return;
         };
-        for message in rendered.try_iter() {
+        loop {
+            let message = match receiver.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // The thread finished, or died before reporting every
+                    // entry; those stay importable, without a thumbnail.
+                    let mut stopped = false;
+                    for t in &mut self.thumbs {
+                        if matches!(t, Thumb::Pending) {
+                            *t = Thumb::Ready(None);
+                            stopped = true;
+                        }
+                    }
+                    if stopped {
+                        self.notes
+                            .push("No more thumbnails: the thumbnail thread stopped".into());
+                    }
+                    self.rendering = Rendering::Done;
+                    return;
+                }
+            };
             match message {
                 Message::Thumb(i, Ok(image)) => {
                     let texture = image.map(|image| {
@@ -187,17 +219,13 @@ impl Picker {
     }
 
     /// Shows the window while it is open, and returns the entry clicked.
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        decomp: &Decomp,
-        gpu: Option<&(wgpu::Device, wgpu::Queue)>,
-    ) -> Option<VillagerRef> {
+    /// The window stays open until [`Picker::close`].
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<VillagerRef> {
         if !self.open {
             return None;
         }
-        if self.rendered.is_none() {
-            self.start_rendering(decomp, gpu, ctx);
+        if matches!(self.rendering, Rendering::NotStarted) {
+            self.start_rendering(ctx);
         }
         self.receive(ctx);
         let mut picked = None;
@@ -234,7 +262,7 @@ impl Picker {
                                 continue;
                             }
                             any = true;
-                            ui.strong(species);
+                            ui.strong(*species);
                             if let Some(v) = self.tiles(ui, &shown) {
                                 picked = Some(v);
                             }
@@ -249,6 +277,8 @@ impl Picker {
                                 others.len()
                             ))
                             .id_salt("other entries")
+                            // Search results don't hide behind the header.
+                            .open((!search.is_empty()).then_some(true))
                             .show(ui, |ui| {
                                 ui.label("Special characters and test entries.");
                                 if let Some(v) = self.tiles(ui, &others) {
@@ -261,7 +291,7 @@ impl Picker {
                         }
                     });
             });
-        self.open = open && picked.is_none();
+        self.open = open;
         picked
     }
 
@@ -352,7 +382,7 @@ impl Picker {
 fn render_thumbnails(
     decomp: &Decomp,
     order: &[(usize, VillagerRef)],
-    gpu: Option<(wgpu::Device, wgpu::Queue)>,
+    gpu: Option<Gpu>,
     sender: &Sender<Message>,
     ctx: &egui::Context,
 ) {
@@ -360,14 +390,14 @@ fn render_thumbnails(
     if offscreen.is_none() {
         let _ = sender.send(Message::NoRender("no GPU to render with".into()));
     }
-    for (generation, (i, villager)) in order.iter().enumerate() {
+    for (i, villager) in order {
         let result = decomp.import(villager).map_err(|e| e.to_string());
         let result = result.map(|project| {
             let o = offscreen.as_mut()?;
             let scene = Arc::new(SceneData::new(
                 &project,
                 &vec![0; project.textures().len()],
-                generation as u64 + 1,
+                0,
             ));
             let camera = Orbit::portrait(scene.mesh.bounds_min, scene.mesh.bounds_max);
             match o.render(scene, camera.view_proj(1.0)) {

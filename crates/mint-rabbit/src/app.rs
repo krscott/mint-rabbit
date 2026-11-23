@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
-use eframe::egui_wgpu::{self, wgpu};
+use eframe::egui_wgpu;
 use glam::Vec3;
 use mint_ac::{Decomp, VillagerRef};
 use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
@@ -13,7 +13,7 @@ use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
 use crate::camera::Orbit;
 use crate::editor::Editor;
 use crate::panels;
-use crate::picker::Picker;
+use crate::picker::{Gpu, Picker};
 use crate::render::{ModelCallback, Renderer, SceneData};
 use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
 
@@ -145,7 +145,7 @@ pub struct App {
     /// Lists the open decomp's villagers to import.
     picker: Option<Picker>,
     /// The window's GPU, which also renders the picker's thumbnails.
-    gpu: Option<(wgpu::Device, wgpu::Queue)>,
+    gpu: Option<Gpu>,
     doc: Option<Doc>,
     /// Counts scene rebuilds, so the renderer uploads each new one.
     generation: u64,
@@ -217,6 +217,7 @@ impl App {
         if let Some(dir) = options.project {
             app.open_project(&dir);
         }
+        app.offer_import();
         app
     }
 
@@ -234,12 +235,7 @@ impl App {
             .and_then(|d| d.villagers().map(|v| (d, v)));
         match result {
             Ok((d, v)) => {
-                let mut picker = Picker::new(&d, v);
-                // With nothing open yet, importing is the next step.
-                if self.doc.is_none() {
-                    picker.open();
-                }
-                self.picker = Some(picker);
+                self.picker = Some(Picker::new(d.clone(), v, self.gpu.clone()));
                 self.decomp = Some(d);
             }
             Err(e) => {
@@ -247,6 +243,26 @@ impl App {
                 self.picker = None;
                 self.fail(e.to_string());
             }
+        }
+    }
+
+    /// Opens the picker when nothing is open yet, since importing is then
+    /// the next step.
+    fn offer_import(&mut self) {
+        if self.doc.is_none()
+            && let Some(picker) = &mut self.picker
+        {
+            picker.open();
+        }
+    }
+
+    /// Lists the decomp's villagers again, so thumbnails show what it holds
+    /// now.
+    fn reload_picker(&mut self) {
+        let Some(decomp) = &self.decomp else { return };
+        match decomp.villagers() {
+            Ok(v) => self.picker = Some(Picker::new(decomp.clone(), v, self.gpu.clone())),
+            Err(e) => self.fail(e.to_string()),
         }
     }
 
@@ -277,7 +293,12 @@ impl App {
 
     fn do_replace(&mut self, replace: Replace, ctx: &egui::Context) {
         match replace {
-            Replace::Import(v) => self.import(&v),
+            Replace::Import(v) => {
+                if let Some(picker) = &mut self.picker {
+                    picker.close();
+                }
+                self.import(&v);
+            }
             Replace::Open(dir) => self.open_project(&dir),
             Replace::Quit => {
                 self.quitting = true;
@@ -443,6 +464,7 @@ impl App {
             let enter = path.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if ui.button("Open decomp").clicked() || enter {
                 self.open_decomp();
+                self.offer_import();
             }
             if let Some(picker) = &mut self.picker {
                 ui.separator();
@@ -788,6 +810,7 @@ impl App {
                     let result = self.decomp.as_ref().map(|d| d.write_texture_set(&export));
                     match result {
                         Some(Ok(path)) => {
+                            self.reload_picker();
                             self.tell(format!(
                                 "Wrote {}; build with `python configure.py --non-matching && ninja`",
                                 path.display()
@@ -871,8 +894,8 @@ impl eframe::App for App {
                 self.texture_view(ui);
             });
         });
-        if let (Some(picker), Some(decomp)) = (&mut self.picker, &self.decomp)
-            && let Some(v) = picker.show(&ctx, decomp, self.gpu.as_ref())
+        if let Some(picker) = &mut self.picker
+            && let Some(v) = picker.show(&ctx)
         {
             self.replace(Replace::Import(v), &ctx);
         }

@@ -541,13 +541,14 @@ impl Offscreen {
     }
 
     /// Draws `scene` and returns the image's RGBA8 pixels, top row first.
-    /// Each scene drawn needs its own generation.
     pub fn render(&mut self, scene: Arc<SceneData>, view_proj: Mat4) -> Result<Vec<u8>, String> {
         let frame = ModelCallback {
             scene,
             view_proj,
             linear_filter: true,
         };
+        // Each call may draw a different scene, whatever its generation.
+        self.renderer.scene = None;
         self.renderer.prepare(&self.device, &self.queue, &frame);
         let mut encoder = self
             .device

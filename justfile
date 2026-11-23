@@ -32,22 +32,11 @@ test:
 
 # Parse every model source and the villager table of an ac-decomp checkout (built or not; default $MINT_AC_DECOMP).
 test-decomp-sources decomp=env("MINT_AC_DECOMP", ""):
-    MINT_AC_DECOMP="$(just _decomp "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
+    MINT_AC_DECOMP="$(realpath -- "${1:?pass an ac-decomp checkout, or set MINT_AC_DECOMP to one}")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --ignored all_model_sources_interpret villager_table_and_pose_parse
 
 # Run every decomp test, including the round trip of every villager; needs a built checkout and its disc image (default $MINT_AC_DECOMP).
 test-decomp decomp=env("MINT_AC_DECOMP", ""):
-    MINT_AC_DECOMP="$(just _decomp "$1")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
-
-# Print the absolute path of the decomp checkout DECOMP, or fail when none is given.
-[private]
-_decomp decomp:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -z "$1" ]]; then
-        echo "error: pass an ac-decomp checkout, or set MINT_AC_DECOMP to one" >&2
-        exit 1
-    fi
-    realpath -- "$1"
+    MINT_AC_DECOMP="$(realpath -- "${1:?pass an ac-decomp checkout, or set MINT_AC_DECOMP to one}")" && export MINT_AC_DECOMP && cargo test --locked -p mint-ac -- --include-ignored
 
 # Write a generated demo villager as a decomp-shaped directory and open it.
 demo dir="target/demo-decomp":

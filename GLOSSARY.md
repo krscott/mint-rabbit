@@ -139,8 +139,8 @@ belongs to one species.
 _Avoid_: Animal type, race
 
 **Texture Set**:
-The textures a villager is drawn with (body, eyes, and mouth), named after the
-villager, such as `cat_2`; an export replaces one or adds a new one.
+The textures a villager is drawn with (body, eyes, and mouth); each villager
+has its own.
 _Avoid_: Skin, villager textures
 
 **Islander**:

@@ -6,17 +6,25 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::VILLAGER_COUNT;
+
 /// The archive at the disc root that holds the name table.
 const NAME_ARCHIVE: &str = "forest_2nd.arc";
 /// One fixed-width record per villager, in villager id order.
 const NAME_TABLE: &str = "npc_name_str_table.bin";
 /// Bytes per name record, padded with spaces.
 const NAME_LEN: usize = 8;
+/// Other disc image formats the decomp builds from.
+const COMPRESSED_DISCS: [&str; 5] = ["rvz", "wia", "wbfs", "ciso", "gcz"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum NamesError {
-    #[error("no disc image (.iso or .gcm) in {0}, so villagers show texture set names")]
+    #[error("no disc image (.iso or .gcm) in {0}")]
     NoDisc(PathBuf),
+    #[error(
+        "{0} is compressed; names are read from an uncompressed disc image, so convert it to .iso with Dolphin"
+    )]
+    Compressed(PathBuf),
     #[error("{0} holds several disc images, so it's unclear which to read names from: {1:?}")]
     ManyDiscs(PathBuf, Vec<PathBuf>),
     #[error("{0}: {1}")]
@@ -36,10 +44,18 @@ pub(crate) fn villager_names(dir: &Path) -> Result<Vec<String>, NamesError> {
         problem: format!("{NAME_ARCHIVE}: {problem}"),
     };
     let table = rarc_file(&arc, NAME_TABLE).map_err(malformed)?;
-    decode_names(table).map_err(|p| NamesError::Malformed {
+    let in_table = |p: String| NamesError::Malformed {
         path: path.clone(),
         problem: format!("{NAME_ARCHIVE}/{NAME_TABLE}: {p}"),
-    })
+    };
+    let names = decode_names(table).map_err(in_table)?;
+    if names.len() != VILLAGER_COUNT {
+        return Err(in_table(format!(
+            "it holds {} names, but there are {VILLAGER_COUNT} villagers",
+            names.len()
+        )));
+    }
+    Ok(names)
 }
 
 fn find_disc(dir: &Path) -> Result<PathBuf, NamesError> {
@@ -48,18 +64,28 @@ fn find_disc(dir: &Path) -> Result<PathBuf, NamesError> {
         _ => NamesError::Io(dir.to_owned(), e),
     })?;
     let mut discs = Vec::new();
+    let mut compressed = None;
     for entry in entries {
         let path = entry.map_err(|e| NamesError::Io(dir.to_owned(), e))?.path();
-        let disc = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("iso") || e.eq_ignore_ascii_case("gcm"));
-        if disc && path.is_file() {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let ext = ext.to_ascii_lowercase();
+        if !path.is_file() {
+            continue;
+        }
+        if ext == "iso" || ext == "gcm" {
             discs.push(path);
+        } else if COMPRESSED_DISCS.contains(&ext.as_str()) {
+            compressed = Some(path);
         }
     }
     discs.sort();
     match discs.len() {
-        0 => Err(NamesError::NoDisc(dir.to_owned())),
+        0 => Err(compressed.map_or_else(
+            || NamesError::NoDisc(dir.to_owned()),
+            NamesError::Compressed,
+        )),
         1 => Ok(discs.remove(0)),
         _ => Err(NamesError::ManyDiscs(dir.to_owned(), discs)),
     }
@@ -85,14 +111,18 @@ fn c_str(bytes: &[u8], at: usize) -> Option<&[u8]> {
 struct Disc {
     path: PathBuf,
     file: File,
+    len: u64,
 }
 
 impl Disc {
     fn open(path: &Path) -> Result<Self, NamesError> {
-        let file = File::open(path).map_err(|e| NamesError::Io(path.to_owned(), e))?;
+        let io = |e| NamesError::Io(path.to_owned(), e);
+        let file = File::open(path).map_err(io)?;
+        let len = file.metadata().map_err(io)?.len();
         Ok(Self {
             path: path.to_owned(),
             file,
+            len,
         })
     }
 
@@ -104,16 +134,17 @@ impl Disc {
     }
 
     fn read(&mut self, offset: u32, len: u32) -> Result<Vec<u8>, NamesError> {
+        // Checked first, so a bad size never allocates.
+        if u64::from(offset) + u64::from(len) > self.len {
+            return Err(self.malformed(format!(
+                "ends before {len} bytes at {offset:#x}; is this an uncompressed GameCube disc image?"
+            )));
+        }
         let mut buf = vec![0; len as usize];
         self.file
             .seek(SeekFrom::Start(u64::from(offset)))
             .and_then(|_| self.file.read_exact(&mut buf))
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => self.malformed(format!(
-                    "ends before {len} bytes at {offset:#x}; is this an uncompressed disc image?"
-                )),
-                _ => NamesError::Io(self.path.clone(), e),
-            })?;
+            .map_err(|e| NamesError::Io(self.path.clone(), e))?;
         Ok(buf)
     }
 
@@ -222,7 +253,8 @@ fn decode_names(table: &[u8]) -> Result<Vec<String>, String> {
                     "name {i} has character code {b:#04x}, which is not plain ASCII in the game's font"
                 ));
             }
-            Ok(String::from_utf8_lossy(record).trim_end().to_owned())
+            let name: String = record.iter().map(|&b| char::from(b)).collect();
+            Ok(name.trim_end().to_owned())
         })
         .collect()
 }
@@ -297,6 +329,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compressed_discs_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(find_disc(dir.path()), Err(NamesError::NoDisc(_))));
+        std::fs::write(dir.path().join("game.rvz"), b"").unwrap();
+        assert!(matches!(
+            find_disc(dir.path()),
+            Err(NamesError::Compressed(_))
+        ));
+        std::fs::write(dir.path().join("game.ISO"), b"").unwrap();
+        assert!(find_disc(dir.path()).unwrap().ends_with("game.ISO"));
+    }
+
     /// Reads the names from the disc image in the decomp named by
     /// `MINT_AC_DECOMP`.
     #[test]
@@ -304,7 +349,7 @@ mod tests {
     fn disc_names_read() {
         let root = PathBuf::from(std::env::var("MINT_AC_DECOMP").expect("MINT_AC_DECOMP"));
         let names = villager_names(&root.join("orig/GAFE01_00")).unwrap();
-        assert_eq!(names.len(), crate::VILLAGER_COUNT);
+        assert_eq!(names.len(), VILLAGER_COUNT);
         assert_eq!(names[..3], ["Bob", "Olivia", "Mitzi"]);
         assert!(names.iter().any(|n| n == "O'Hare"), "{names:?}");
     }
