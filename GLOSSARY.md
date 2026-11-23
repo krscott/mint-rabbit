@@ -84,13 +84,14 @@ shown, hidden, or replaced.
 _Avoid_: Base texture, background
 
 **Layer**:
-An ordered list of shapes in one variant, with its own visibility, lock, and
-display-only opacity that never affects export.
+An ordered list of shapes in one variant, with its own visibility (hidden
+layers neither show nor export), lock, and display-only opacity that never
+affects export.
 _Avoid_: Group, folder
 
 **Shape**:
-A single vector element in texture space: a path that is either filled
-(closed) or stroked (open), in one palette color.
+A single vector element in texture space: a Bézier path that is filled, or
+stroked along an open or closed path, in one palette color.
 _Avoid_: Stroke, vector, brush mark
 
 **Stamp**:

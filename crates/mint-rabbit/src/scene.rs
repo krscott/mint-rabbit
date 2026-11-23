@@ -21,10 +21,10 @@ pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> V
         TextureContent::Painted(variants) => {
             let colors = project.palette().colors();
             variants[variant]
-                .underlay()
+                .rasterize()
                 .pixels()
                 .iter()
-                // Projects guarantee underlay pixels name palette entries.
+                // Projects guarantee every pixel names a palette entry.
                 .map(|&i| display_color(project, colors[usize::from(i.0)]))
                 .collect()
         }

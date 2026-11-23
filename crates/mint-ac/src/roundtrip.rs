@@ -40,7 +40,7 @@ fn canonical(p: &Project) -> Canonical {
             let variants = t
                 .variants()
                 .iter()
-                .map(|v| v.underlay().pixels().iter().map(|i| i.0).collect())
+                .map(|v| v.rasterize().pixels().iter().map(|i| i.0).collect())
                 .collect();
             let external = matches!(t.content(), TextureContent::External { .. });
             (t.slot.0.clone(), t.size().to_array(), variants, external)
@@ -293,6 +293,55 @@ fn synthetic_villager_round_trips() {
 
     let again = reimport(&original, &pose);
     assert_eq!(canonical(&original), canonical(&again));
+}
+
+/// Export writes what the layers paint over the underlays, and hidden layers
+/// are left out.
+#[test]
+fn export_rasterizes_painted_layers() {
+    use glam::Vec2;
+    use mint_core::{Layer, PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
+    let (mut p, pose) = synthetic_project();
+    let texture = p
+        .textures()
+        .iter()
+        .position(|t| t.slot.0 == crate::SLOT_EYES)
+        .unwrap();
+    let r = VariantRef {
+        texture: TextureId(texture as u32),
+        variant: 2,
+    };
+    let size = p.texture(r.texture).size().as_vec2();
+    // A shown ellipse, with a hidden rectangle over all of it.
+    let shapes = [
+        Shape::new(
+            shape::ellipse(size / 2.0, size / 3.0),
+            Style::Fill,
+            PaletteIndex(3),
+        ),
+        Shape::new(
+            shape::rectangle(Vec2::ZERO, size),
+            Style::Fill,
+            PaletteIndex(5),
+        ),
+    ];
+    p.edit_variant(r, |v| {
+        for (i, s) in shapes.into_iter().enumerate() {
+            let mut layer = Layer::new(format!("layer {i}"));
+            layer.insert_shape(0, s.unwrap());
+            v.insert_layer(i, layer);
+        }
+        v.layers_mut()[1].visible = false;
+    })
+    .unwrap();
+    let painted = p.variant(r).rasterize();
+    let center = painted.pixel(size.x as u32 / 2, size.y as u32 / 2);
+    assert_eq!(center, PaletteIndex(3));
+    assert_ne!(&painted, p.variant(r).underlay());
+
+    let again = reimport(&p, &pose);
+    assert_eq!(again.variant(r).underlay(), &painted);
+    assert_eq!(canonical(&p), canonical(&again));
 }
 
 /// Triangles keep their drawing order even when materials interleave: the
