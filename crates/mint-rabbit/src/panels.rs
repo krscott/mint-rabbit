@@ -425,6 +425,14 @@ fn fill_or_stroke(ui: &mut egui::Ui, fill: bool) -> Option<bool> {
     choice
 }
 
+/// Says whose style the bar shows, at one width so the controls after it
+/// stay where they are when it changes.
+fn bar_label(ui: &mut egui::Ui, text: &str, hover: &str) {
+    let size = [46.0, ui.spacing().interact_size.y];
+    ui.add_sized(size, egui::Label::new(RichText::new(text).weak()))
+        .on_hover_text(hover);
+}
+
 fn stroke_width(value: &mut f32) -> egui::DragValue<'_> {
     egui::DragValue::new(value)
         .range(0.1..=64.0)
@@ -438,7 +446,7 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
     let layer = t.selection.layer;
     let picked = t.selection.shapes.clone();
     let Some(&first) = picked.first() else {
-        ui.weak("New shapes:");
+        bar_label(ui, "New", "The style new shapes are painted in");
         if let Some(fill) = fill_or_stroke(ui, paint.fill) {
             paint.fill = fill;
         }
@@ -446,7 +454,11 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
             .on_hover_text("Stroke width, for strokes and the brush");
         return;
     };
-    ui.weak(format!("Picked ({}):", picked.len()));
+    let count = match picked.len() {
+        1 => "1 picked shape".to_owned(),
+        n => format!("{n} picked shapes"),
+    };
+    bar_label(ui, "Picked", &format!("The style of the {count}"));
     // The first picked shape shows the values; an edit applies to each
     // picked shape, keeping its other settings.
     let style = t.layers()[layer].shapes()[first].style();
@@ -535,7 +547,7 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
         });
         t.selection.shapes = picked.iter().map(|s| s - 1).collect();
     }
-    ui.menu_button("To layer", |ui| {
+    let to_layer = ui.menu_button(icons::text(Icon::Layers, icons::SMALL), |ui| {
         let layers: Vec<(String, bool)> = t
             .layers()
             .iter()
@@ -567,6 +579,7 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
             ui.close();
         }
     });
+    to_layer.response.on_hover_text("Move to another layer");
 }
 
 /// Restyles each of the `picked` shapes with `restyle` of its own style, as
