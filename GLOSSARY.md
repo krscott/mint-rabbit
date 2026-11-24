@@ -89,9 +89,19 @@ affects export.
 _Avoid_: Group, folder
 
 **Shape**:
-A single vector element in texture space: a Bézier path that is filled, or
-stroked along an open or closed path, in one palette color.
+A single vector element in texture space: a Bézier path drawn in one style and
+one palette color.
 _Avoid_: Stroke, vector, brush mark
+
+**Style**:
+How a shape covers pixels: filled, or stroked at a width along an open or
+closed path.
+_Avoid_: Fill mode, brush settings
+
+**Pick**:
+To choose the layer, and shapes in it, that edits apply to; new shapes go on
+the picked layer.
+_Avoid_: Selection, active layer
 
 **Stamp**:
 A saved group of shapes in the user's stamp library; placing it copies its
