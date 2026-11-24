@@ -181,9 +181,6 @@ pub struct Frame<'a> {
     /// Whether the view takes pointer and key input; not while a dialog is
     /// open.
     pub input: bool,
-    /// Whether a text field had the keyboard as the frame began, so the
-    /// frame's keys are that field's.
-    pub typing: bool,
     /// Set when the view refuses an edit, to show the user.
     pub message: &'a mut Option<String>,
 }
@@ -199,6 +196,8 @@ pub struct TextureView {
     targets: (usize, Vec<usize>),
     /// Anchors of the pen path being drawn.
     pen: Vec<Anchor>,
+    /// Whether a text field had the keyboard when the view was last shown.
+    typing: bool,
 }
 
 /// Screen placement of the image: texture space to screen and back.
@@ -256,6 +255,11 @@ impl TextureView {
         if self.zoom == 0.0 {
             self.zoom = 1.0;
         }
+        // A key that ends a text field's edit, such as Enter or Escape, was
+        // typed into the field, though the field has let go of the keyboard
+        // by now.
+        let now = ui.ctx().text_edit_focused();
+        let typing = std::mem::replace(&mut self.typing, now) || now;
         let r = VariantRef {
             texture: f.texture,
             variant: f.variant,
@@ -308,7 +312,7 @@ impl TextureView {
             return;
         }
         if f.input {
-            self.interact(ui, &response, at, f, r);
+            self.interact(ui, &response, at, f, r, typing);
         } else {
             self.cancel_drag(f.editor);
             self.pen.clear();
@@ -354,6 +358,7 @@ impl TextureView {
         at: Placement,
         f: Frame<'_>,
         r: VariantRef,
+        typing: bool,
     ) {
         let Frame {
             editor,
@@ -361,7 +366,6 @@ impl TextureView {
             paint,
             selection,
             message,
-            typing,
             ..
         } = f;
         if tool != Tool::Pen && !self.pen.is_empty() {
@@ -478,11 +482,7 @@ impl TextureView {
 
         // Keys, while the view has the pointer.
         // Keys a text field is using are its own, and none act mid-drag.
-        if (response.hovered() || !self.pen.is_empty())
-            && !typing
-            && !ui.ctx().text_edit_focused()
-            && self.drag.is_none()
-        {
+        if (response.hovered() || !self.pen.is_empty()) && !typing && self.drag.is_none() {
             let (enter, delete) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),

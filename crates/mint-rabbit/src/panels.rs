@@ -203,9 +203,6 @@ pub fn palette(
 pub struct Rename {
     variant: VariantRef,
     layer: usize,
-    /// The layer's name when the rename began, which tells whether `layer`
-    /// still names that layer.
-    from: String,
     typed: String,
 }
 
@@ -227,15 +224,14 @@ pub fn layer_list(
     previews: &mut Previews,
     rename: &mut Option<Rename>,
 ) {
-    // A rename ends with its layer, as when the variant shown changes or
-    // another layer takes its place in the stack.
-    let renamed = |n: &Rename| {
-        n.variant == t.variant && t.layers().get(n.layer).is_some_and(|l| l.name == n.from)
-    };
-    if !rename.as_ref().is_some_and(renamed) {
+    let count = t.layers().len();
+    // A rename ends with its layer, as when the variant shown changes.
+    if rename
+        .as_ref()
+        .is_some_and(|n| n.variant != t.variant || n.layer >= count)
+    {
         *rename = None;
     }
-    let count = t.layers().len();
     if count == 0 {
         ui.weak("No layers yet; painting adds one.");
     }
@@ -291,8 +287,7 @@ pub fn layer_list(
                     *rename = Some(Rename {
                         variant: t.variant,
                         layer: i,
-                        typed: name.clone(),
-                        from: name,
+                        typed: name,
                     });
                 }
             }
@@ -339,107 +334,128 @@ pub fn layer_opacity(ui: &mut egui::Ui, t: &mut Target<'_>) {
     });
 }
 
-/// The actions that add, remove, and reorder layers.
-pub fn layer_actions(ui: &mut egui::Ui, t: &mut Target<'_>) {
+/// What a click among the layer actions asks for, done to the picked layer.
+pub enum LayerAction {
+    New,
+    Delete,
+    Up,
+    Down,
+    Duplicate,
+    /// Copy onto the top of these other variants of the texture.
+    CopyTo(Vec<usize>),
+}
+
+/// The buttons that add, remove, and reorder layers. Returns what was
+/// clicked, for [`apply_layer_action`] once the layer list has run, so a
+/// rename the click ended is entered before layers change places.
+pub fn layer_actions(ui: &mut egui::Ui, t: &Target<'_>) -> Option<LayerAction> {
     let count = t.layers().len();
     let i = t.selection.layer;
+    let mut action = None;
     ui.horizontal(|ui| {
         if icon_button(ui, Icon::Plus, true, "New layer").clicked() {
+            action = Some(LayerAction::New);
+        }
+        let Some(layer) = t.layers().get(i) else {
+            return;
+        };
+        let delete = if layer.locked {
+            "The picked layer is locked"
+        } else {
+            "Delete the picked layer"
+        };
+        if icon_button(ui, Icon::Trash2, !layer.locked, delete).clicked() {
+            action = Some(LayerAction::Delete);
+        }
+        if icon_button(ui, Icon::ArrowUp, i + 1 < count, "Move the picked layer up").clicked() {
+            action = Some(LayerAction::Up);
+        }
+        if icon_button(ui, Icon::ArrowDown, i > 0, "Move the picked layer down").clicked() {
+            action = Some(LayerAction::Down);
+        }
+        let more = ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
+            if ui.button("Duplicate").clicked() {
+                action = Some(LayerAction::Duplicate);
+                ui.close();
+            }
+            // Other variants of the same texture to copy the layer onto.
+            let texture = t.editor.project().texture(t.variant.texture);
+            let others = || (0..texture.variants().len()).filter(|&k| k != t.variant.variant);
+            if others().next().is_none() {
+                return;
+            }
+            ui.menu_button("Copy to", |ui| {
+                if ui.button("All other variants").clicked() {
+                    action = Some(LayerAction::CopyTo(others().collect()));
+                    ui.close();
+                }
+                for k in others() {
+                    let name = &texture.variants()[k].name;
+                    if ui.button(format!("Variant {name}")).clicked() {
+                        action = Some(LayerAction::CopyTo(vec![k]));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        more.response.on_hover_text("More layer actions");
+    });
+    action
+}
+
+/// Does `action` to the picked layer, and picks the layer it leaves on top
+/// of where that was.
+pub fn apply_layer_action(t: &mut Target<'_>, action: LayerAction) {
+    let count = t.layers().len();
+    let i = t.selection.layer;
+    match action {
+        LayerAction::New => {
             let at = if count == 0 { 0 } else { i + 1 };
             let name = format!("Layer {}", count + 1);
             if t.edit(|v| v.insert_layer(at, Layer::new(name))).is_some() {
                 t.pick_layer(at);
             }
         }
-        if count == 0 {
-            return;
-        }
-        let locked = t.layers()[i].locked;
-        let delete = if locked {
-            "The picked layer is locked"
-        } else {
-            "Delete the picked layer"
-        };
-        if icon_button(ui, Icon::Trash2, !locked, delete).clicked()
-            && t.edit(|v| {
+        // The rest need a picked layer.
+        _ if i >= count => {}
+        LayerAction::Delete => {
+            let removed = t.edit(|v| {
                 v.remove_layer(i);
-            })
-            .is_some()
-        {
-            t.pick_layer(i.saturating_sub(1));
+            });
+            if removed.is_some() {
+                t.pick_layer(i.saturating_sub(1));
+            }
         }
-        if icon_button(ui, Icon::ArrowUp, i + 1 < count, "Move the picked layer up").clicked() {
+        LayerAction::Up if i + 1 < count => {
             t.edit(|v| v.move_layer(i, i + 1));
             t.selection.layer = i + 1;
         }
-        if icon_button(ui, Icon::ArrowDown, i > 0, "Move the picked layer down").clicked() {
+        LayerAction::Down if i > 0 => {
             t.edit(|v| v.move_layer(i, i - 1));
             t.selection.layer = i - 1;
         }
-        let more = ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
-            // The layer picked now, which a button before this may have
-            // changed.
-            let i = t.selection.layer;
-            if i >= t.layers().len() {
-                return;
-            }
-            if ui.button("Duplicate").clicked() {
-                t.edit(|v| {
-                    let mut copy = v.layers()[i].clone();
-                    copy.name = format!("{} copy", copy.name);
-                    v.insert_layer(i + 1, copy);
-                });
-                t.pick_layer(i + 1);
-                ui.close();
-            }
-            copy_to_variants(ui, t, i);
-        });
-        more.response.on_hover_text("More layer actions");
-    });
-}
-
-/// A submenu that copies layer `i` onto the top of other variants of the
-/// same texture.
-fn copy_to_variants(ui: &mut egui::Ui, t: &mut Target<'_>, i: usize) {
-    let r = t.variant;
-    let names: Vec<String> = t
-        .editor
-        .project()
-        .texture(r.texture)
-        .variants()
-        .iter()
-        .map(|v| v.name.clone())
-        .collect();
-    if names.len() < 2 {
-        return;
+        LayerAction::Up | LayerAction::Down => {}
+        LayerAction::Duplicate => {
+            t.edit(|v| {
+                let mut copy = v.layers()[i].clone();
+                copy.name = format!("{} copy", copy.name);
+                v.insert_layer(i + 1, copy);
+            });
+            t.pick_layer(i + 1);
+        }
+        LayerAction::CopyTo(variants) => {
+            let texture = t.variant.texture;
+            let layer = t.layers()[i].clone();
+            let result = t.editor.edit(|p| {
+                for variant in variants {
+                    let to = VariantRef { texture, variant };
+                    p.edit_variant(to, |v| v.insert_layer(v.layers().len(), layer.clone()))?;
+                }
+                Ok::<_, mint_core::EditError>(())
+            });
+            report(result, t.message);
+        }
     }
-    ui.menu_button("Copy to", |ui| {
-        let targets: Vec<usize> = (0..names.len()).filter(|&k| k != r.variant).collect();
-        if ui.button("All other variants").clicked() {
-            copy_layer(t, i, &targets);
-            ui.close();
-        }
-        for k in targets {
-            if ui.button(format!("Variant {}", names[k])).clicked() {
-                copy_layer(t, i, &[k]);
-                ui.close();
-            }
-        }
-    });
-}
-
-/// Copies layer `i` onto the top of the `targets` variants of its texture.
-fn copy_layer(t: &mut Target<'_>, i: usize, targets: &[usize]) {
-    let texture = t.variant.texture;
-    let layer = &t.layers()[i].clone();
-    let result = t.editor.edit(|p| {
-        for &variant in targets {
-            let to = VariantRef { texture, variant };
-            p.edit_variant(to, |v| v.insert_layer(v.layers().len(), layer.clone()))?;
-        }
-        Ok::<_, mint_core::EditError>(())
-    });
-    report(result, t.message);
 }
 
 /// The fill-or-stroke choice, returning the other one when it is clicked.

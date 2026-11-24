@@ -775,7 +775,7 @@ impl App {
         );
         // The actions keep to the bottom, and the list scrolls in the rest.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            panels::layer_actions(ui, &mut target);
+            let action = panels::layer_actions(ui, &target);
             panels::layer_opacity(ui, &mut target);
             ui.separator();
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -785,6 +785,11 @@ impl App {
                         panels::layer_list(ui, &mut target, &mut doc.previews, &mut doc.rename);
                     });
             });
+            if let Some(action) = action {
+                panels::apply_layer_action(&mut target, action);
+                // The list above was drawn before the change.
+                ui.ctx().request_repaint();
+            }
         });
     }
 
@@ -839,12 +844,15 @@ impl App {
     }
 
     /// The style bar, one row high whatever it holds, so the Texture View
-    /// under it stays put when shapes are picked. What doesn't fit scrolls.
+    /// under it stays put when shapes are picked. What doesn't fit scrolls
+    /// with the wheel, without a scroll bar, which would cover the controls.
     fn style_bar(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = &mut self.doc else { return };
+        ui.style_mut().always_scroll_the_only_direction = true;
         egui::ScrollArea::horizontal()
             .id_salt("style bar")
             .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let Some(variant) = doc.variant() else {
@@ -876,7 +884,7 @@ impl App {
 
     /// The Texture View under its texture strip and style bar, with the
     /// tools at its left. `idle` is whether the controls take input.
-    fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool, typing: bool) {
+    fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool) {
         ui.add_enabled_ui(idle, |ui| {
             self.texture_strip(ui);
             self.style_bar(ui);
@@ -889,7 +897,7 @@ impl App {
             ui.add_enabled_ui(idle && painted, |ui| self.tool_strip(ui));
         });
         ui.scope_builder(egui::UiBuilder::new().max_rect(view), |ui| {
-            self.texture_view(ui, typing);
+            self.texture_view(ui);
         });
     }
 
@@ -928,7 +936,7 @@ impl App {
         ));
     }
 
-    fn texture_view(&mut self, ui: &mut egui::Ui, typing: bool) {
+    fn texture_view(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = &mut self.doc else { return };
         let Some(t) = doc.selected else { return };
         self.texture_view.show(
@@ -943,7 +951,6 @@ impl App {
                 selection: &mut doc.selection,
                 show_uv: self.show_uv,
                 input: self.dialog.is_none(),
-                typing,
                 message: &mut self.refusal,
             },
         );
@@ -1147,10 +1154,6 @@ impl eframe::App for App {
         // Controls wait while a canvas drag is in progress, so nothing (an
         // export, a save) acts on a drag that may still be cancelled.
         let idle = !self.texture_view.dragging();
-        // A key that ends a text field's edit, such as Enter, was typed
-        // into the field, though the field has let go of the keyboard by the
-        // time the Texture View looks.
-        let typing = ctx.text_edit_focused();
         egui::Panel::top("menu").show(ui, |ui| {
             ui.add_enabled_ui(idle, |ui| self.menu_bar(ui));
         });
@@ -1177,7 +1180,7 @@ impl eframe::App for App {
                 self.model_view(ui);
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                self.texture_pane(ui, idle, typing);
+                self.texture_pane(ui, idle);
             });
         });
         if let Some(picker) = &mut self.picker
