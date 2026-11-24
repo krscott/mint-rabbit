@@ -17,8 +17,8 @@ enum Key {
     Layer(VariantRef, usize),
 }
 
-/// The images of one open project, each drawn again only once the project
-/// has changed since it was last asked for.
+/// The images of one open project. An image is drawn again when it is asked
+/// for after any change to the project.
 #[derive(Default)]
 pub struct Previews {
     /// Each image with the editor generation it was drawn at.

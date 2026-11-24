@@ -8,10 +8,13 @@ use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::previews::{Previews, thumbnail};
 use crate::scene;
-use crate::texture_view::{self, Paint, Selection};
+use crate::texture_view::{self, Paint, Selection, Tool};
 
 /// Most colors an Animal Crossing villager's palette holds.
 const AC_PALETTE: usize = 16;
+
+/// What the style bar's layer menu does.
+const TO_LAYER: &str = "Move to another layer";
 
 /// Size of a layer's preview in its row.
 const LAYER_PREVIEW: egui::Vec2 = egui::vec2(40.0, 28.0);
@@ -191,9 +194,10 @@ pub fn palette(
 pub struct Rename {
     variant: VariantRef,
     layer: usize,
-    name: String,
-    /// Whether the field has been given the keyboard yet.
-    focused: bool,
+    /// The layer's name when the rename began, which tells whether `layer`
+    /// still names that layer.
+    from: String,
+    typed: String,
 }
 
 /// An icon that toggles something on its row, dimmed when `dim`.
@@ -214,8 +218,12 @@ pub fn layer_list(
     previews: &mut Previews,
     rename: &mut Option<Rename>,
 ) {
-    // A rename doesn't outlast the variant it was started in.
-    if rename.as_ref().is_some_and(|n| n.variant != t.variant) {
+    // A rename ends with its layer, as when the variant shown changes or
+    // another layer takes its place in the stack.
+    let renamed = |n: &Rename| {
+        n.variant == t.variant && t.layers().get(n.layer).is_some_and(|l| l.name == n.from)
+    };
+    if !rename.as_ref().is_some_and(renamed) {
         *rename = None;
     }
     let count = t.layers().len();
@@ -246,19 +254,18 @@ pub fn layer_list(
                 t.edit(|v| v.layers_mut()[i].locked = !locked);
             }
             let mut pick = thumbnail(ui, &image, LAYER_PREVIEW, picked).clicked();
-            if let Some(typed) = rename.as_mut().filter(|n| n.layer == i) {
-                let field = ui
-                    .add(egui::TextEdit::singleline(&mut typed.name).desired_width(f32::INFINITY));
-                if !typed.focused {
-                    field.request_focus();
-                    typed.focused = true;
-                } else if !field.has_focus() {
+            if let Some(n) = rename.as_mut().filter(|n| n.layer == i) {
+                let field =
+                    ui.add(egui::TextEdit::singleline(&mut n.typed).desired_width(f32::INFINITY));
+                if field.lost_focus() {
                     // Escape leaves the name as it was.
                     if !ui.input(|i| i.key_pressed(Key::Escape)) {
-                        let name = std::mem::take(&mut typed.name);
+                        let name = std::mem::take(&mut n.typed);
                         t.edit(|v| v.layers_mut()[i].name = name);
                     }
                     *rename = None;
+                } else if !field.has_focus() {
+                    field.request_focus();
                 }
             } else {
                 let button = egui::Button::selectable(picked, name.as_str())
@@ -273,8 +280,8 @@ pub fn layer_list(
                     *rename = Some(Rename {
                         variant: t.variant,
                         layer: i,
-                        name,
-                        focused: false,
+                        typed: name.clone(),
+                        from: name,
                     });
                 }
             }
@@ -285,10 +292,13 @@ pub fn layer_list(
     }
 }
 
-/// A button holding only an icon.
+/// A button holding only an icon, named by `hover` whether or not it is
+/// enabled.
 fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, hover: &str) -> egui::Response {
     let button = egui::Button::new(icons::text(icon, icons::SMALL));
-    ui.add_enabled(enabled, button).on_hover_text(hover)
+    ui.add_enabled(enabled, button)
+        .on_hover_text(hover)
+        .on_disabled_hover_text(hover)
 }
 
 /// The picked layer's opacity in the views.
@@ -334,9 +344,12 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &mut Target<'_>) {
             return;
         }
         let locked = t.layers()[i].locked;
-        if icon_button(ui, Icon::Trash2, !locked, "Delete the picked layer")
-            .on_disabled_hover_text("The layer is locked")
-            .clicked()
+        let delete = if locked {
+            "The picked layer is locked"
+        } else {
+            "Delete the picked layer"
+        };
+        if icon_button(ui, Icon::Trash2, !locked, delete).clicked()
             && t.edit(|v| {
                 v.remove_layer(i);
             })
@@ -352,7 +365,13 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &mut Target<'_>) {
             t.edit(|v| v.move_layer(i, i - 1));
             t.selection.layer = i - 1;
         }
-        ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
+        let more = ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
+            // The layer picked now, which a button before this may have
+            // changed.
+            let i = t.selection.layer;
+            if i >= t.layers().len() {
+                return;
+            }
             if ui.button("Duplicate").clicked() {
                 t.edit(|v| {
                     let mut copy = v.layers()[i].clone();
@@ -364,6 +383,7 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &mut Target<'_>) {
             }
             copy_to_variants(ui, t, i);
         });
+        more.response.on_hover_text("More layer actions");
     });
 }
 
@@ -383,23 +403,24 @@ fn copy_to_variants(ui: &mut egui::Ui, t: &mut Target<'_>, i: usize) {
         return;
     }
     ui.menu_button("Copy to", |ui| {
-        let layer = t.layers()[i].clone();
         let targets: Vec<usize> = (0..names.len()).filter(|&k| k != r.variant).collect();
         if ui.button("All other variants").clicked() {
-            copy_layer(t, &layer, &targets);
+            copy_layer(t, i, &targets);
             ui.close();
         }
         for k in targets {
             if ui.button(format!("Variant {}", names[k])).clicked() {
-                copy_layer(t, &layer, &[k]);
+                copy_layer(t, i, &[k]);
                 ui.close();
             }
         }
     });
 }
 
-fn copy_layer(t: &mut Target<'_>, layer: &Layer, targets: &[usize]) {
+/// Copies layer `i` onto the top of the `targets` variants of its texture.
+fn copy_layer(t: &mut Target<'_>, i: usize, targets: &[usize]) {
     let texture = t.variant.texture;
+    let layer = &t.layers()[i].clone();
     let result = t.editor.edit(|p| {
         for &variant in targets {
             let to = VariantRef { texture, variant };
@@ -440,11 +461,16 @@ fn stroke_width(value: &mut f32) -> egui::DragValue<'_> {
         .suffix(" px")
 }
 
-/// The style of the picked shapes, with what else can be done to them; with
-/// none picked, the style new shapes are painted in.
-pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
+/// With the Select tool and shapes picked, their style and what else can be
+/// done to them; otherwise the style new shapes are painted in. A drawing
+/// tool picks each shape it adds, and still shows the style of the next.
+pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool: Tool) {
     let layer = t.selection.layer;
-    let picked = t.selection.shapes.clone();
+    let picked = if tool == Tool::Select {
+        t.selection.shapes.clone()
+    } else {
+        Vec::new()
+    };
     let Some(&first) = picked.first() else {
         bar_label(ui, "New", "The style new shapes are painted in");
         if let Some(fill) = fill_or_stroke(ui, paint.fill) {
@@ -547,39 +573,45 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint) {
         });
         t.selection.shapes = picked.iter().map(|s| s - 1).collect();
     }
-    let to_layer = ui.menu_button(icons::text(Icon::Layers, icons::SMALL), |ui| {
-        let layers: Vec<(String, bool)> = t
-            .layers()
-            .iter()
-            .map(|l| (l.name.clone(), l.locked))
-            .collect();
-        for (k, (name, locked)) in layers.iter().enumerate() {
-            if k == layer || !ui.add_enabled(!locked, egui::Button::new(name)).clicked() {
-                continue;
-            }
-            let moved = t.edit(|v| {
-                let mut shapes = Vec::new();
-                for &s in sorted.iter().rev() {
-                    shapes.push(v.layers_mut()[layer].remove_shape(s));
+    // There is nowhere to move them with only their own layer.
+    ui.add_enabled_ui(t.layers().len() > 1, |ui| {
+        let to_layer = ui.menu_button(icons::text(Icon::Layers, icons::SMALL), |ui| {
+            let layers: Vec<(String, bool)> = t
+                .layers()
+                .iter()
+                .map(|l| (l.name.clone(), l.locked))
+                .collect();
+            for (k, (name, locked)) in layers.iter().enumerate() {
+                if k == layer || !ui.add_enabled(!locked, egui::Button::new(name)).clicked() {
+                    continue;
                 }
-                let to = &mut v.layers_mut()[k];
-                let start = to.shapes().len();
-                for s in shapes.into_iter().rev() {
-                    to.insert_shape(to.shapes().len(), s);
+                let moved = t.edit(|v| {
+                    let mut shapes = Vec::new();
+                    for &s in sorted.iter().rev() {
+                        shapes.push(v.layers_mut()[layer].remove_shape(s));
+                    }
+                    let to = &mut v.layers_mut()[k];
+                    let start = to.shapes().len();
+                    for s in shapes.into_iter().rev() {
+                        to.insert_shape(to.shapes().len(), s);
+                    }
+                    start
+                });
+                if let Some(start) = moved {
+                    *t.selection = Selection {
+                        layer: k,
+                        shapes: (start..start + sorted.len()).collect(),
+                        anchor: None,
+                    };
                 }
-                start
-            });
-            if let Some(start) = moved {
-                *t.selection = Selection {
-                    layer: k,
-                    shapes: (start..start + sorted.len()).collect(),
-                    anchor: None,
-                };
+                ui.close();
             }
-            ui.close();
-        }
+        });
+        to_layer
+            .response
+            .on_hover_text(TO_LAYER)
+            .on_disabled_hover_text(TO_LAYER);
     });
-    to_layer.response.on_hover_text("Move to another layer");
 }
 
 /// Restyles each of the `picked` shapes with `restyle` of its own style, as

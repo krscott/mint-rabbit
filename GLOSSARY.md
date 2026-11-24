@@ -99,9 +99,9 @@ closed path.
 _Avoid_: Fill mode, brush settings
 
 **Pick**:
-To choose the layer, and shapes in it, that edits apply to; new shapes go on
-the picked layer.
-_Avoid_: Selection, active layer
+To choose what painting and edits apply to: a palette entry, a layer, and
+shapes in that layer.
+_Avoid_: Active layer, current color
 
 **Stamp**:
 A saved group of shapes in the user's stamp library; placing it copies its

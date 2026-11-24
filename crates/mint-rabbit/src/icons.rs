@@ -6,9 +6,9 @@ pub use lucide_icons::Icon;
 
 const FAMILY: &str = "icons";
 
-/// Icon height in buttons beside text.
+/// Icon height in rows and bars, beside text controls.
 pub const SMALL: f32 = 14.0;
-/// Icon height in buttons that hold only an icon.
+/// Icon height in the tool strip.
 pub const LARGE: f32 = 18.0;
 
 /// Adds the icon font, which [`text`] needs.

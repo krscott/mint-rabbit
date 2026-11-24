@@ -26,9 +26,9 @@ The thumbnails above the Texture View choose the texture it shows and, for a
 texture with several, the variant. Paint in it with the tools at its left:
 Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on
 the picked layer, which must be visible and unlocked, in the picked palette
-color and the style set in the bar above the view. With shapes picked, that bar
-shows and changes their style instead, and can recolor, duplicate, reorder, and
-move them to another layer.
+color and the style set in the bar above the view. With the Select tool and
+shapes picked, that bar shows and changes their style instead, and can recolor,
+duplicate, reorder, and move them to another layer.
 
 The panel at the right holds the palette and the layers of the variant shown.
 Double-click a layer's name to rename it.

@@ -181,6 +181,9 @@ pub struct Frame<'a> {
     /// Whether the view takes pointer and key input; not while a dialog is
     /// open.
     pub input: bool,
+    /// Whether a text field had the keyboard as the frame began, so the
+    /// frame's keys are that field's.
+    pub typing: bool,
     /// Set when the view refuses an edit, to show the user.
     pub message: &'a mut Option<String>,
 }
@@ -358,6 +361,7 @@ impl TextureView {
             paint,
             selection,
             message,
+            typing,
             ..
         } = f;
         if tool != Tool::Pen && !self.pen.is_empty() {
@@ -475,6 +479,7 @@ impl TextureView {
         // Keys, while the view has the pointer.
         // Keys a text field is using are its own, and none act mid-drag.
         if (response.hovered() || !self.pen.is_empty())
+            && !typing
             && !ui.ctx().text_edit_focused()
             && self.drag.is_none()
         {

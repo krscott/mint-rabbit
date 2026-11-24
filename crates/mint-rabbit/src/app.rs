@@ -25,7 +25,6 @@ const REDO: KeyboardShortcut =
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 const REDO_Y: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
-const DELETE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
 
 const WARNING: Color32 = Color32::from_rgb(255, 170, 90);
 const ERROR: Color32 = Color32::from_rgb(255, 110, 110);
@@ -705,7 +704,7 @@ impl App {
         } else {
             "Delete shapes"
         };
-        if ui.add_enabled(shapes, item(delete, &DELETE)).clicked()
+        if ui.add_enabled(shapes, egui::Button::new(delete)).clicked()
             && let Some(mut t) = self.target()
         {
             panels::delete(&mut t);
@@ -740,7 +739,8 @@ impl App {
                         let text = egui::RichText::new(format!("Can't export: {e}")).color(WARNING);
                         ui.scope(|ui| {
                             ui.set_max_width(half);
-                            ui.add(egui::Label::new(text).truncate()).on_hover_text(e);
+                            // Hovering a cut-off label shows all of it.
+                            ui.add(egui::Label::new(text).truncate());
                         });
                     }
                     None => {}
@@ -837,21 +837,28 @@ impl App {
         }
     }
 
+    /// The style bar, one row high whatever it holds, so the Texture View
+    /// under it stays put when shapes are picked. What doesn't fit scrolls.
     fn style_bar(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = &mut self.doc else { return };
-        ui.horizontal_wrapped(|ui| {
-            let Some(variant) = doc.variant() else {
-                ui.weak("An external texture is filled in by the game, and isn't painted.");
-                return;
-            };
-            let mut target = Target::new(
-                &mut doc.editor,
-                variant,
-                &mut doc.selection,
-                &mut self.refusal,
-            );
-            panels::style_bar(ui, &mut target, &mut self.paint);
-        });
+        egui::ScrollArea::horizontal()
+            .id_salt("style bar")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let Some(variant) = doc.variant() else {
+                        ui.weak("An external texture is filled in by the game, and isn't painted.");
+                        return;
+                    };
+                    let mut target = Target::new(
+                        &mut doc.editor,
+                        variant,
+                        &mut doc.selection,
+                        &mut self.refusal,
+                    );
+                    panels::style_bar(ui, &mut target, &mut self.paint, self.tool);
+                });
+            });
     }
 
     fn tool_strip(&mut self, ui: &mut egui::Ui) {
@@ -868,7 +875,7 @@ impl App {
 
     /// The Texture View under its texture strip and style bar, with the
     /// tools at its left. `idle` is whether the controls take input.
-    fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool) {
+    fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool, typing: bool) {
         ui.add_enabled_ui(idle, |ui| {
             self.texture_strip(ui);
             self.style_bar(ui);
@@ -881,7 +888,7 @@ impl App {
             ui.add_enabled_ui(idle && painted, |ui| self.tool_strip(ui));
         });
         ui.scope_builder(egui::UiBuilder::new().max_rect(view), |ui| {
-            self.texture_view(ui);
+            self.texture_view(ui, typing);
         });
     }
 
@@ -920,7 +927,7 @@ impl App {
         ));
     }
 
-    fn texture_view(&mut self, ui: &mut egui::Ui) {
+    fn texture_view(&mut self, ui: &mut egui::Ui, typing: bool) {
         let Some(doc) = &mut self.doc else { return };
         let Some(t) = doc.selected else { return };
         self.texture_view.show(
@@ -935,6 +942,7 @@ impl App {
                 selection: &mut doc.selection,
                 show_uv: self.show_uv,
                 input: self.dialog.is_none(),
+                typing,
                 message: &mut self.refusal,
             },
         );
@@ -1138,6 +1146,10 @@ impl eframe::App for App {
         // Controls wait while a canvas drag is in progress, so nothing (an
         // export, a save) acts on a drag that may still be cancelled.
         let idle = !self.texture_view.dragging();
+        // A key that ends a text field's edit, such as Enter, was typed
+        // into the field, though the field has let go of the keyboard by the
+        // time the Texture View looks.
+        let typing = ctx.text_edit_focused();
         egui::Panel::top("menu").show(ui, |ui| {
             ui.add_enabled_ui(idle, |ui| self.menu_bar(ui));
         });
@@ -1164,7 +1176,7 @@ impl eframe::App for App {
                 self.model_view(ui);
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                self.texture_pane(ui, idle);
+                self.texture_pane(ui, idle, typing);
             });
         });
         if let Some(picker) = &mut self.picker
