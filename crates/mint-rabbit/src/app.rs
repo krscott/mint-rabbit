@@ -801,9 +801,9 @@ impl App {
                     texture: TextureId(i as u32),
                     variant: doc.variants[i],
                 };
-                let image = doc.previews.variant(ui.ctx(), project, generation, r);
                 let picked = doc.selected == Some(r.texture);
-                if thumbnail(ui, &image, THUMBNAIL, picked)
+                let image = |ctx: &egui::Context| doc.previews.variant(ctx, project, generation, r);
+                if thumbnail(ui, THUMBNAIL, picked, image)
                     .on_hover_text(texture_label(t))
                     .clicked()
                 {
@@ -821,8 +821,9 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for (variant, v) in variants.iter().enumerate() {
                     let r = VariantRef { texture, variant };
-                    let image = doc.previews.variant(ui.ctx(), project, generation, r);
-                    if thumbnail(ui, &image, THUMBNAIL, shown == variant)
+                    let image =
+                        |ctx: &egui::Context| doc.previews.variant(ctx, project, generation, r);
+                    if thumbnail(ui, THUMBNAIL, shown == variant, image)
                         .on_hover_text(format!("Variant {}", v.name))
                         .clicked()
                     {

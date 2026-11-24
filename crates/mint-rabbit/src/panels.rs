@@ -16,6 +16,9 @@ const AC_PALETTE: usize = 16;
 /// What the style bar's layer menu does.
 const TO_LAYER: &str = "Move to another layer";
 
+/// Most height the palette's swatches take before they scroll.
+const PALETTE_HEIGHT: f32 = 140.0;
+
 /// Size of a layer's preview in its row.
 const LAYER_PREVIEW: egui::Vec2 = egui::vec2(40.0, 28.0);
 
@@ -119,19 +122,25 @@ pub fn palette(
             });
         }
     });
-    ui.horizontal_wrapped(|ui| {
-        for (i, &c) in colors.iter().enumerate() {
-            let shown = scene::display_color(project, c);
-            let index = PaletteIndex(i as u8);
-            let r = swatch(ui, shown, paint.color == index).on_hover_text(format!(
-                "Entry {i}: #{:02X}{:02X}{:02X}, alpha {}",
-                c.r, c.g, c.b, c.a
-            ));
-            if r.clicked() {
-                paint.color = index;
-            }
-        }
-    });
+    // A long palette scrolls, leaving room under it.
+    egui::ScrollArea::vertical()
+        .id_salt("palette")
+        .max_height(PALETTE_HEIGHT)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, &c) in colors.iter().enumerate() {
+                    let shown = scene::display_color(project, c);
+                    let index = PaletteIndex(i as u8);
+                    let r = swatch(ui, shown, paint.color == index).on_hover_text(format!(
+                        "Entry {i}: #{:02X}{:02X}{:02X}, alpha {}",
+                        c.r, c.g, c.b, c.a
+                    ));
+                    if r.clicked() {
+                        paint.color = index;
+                    }
+                }
+            });
+        });
     let Some(&current) = colors.get(usize::from(paint.color.0)) else {
         return;
     };
@@ -234,8 +243,6 @@ pub fn layer_list(
         let layer = &t.layers()[i];
         let (visible, locked) = (layer.visible, layer.locked);
         let (name, shapes) = (layer.name.clone(), layer.shapes().len());
-        let project = t.editor.project();
-        let image = previews.layer(ui.ctx(), project, t.editor.generation(), t.variant, i);
         let picked = t.selection.layer == i;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -253,7 +260,11 @@ pub fn layer_list(
             {
                 t.edit(|v| v.layers_mut()[i].locked = !locked);
             }
-            let mut pick = thumbnail(ui, &image, LAYER_PREVIEW, picked).clicked();
+            let preview = |ctx: &egui::Context| {
+                let (project, generation) = (t.editor.project(), t.editor.generation());
+                previews.layer(ctx, project, generation, t.variant, i)
+            };
+            let mut pick = thumbnail(ui, LAYER_PREVIEW, picked, preview).clicked();
             if let Some(n) = rename.as_mut().filter(|n| n.layer == i) {
                 let field =
                     ui.add(egui::TextEdit::singleline(&mut n.typed).desired_width(f32::INFINITY));

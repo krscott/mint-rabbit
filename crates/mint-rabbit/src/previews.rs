@@ -103,17 +103,20 @@ pub fn checkerboard(painter: &egui::Painter, rect: Rect, cell: f32) {
     }
 }
 
-/// A clickable `image` fitted into `size`, outlined when `picked`.
+/// A clickable image fitted into `size`, outlined when `picked`. `image` is
+/// asked for only when the thumbnail is in view, as a row scrolled out of a
+/// list is not.
 pub fn thumbnail(
     ui: &mut egui::Ui,
-    image: &TextureHandle,
     size: egui::Vec2,
     picked: bool,
+    image: impl FnOnce(&egui::Context) -> TextureHandle,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
+    let image = image(ui.ctx());
     let [w, h] = image.size().map(|n| n.max(1) as f32);
     let scale = (rect.width() / w).min(rect.height() / h);
     let fitted = Rect::from_center_size(rect.center(), vec2(w, h) * scale);
