@@ -403,8 +403,8 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &Target<'_>) -> Option<LayerAction> {
     action
 }
 
-/// Does `action` to the picked layer, and picks the layer it leaves on top
-/// of where that was.
+/// Does `action` to the picked layer, and picks the layer to act on next:
+/// the new, moved, or duplicated layer, or the one under a deleted layer.
 pub fn apply_layer_action(t: &mut Target<'_>, action: LayerAction) {
     let count = t.layers().len();
     let i = t.selection.layer;

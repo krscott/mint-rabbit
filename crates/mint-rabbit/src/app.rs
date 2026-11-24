@@ -787,8 +787,6 @@ impl App {
             });
             if let Some(action) = action {
                 panels::apply_layer_action(&mut target, action);
-                // The list above was drawn before the change.
-                ui.ctx().request_repaint();
             }
         });
     }
