@@ -418,6 +418,8 @@ pub fn apply_layer_action(t: &mut Target<'_>, action: LayerAction) {
         }
         // The rest need a picked layer.
         _ if i >= count => {}
+        // A locked layer stays, whatever was picked when Delete was clicked.
+        LayerAction::Delete if t.layers()[i].locked => {}
         LayerAction::Delete => {
             let removed = t.edit(|v| {
                 v.remove_layer(i);
