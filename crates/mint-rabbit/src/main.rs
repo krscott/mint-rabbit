@@ -3,8 +3,10 @@
 mod app;
 mod camera;
 mod editor;
+mod icons;
 mod panels;
 mod picker;
+mod previews;
 mod render;
 mod scene;
 mod texture_view;

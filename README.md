@@ -16,15 +16,22 @@ in its `orig/` directory (`python configure.py && ninja pre-compile`, which
 `just run --decomp PATH` does for you). `--decomp` defaults to the
 `MINT_AC_DECOMP` environment variable.
 
-Press Import… to pick a villager by its thumbnail, in-game name, species, or
-texture set, and see it in the Model View (left) and Texture View (right).
-Names are read from the disc image in the decomp's `orig/<version>/`
-directory; without one, villagers show their texture set names.
+File > Import villager… picks a villager by its thumbnail, in-game name,
+species, or texture set, and shows it in the Model View (left) and Texture View
+(right). Names are read from the disc image in the decomp's `orig/<version>/`
+directory; without one, villagers show their texture set names. File > Open
+decomp… opens another checkout.
 
-Paint in the Texture View with the tools in the Paint section: Select (V),
-Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on the picked
-layer, which must be visible and unlocked, in the palette color picked below
-them.
+The thumbnails above the Texture View choose the texture it shows and, for a
+texture with several, the variant. Paint in it with the tools at its left:
+Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on
+the picked layer, which must be visible and unlocked, in the picked palette
+color and the style set in the bar above the view. With shapes picked, that bar
+shows and changes their style instead, and can recolor, duplicate, reorder, and
+move them to another layer.
+
+The panel at the right holds the palette and the layers of the variant shown.
+Double-click a layer's name to rename it.
 
 - Select: drag a shape to move it, the square handles outside its corners to
   scale (Shift keeps proportions), and the round handle to rotate (Shift snaps
@@ -40,10 +47,11 @@ them.
 - Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes, Ctrl+S saves, and Ctrl+D
   duplicates the picked shapes.
 
-A project saves as a folder (Save, Save as). Export either replaces the
-imported villager's texture set in the decomp, after which the decomp must be
-built with `python configure.py --non-matching && ninja`, or writes a new
-texture set to a folder with the steps for adding it.
+A project saves as a folder (File > Save, Save as). The File menu's exports
+either replace the imported villager's texture set in the decomp, after which
+the decomp must be built with `python configure.py --non-matching && ninja`, or
+write a new texture set to a folder with the steps for adding it. The status
+bar says whether the project can export, and if not, why.
 
 To try the app without a disc, `just demo` writes a generated villager to a
 decomp-shaped directory and opens it.

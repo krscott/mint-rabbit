@@ -2,8 +2,10 @@
 //! order, batched in runs of one material, and textures resolved to the
 //! colors the target shows.
 
-use glam::{Mat3, Vec2, Vec3};
-use mint_core::{MaterialId, PaletteIndex, Project, Rgba8, Texture, TextureContent, TextureId};
+use glam::{Mat3, UVec2, Vec2, Vec3};
+use mint_core::{
+    Layer, MaterialId, PaletteIndex, Project, Rgba8, Texture, TextureContent, TextureId,
+};
 
 /// Converts a palette color to what the export target displays.
 pub fn display_color(project: &Project, c: Rgba8) -> Rgba8 {
@@ -22,10 +24,7 @@ pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> V
         TextureContent::External { preview } => preview.pixels.clone(),
         TextureContent::Painted(variants) => {
             let v = &variants[variant];
-            // Projects guarantee every pixel and shape names a palette entry.
-            let color = |i: PaletteIndex| {
-                display_color(project, project.palette().colors()[usize::from(i.0)])
-            };
+            let color = |i| entry_color(project, i);
             let mut out: Vec<Rgba8> = v.underlay().pixels().iter().map(|&i| color(i)).collect();
             for layer in v.layers().iter().filter(|l| l.visible) {
                 let opacity = if layer.opacity.is_nan() {
@@ -42,6 +41,22 @@ pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> V
             out
         }
     }
+}
+
+/// The RGBA pixels of one layer alone in the colors the views show, clear
+/// where no shape covers.
+pub fn layer_pixels(project: &Project, layer: &Layer, size: UVec2) -> Vec<Rgba8> {
+    layer
+        .coverage(size)
+        .into_iter()
+        .map(|c| c.map_or(Rgba8::new(0, 0, 0, 0), |c| entry_color(project, c)))
+        .collect()
+}
+
+/// A palette entry as the views show it. Projects guarantee every pixel and
+/// shape names an entry.
+fn entry_color(project: &Project, i: PaletteIndex) -> Rgba8 {
+    display_color(project, project.palette().colors()[usize::from(i.0)])
 }
 
 /// `over` drawn on `under` at `opacity`, mixing premultiplied colors so a
@@ -164,7 +179,7 @@ mod tests {
     use glam::{Quat, UVec2};
     use mint_core::{
         AlphaMode, Corner, IndexedImage, Material, Mesh, Model, NodeId, Palette, PaletteIndex,
-        Pose, Slot, Transform, Triangle, Vertex, Wrap,
+        Pose, Shape, Slot, Style, Transform, Triangle, Vertex, Wrap, shape,
     };
 
     use super::*;
@@ -261,5 +276,17 @@ mod tests {
         let px = texture_pixels(&p, &p.textures()[0], 0);
         // RGB5A3 cannot hold 1 and 2 exactly.
         assert_eq!(px, vec![Rgba8::new(255, 0, 0, 255)]);
+    }
+
+    #[test]
+    fn a_layer_alone_is_clear_where_no_shape_covers() {
+        let p = project();
+        let mut layer = Layer::new("l");
+        let square = shape::rectangle(Vec2::ZERO, Vec2::ONE);
+        layer.insert_shape(0, Shape::new(square, Style::Fill, PaletteIndex(0)).unwrap());
+        // A hidden layer still previews.
+        layer.visible = false;
+        let px = layer_pixels(&p, &layer, UVec2::new(2, 1));
+        assert_eq!(px, vec![Rgba8::new(255, 0, 0, 255), Rgba8::new(0, 0, 0, 0)]);
     }
 }
