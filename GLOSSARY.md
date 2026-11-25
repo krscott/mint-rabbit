@@ -79,9 +79,26 @@ _Avoid_: Expression, frame, version
 
 **Layer**:
 One level of a variant's stack, either a vector layer or a raster layer, with
-its own visibility (hidden layers neither show nor export), lock, and
-display-only opacity that never affects export.
+its own visibility (hidden layers neither show nor export), lock,
+display-only opacity that never affects export, and modifiers.
 _Avoid_: Group, folder
+
+**Modifier**:
+One step of a layer's ordered stack that changes what the layer shows and
+exports without changing the shapes or pixels it holds; each can be turned off,
+which removes it from both, or applied, which writes its result into the layer
+and removes it.
+_Avoid_: Effect, filter
+
+**Mirror**:
+A modifier that adds copies of its layer reflected across a vertical line, a
+horizontal line, or both, each at a position the user sets.
+_Avoid_: Flip, horizontal or vertical symmetry
+
+**Radial**:
+A modifier that adds copies of its layer turned about a point the user sets:
+one copy at a half turn, or three at quarter turns.
+_Avoid_: Rotate, rotational symmetry
 
 **Vector Layer**:
 A layer holding an ordered list of shapes.

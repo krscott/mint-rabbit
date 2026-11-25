@@ -7,8 +7,8 @@ use eframe::egui::{
 };
 use glam::{Affine2, Vec2};
 use mint_core::{
-    Anchor, Layer, LayerKind, PaletteIndex, Project, Raster, Shape, Style, TextureId, VariantRef,
-    shape,
+    Anchor, HalfPoint, Layer, LayerKind, ModifierKind, PaletteIndex, Project, Radial, Raster,
+    Shape, Style, TextureId, VariantRef, shape,
 };
 
 use crate::editor::Editor;
@@ -22,6 +22,11 @@ const HIT: f32 = 7.0;
 const CANVAS_DRAG: &str = "canvas drag";
 /// Freehand simplification tolerance in texels.
 const BRUSH_TOLERANCE: f32 = 0.25;
+/// Room, in screen points, left around the fitted image for the handles of
+/// modifier guides.
+const GUIDE_MARGIN: f32 = 16.0;
+/// How far outside the image a mirror line's handles sit, in screen points.
+const GUIDE_REACH: f32 = 9.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -214,6 +219,30 @@ enum Drag {
         end: Vec2,
         tool: Tool,
     },
+    /// A modifier guide of layer `layer` being moved.
+    Guide {
+        layer: usize,
+        modifier: usize,
+        part: GuidePart,
+    },
+}
+
+/// The part of a modifier guide that a handle moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuidePart {
+    /// A mirror's vertical line.
+    X,
+    /// A mirror's horizontal line.
+    Y,
+    /// A radial modifier's center.
+    Center,
+}
+
+/// A handle of a modifier guide, on screen.
+struct GuideHandle {
+    modifier: usize,
+    part: GuidePart,
+    at: Pos2,
 }
 
 /// Everything the view needs from the app for one frame.
@@ -325,7 +354,8 @@ impl TextureView {
         // app's keys.
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), Sense::CLICK | Sense::DRAG);
-        let fit = (rect.width() / size.x).min(rect.height() / size.y).max(1.0);
+        let room = rect.size() - egui::Vec2::splat(2.0 * GUIDE_MARGIN);
+        let fit = (room.x / size.x).min(room.y / size.y).max(1.0);
         let scale = fit * self.zoom;
         let image = Rect::from_center_size(rect.center() + self.pan, vec2(size.x, size.y) * scale);
         let at = Placement {
@@ -459,6 +489,7 @@ impl TextureView {
         } else if response.clicked()
             && !was_dragging
             && let Some(p) = pointer
+            && guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)).is_none()
         {
             match tool {
                 Tool::Pen => self.pen_click(editor, paint, selection, r, p, at, message),
@@ -513,6 +544,22 @@ impl TextureView {
 
         if let (Some(drag), Some(p)) = (&mut self.drag, pointer) {
             continue_drag(editor, drag, &self.targets, r, p, &mut self.pen, shift);
+        }
+        // The pointer shows which way a guide under it moves.
+        let part = match &self.drag {
+            Some(Drag::Guide { part, .. }) => Some(*part),
+            Some(_) => None,
+            None => response
+                .hover_pos()
+                .and_then(|q| guide_hit(editor.project(), r, selection.layer, at, q))
+                .map(|h| h.part),
+        };
+        if let Some(part) = part {
+            ui.ctx().set_cursor_icon(match part {
+                GuidePart::X => egui::CursorIcon::ResizeHorizontal,
+                GuidePart::Y => egui::CursorIcon::ResizeVertical,
+                GuidePart::Center => egui::CursorIcon::Move,
+            });
         }
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
         let cancelled = escape && self.drag.is_some();
@@ -601,6 +648,14 @@ impl TextureView {
         at: Placement,
         message: &mut Option<String>,
     ) -> Option<Drag> {
+        // Any tool moves the picked layer's modifier guides.
+        if let Some(h) = guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)) {
+            return Some(Drag::Guide {
+                layer: selection.layer,
+                modifier: h.modifier,
+                part: h.part,
+            });
+        }
         if matches!(tool, Tool::Brush | Tool::Ellipse | Tool::Rectangle)
             && let Err(why) = drawable(editor.project(), r, selection)
         {
@@ -817,6 +872,138 @@ impl TextureView {
                 );
             }
         }
+        if let Some(layer) = layers.get(selection.layer) {
+            draw_guides(&painter, layer, at);
+        }
+    }
+}
+
+/// The handles of the guides of layer `layer`'s enabled Mirror and Radial
+/// modifiers, if the layer is visible: each mirror line has one past either
+/// end of the image, kept inside the view, and each radial center one.
+fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
+    if !layer.visible {
+        return Vec::new();
+    }
+    let (image, view) = (at.image, at.view.shrink(GUIDE_REACH));
+    let mut out = Vec::new();
+    for (modifier, m) in layer.modifiers.iter().enumerate() {
+        if !m.enabled {
+            continue;
+        }
+        let mut add = |part, at| out.push(GuideHandle { modifier, part, at });
+        match m.kind {
+            ModifierKind::Mirror(mirror) => {
+                let c = at.to_screen(mirror.at.to_vec2());
+                if mirror.axes.x() {
+                    let ends = [image.top() - GUIDE_REACH, image.bottom() + GUIDE_REACH];
+                    for y in ends {
+                        add(GuidePart::X, pos2(c.x, y.clamp(view.top(), view.bottom())));
+                    }
+                }
+                if mirror.axes.y() {
+                    let ends = [image.left() - GUIDE_REACH, image.right() + GUIDE_REACH];
+                    for x in ends {
+                        add(GuidePart::Y, pos2(x.clamp(view.left(), view.right()), c.y));
+                    }
+                }
+            }
+            ModifierKind::Radial(radial) => {
+                add(GuidePart::Center, at.to_screen(radial.center().to_vec2()));
+            }
+        }
+    }
+    out
+}
+
+/// The guide handle nearest screen point `q` within reach, among those of
+/// layer `layer` if it can be edited.
+fn guide_hit(
+    project: &Project,
+    r: VariantRef,
+    layer: usize,
+    at: Placement,
+    q: Pos2,
+) -> Option<GuideHandle> {
+    let layer = project.variant(r).layers().get(layer)?;
+    if layer.locked {
+        return None;
+    }
+    guide_handles(layer, at)
+        .into_iter()
+        .map(|h| (h.at.distance(q), h))
+        .filter(|(d, _)| *d <= HIT)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, h)| h)
+}
+
+/// Draws the guides of `layer`'s enabled modifiers, faint on a locked layer,
+/// whose guides don't move.
+fn draw_guides(painter: &egui::Painter, layer: &Layer, at: Placement) {
+    let alpha = if layer.locked { 90 } else { 230 };
+    let color = Color32::from_rgba_unmultiplied(90, 200, 255, alpha);
+    let stroke = Stroke::new(1.5, color);
+    let image = at.image;
+    for m in layer.modifiers.iter().filter(|m| m.enabled) {
+        match m.kind {
+            ModifierKind::Mirror(mirror) => {
+                let c = at.to_screen(mirror.at.to_vec2());
+                if mirror.axes.x() {
+                    let line = [pos2(c.x, image.top()), pos2(c.x, image.bottom())];
+                    painter.extend(egui::Shape::dashed_line(&line, stroke, 5.0, 4.0));
+                }
+                if mirror.axes.y() {
+                    let line = [pos2(image.left(), c.y), pos2(image.right(), c.y)];
+                    painter.extend(egui::Shape::dashed_line(&line, stroke, 5.0, 4.0));
+                }
+            }
+            ModifierKind::Radial(radial) => {
+                let c = at.to_screen(radial.center().to_vec2());
+                let arm = 10.0;
+                painter.line_segment([c - vec2(arm, 0.0), c + vec2(arm, 0.0)], stroke);
+                painter.line_segment([c - vec2(0.0, arm), c + vec2(0.0, arm)], stroke);
+                painter.circle_stroke(c, 5.0, stroke);
+            }
+        }
+    }
+    for h in guide_handles(layer, at) {
+        if h.part == GuidePart::Center {
+            continue;
+        }
+        // A triangle pointing at the image.
+        let toward = match h.part {
+            GuidePart::X if h.at.y < image.center().y => vec2(0.0, 1.0),
+            GuidePart::X => vec2(0.0, -1.0),
+            _ if h.at.x < image.center().x => vec2(1.0, 0.0),
+            _ => vec2(-1.0, 0.0),
+        };
+        let side = vec2(toward.y, -toward.x) * 6.0;
+        let tip = h.at + toward * 5.0;
+        let back = h.at - toward * 5.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![tip, back + side, back - side],
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
+/// `kind` with the guide `part` moved to texel `p`, on the half-texel grid.
+fn move_guide(kind: ModifierKind, part: GuidePart, p: Vec2) -> ModifierKind {
+    let snapped = HalfPoint::nearest(p);
+    match (kind, part) {
+        (ModifierKind::Mirror(mut m), GuidePart::X) => {
+            m.at.x = snapped.x;
+            ModifierKind::Mirror(m)
+        }
+        (ModifierKind::Mirror(mut m), GuidePart::Y) => {
+            m.at.y = snapped.y;
+            ModifierKind::Mirror(m)
+        }
+        (ModifierKind::Radial(r), GuidePart::Center) => {
+            ModifierKind::Radial(Radial::nearest(r.turns(), p))
+        }
+        _ => kind,
     }
 }
 
@@ -1118,6 +1305,25 @@ fn continue_drag(
             }
         }
         Drag::Box { end, .. } => *end = p,
+        Drag::Guide {
+            layer,
+            modifier,
+            part,
+        } => {
+            // Guides stay on the image.
+            let size = editor.project().variant(r).size().as_vec2();
+            let p = p.clamp(Vec2::ZERO, size);
+            let (layer, modifier, part) = (*layer, *modifier, *part);
+            let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
+                if let Some(m) = v
+                    .layers_mut()
+                    .get_mut(layer)
+                    .and_then(|l| l.modifiers.get_mut(modifier))
+                {
+                    m.kind = move_guide(m.kind, part, p);
+                }
+            });
+        }
         Drag::Pixels {
             layer,
             last,
@@ -1130,12 +1336,8 @@ fn continue_drag(
             let (from, layer, value, width) = (*last, *layer, *value, *width);
             *last = p;
             let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
-                if let Some(raster) = v
-                    .layers_mut()
-                    .get_mut(layer)
-                    .and_then(Layer::raster_pixels_mut)
-                {
-                    raster.draw_line(from, p, width, value);
+                if let Some(l) = v.layers_mut().get_mut(layer) {
+                    l.edit_raster(|raster| raster.draw_line(from, p, width, value));
                 }
             });
         }
@@ -1284,14 +1486,13 @@ fn press_pixels(
         return None;
     }
     let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {
-        let Some(raster) = l.raster_pixels_mut() else {
-            return;
-        };
-        if tool == Tool::Fill {
-            raster.fill(p, value);
-        } else {
-            raster.draw_line(p, p, paint.width, value);
-        }
+        l.edit_raster(|raster| {
+            if tool == Tool::Fill {
+                raster.fill(p, value);
+            } else {
+                raster.draw_line(p, p, paint.width, value);
+            }
+        });
     });
     match painted {
         Ok(()) => Some(selection.layer),
@@ -1324,8 +1525,7 @@ pub fn add_shape(
         }
     };
     let added = edit_picked_layer(editor, selection, r, tool, None, |l| {
-        if let Some(raster) = l.raster_pixels_mut() {
-            raster.paint_shape(&shape);
+        if l.edit_raster(|raster| raster.paint_shape(&shape)).is_some() {
             return None;
         }
         l.insert_shape(l.shapes().len(), shape);
@@ -1480,6 +1680,78 @@ mod tests {
             variant: 0,
         };
         (Editor::new(project, None), r)
+    }
+
+    #[test]
+    fn guides_move_on_the_half_texel_grid_as_one_step() {
+        use mint_core::{Axes, Mirror, Modifier, Turns};
+        let (mut editor, r) = layerless();
+        let mirror = Mirror {
+            axes: Axes::Both,
+            at: HalfPoint { x: 4, y: 4 },
+        };
+        let radial = Radial::nearest(Turns::Quarter, Vec2::new(2.0, 2.0));
+        editor
+            .edit_variant(r, |v| {
+                let mut l = Layer::new("l");
+                l.modifiers
+                    .push(Modifier::new(ModifierKind::Mirror(mirror)));
+                l.modifiers
+                    .push(Modifier::new(ModifierKind::Radial(radial)));
+                v.insert_layer(0, l);
+            })
+            .unwrap();
+        let before = editor.project().clone();
+        // The 4x4 texture at 40 points a texel, inside a margin.
+        let at = Placement {
+            view: Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0)),
+            image: Rect::from_min_size(pos2(20.0, 20.0), vec2(160.0, 160.0)),
+            scale: 40.0,
+        };
+        let above = pos2(100.0, 20.0 - GUIDE_REACH);
+        let h = guide_hit(editor.project(), r, 0, at, above).unwrap();
+        assert_eq!((h.modifier, h.part), (0, GuidePart::X));
+        let h = guide_hit(editor.project(), r, 0, at, pos2(100.0, 100.0)).unwrap();
+        assert_eq!((h.modifier, h.part), (1, GuidePart::Center));
+
+        let kind = |e: &Editor, k: usize| e.project().variant(r).layers()[0].modifiers[k].kind;
+        let drag = |e: &mut Editor, modifier, part, p| {
+            let mut d = Drag::Guide {
+                layer: 0,
+                modifier,
+                part,
+            };
+            continue_drag(e, &mut d, &(0, Vec::new()), r, p, &mut [], false);
+        };
+        drag(&mut editor, 0, GuidePart::X, Vec2::new(1.3, 9.0));
+        let moved = Mirror {
+            at: HalfPoint { x: 3, y: 4 },
+            ..mirror
+        };
+        assert_eq!(kind(&editor, 0), ModifierKind::Mirror(moved));
+        // Guides stay on the image.
+        drag(&mut editor, 0, GuidePart::Y, Vec2::new(0.0, -3.0));
+        let moved = Mirror {
+            at: HalfPoint { x: 3, y: 0 },
+            ..mirror
+        };
+        assert_eq!(kind(&editor, 0), ModifierKind::Mirror(moved));
+        // Quarter turns keep the center on a pixel corner or center.
+        drag(&mut editor, 1, GuidePart::Center, Vec2::new(1.4, 1.1));
+        let ModifierKind::Radial(moved) = kind(&editor, 1) else {
+            panic!("not radial");
+        };
+        assert_eq!(moved.center(), HalfPoint { x: 2, y: 2 });
+
+        editor.end_gesture();
+        editor.undo();
+        assert_eq!(editor.project(), &before);
+
+        // A locked layer's guides show but don't move.
+        editor
+            .edit_variant(r, |v| v.layers_mut()[0].locked = true)
+            .unwrap();
+        assert!(guide_hit(editor.project(), r, 0, at, above).is_none());
     }
 
     #[test]

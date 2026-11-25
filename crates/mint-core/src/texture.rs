@@ -3,6 +3,7 @@
 use glam::{UVec2, Vec2};
 
 use crate::Shape;
+use crate::modifier::{self, Modifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgba8 {
@@ -440,6 +441,9 @@ pub struct Layer {
     pub locked: bool,
     /// Opacity in the views only, from 0 to 1; export ignores it.
     pub opacity: f32,
+    /// Applied in order to what the layer holds; locked layers can only
+    /// turn them on and off, which the app enforces.
+    pub modifiers: Vec<Modifier>,
     pub(crate) content: LayerContent,
 }
 
@@ -462,6 +466,7 @@ impl Layer {
             visible: true,
             locked: false,
             opacity: 1.0,
+            modifiers: Vec::new(),
             content,
         }
     }
@@ -500,12 +505,29 @@ impl Layer {
         }
     }
 
-    /// The pixels of a raster layer.
-    pub fn raster_pixels_mut(&mut self) -> Option<&mut Raster> {
-        match &mut self.content {
-            LayerContent::Raster(r) => Some(r),
-            LayerContent::Vector(_) => None,
+    /// Edits the pixels of a raster layer with `f`, returning its result,
+    /// or `None` for a vector layer. Each pixel `f` changes takes its new
+    /// value everywhere the enabled modifiers show copies of it or show it
+    /// as a copy, so the layer looks edited wherever `f` edited it.
+    pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
+        let LayerContent::Raster(r) = &mut self.content else {
+            return None;
+        };
+        if !self.modifiers.iter().any(|m| m.enabled) {
+            return Some(f(r));
         }
+        let before = r.pixels.clone();
+        let out = f(r);
+        let changed: Vec<usize> = (0..before.len())
+            .filter(|&i| r.pixels[i] != before[i])
+            .collect();
+        for i in changed {
+            let value = r.pixels[i];
+            for j in modifier::orbit(&self.modifiers, r.size, i) {
+                r.pixels[j] = value;
+            }
+        }
+        Some(out)
     }
 
     /// The shape list of a vector layer. Panics on a raster layer, which
@@ -536,11 +558,22 @@ impl Layer {
     }
 
     /// The palette entry each pixel of an image of `size` takes from this
-    /// layer, row-major: for a vector layer, the topmost shape covering its
-    /// center, or `None` where none does. Visibility and opacity are not
-    /// applied. A raster layer must be of `size`.
+    /// layer, row-major, after its enabled modifiers: for a vector layer,
+    /// from the topmost shape covering its center, or `None` where nothing
+    /// does. Visibility and opacity are not applied. A raster layer must be
+    /// of `size`.
     #[must_use]
     pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
+        self.modifiers
+            .iter()
+            .filter(|m| m.enabled)
+            .fold(self.content_coverage(size), |px, m| {
+                m.apply_pixels(size, &px)
+            })
+    }
+
+    /// [`Self::coverage`] of what the layer holds, before its modifiers.
+    fn content_coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
         match &self.content {
             LayerContent::Vector(shapes) => {
                 let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
@@ -557,11 +590,27 @@ impl Layer {
     }
 
     /// Turns a vector layer into a raster layer of `size` holding the
-    /// pixels its shapes cover. A raster layer stays as it is.
+    /// pixels its shapes cover, keeping its modifiers. A raster layer stays
+    /// as it is.
     fn rasterize(&mut self, size: UVec2) {
         if self.kind() == LayerKind::Vector {
-            let pixels = self.coverage(size);
+            let pixels = self.content_coverage(size);
             self.content = LayerContent::Raster(Raster { size, pixels });
+        }
+    }
+
+    /// Writes the first modifier's copies into the layer, as shapes or
+    /// pixels, and removes the modifier, whether or not it is enabled.
+    /// Copied shapes go beneath the shapes they copy. Does nothing without
+    /// modifiers.
+    pub fn apply_first_modifier(&mut self) {
+        if self.modifiers.is_empty() {
+            return;
+        }
+        let m = self.modifiers.remove(0);
+        match &mut self.content {
+            LayerContent::Vector(shapes) => *shapes = m.apply_shapes(shapes),
+            LayerContent::Raster(r) => r.pixels = m.apply_pixels(r.size, &r.pixels),
         }
     }
 
@@ -911,6 +960,89 @@ mod tests {
             px(l.raster_pixels().unwrap()),
             [Some(7), None, Some(7), None]
         );
+    }
+
+    fn mirror_x(at: i32) -> Modifier {
+        use crate::{Axes, HalfPoint, Mirror, ModifierKind};
+        Modifier::new(ModifierKind::Mirror(Mirror {
+            axes: Axes::X,
+            at: HalfPoint { x: at, y: 0 },
+        }))
+    }
+
+    #[test]
+    fn modifiers_show_until_turned_off_and_rasterizing_keeps_them() {
+        use crate::{Style, shape};
+        let size = UVec2::new(4, 1);
+        let mut l = Layer::new("l");
+        let dot = shape::rectangle(Vec2::ZERO, Vec2::new(1.0, 1.0));
+        l.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(4));
+        let shown = l.coverage(size);
+        assert_eq!(
+            shown,
+            [Some(7), None, None, Some(7)].map(|p| p.map(PaletteIndex))
+        );
+        let mut v = Variant::new("1", size);
+        v.insert_layer(0, l);
+        v.rasterize_layer(0);
+        let l = &mut v.layers_mut()[0];
+        assert_eq!(l.modifiers.len(), 1);
+        assert_eq!(px(l.raster_pixels().unwrap()), [Some(7), None, None, None]);
+        assert_eq!(l.coverage(size), shown);
+        l.modifiers[0].enabled = false;
+        assert_eq!(l.coverage(size)[3], None);
+    }
+
+    #[test]
+    fn applying_a_modifier_keeps_what_shows() {
+        use crate::{Style, shape};
+        let size = UVec2::new(4, 1);
+        let mut vector = Layer::new("v");
+        let dot = shape::rectangle(Vec2::new(1.0, 0.0), Vec2::new(2.0, 1.0));
+        vector.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        let mut raster = Layer::raster("r", Raster::clear(size));
+        raster.edit_raster(|r| r.draw_line(Vec2::ZERO, Vec2::ZERO, 1.0, Some(PaletteIndex(2))));
+        for mut l in [vector, raster] {
+            l.modifiers = vec![mirror_x(4), mirror_x(2)];
+            let shown = l.coverage(size);
+            l.apply_first_modifier();
+            assert_eq!(l.modifiers, [mirror_x(2)]);
+            assert_eq!(l.coverage(size), shown);
+        }
+        // The copy goes beneath the shape it copies.
+        let mut l = Layer::new("v");
+        let dot = shape::rectangle(Vec2::ZERO, Vec2::ONE);
+        l.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(4));
+        l.apply_first_modifier();
+        assert!(l.modifiers.is_empty());
+        assert_eq!(l.shapes()[1].anchors()[0].point, Vec2::ZERO);
+        assert_eq!(l.shapes()[0].outline().bounds().0, Vec2::new(3.0, 0.0));
+    }
+
+    #[test]
+    fn raster_edits_reach_every_copy() {
+        let size = UVec2::new(4, 1);
+        let mut l = Layer::raster("r", Raster::clear(size));
+        l.modifiers.push(mirror_x(4));
+        // Painting a pixel shown as a copy paints its source too, so the
+        // eraser can then clear it from either side.
+        let paint = |l: &mut Layer, x: f32, value| {
+            l.edit_raster(|r| r.draw_line(Vec2::new(x, 0.5), Vec2::new(x, 0.5), 1.0, value));
+        };
+        paint(&mut l, 3.5, Some(PaletteIndex(5)));
+        assert_eq!(
+            px(l.raster_pixels().unwrap()),
+            [Some(5), None, None, Some(5)]
+        );
+        paint(&mut l, 0.5, None);
+        assert_eq!(px(l.raster_pixels().unwrap()), [None; 4]);
+        // Off, the modifier leaves edits where they are.
+        l.modifiers[0].enabled = false;
+        paint(&mut l, 3.5, Some(PaletteIndex(5)));
+        assert_eq!(px(l.raster_pixels().unwrap()), [None, None, None, Some(5)]);
+        assert!(Layer::new("v").edit_raster(|_| ()).is_none());
     }
 
     #[test]

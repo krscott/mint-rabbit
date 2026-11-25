@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::texture::LayerContent;
 use crate::{
-    AlphaMode, Anchor, Corner, ExportTarget, Layer, Material, Mesh, Model, NodeId, Palette,
-    PaletteIndex, Pose, Project, Raster, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
-    TextureContent, TextureId, Transform, Triangle, Variant, Vertex, Wrap,
+    AlphaMode, Anchor, Axes, Corner, ExportTarget, HalfPoint, Layer, Material, Mesh, Mirror, Model,
+    Modifier, ModifierKind, NodeId, Palette, PaletteIndex, Pose, Project, Radial, Raster, Rgba8,
+    RgbaImage, Shape, Slot, Style, Texture, TextureContent, TextureId, Transform, Triangle, Turns,
+    Variant, Vertex, Wrap,
 };
 
 /// The project file inside a project directory.
@@ -185,7 +186,36 @@ struct LayerFile {
     visible: bool,
     locked: bool,
     opacity: f32,
+    /// Absent in projects saved before layers had modifiers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    modifiers: Vec<ModifierFile>,
     content: LayerContentFile,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ModifierFile {
+    enabled: bool,
+    kind: ModifierKindFile,
+}
+
+/// Lines and centers in texels, on the half-texel grid.
+#[derive(Serialize, Deserialize)]
+enum ModifierKindFile {
+    Mirror { axes: AxesFile, at: [f32; 2] },
+    Radial { turns: TurnsFile, center: [f32; 2] },
+}
+
+#[derive(Serialize, Deserialize)]
+enum AxesFile {
+    X,
+    Y,
+    Both,
+}
+
+#[derive(Serialize, Deserialize)]
+enum TurnsFile {
+    Half,
+    Quarter,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -286,6 +316,7 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
                             visible: layer.visible,
                             locked: layer.locked,
                             opacity: layer.opacity,
+                            modifiers: layer.modifiers.iter().map(modifier_file).collect(),
                             content,
                         });
                     }
@@ -490,6 +521,7 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
                         layer.visible = l.visible;
                         layer.locked = l.locked;
                         layer.opacity = l.opacity;
+                        layer.modifiers = l.modifiers.into_iter().map(modifier).collect();
                         variant.insert_layer(i, layer);
                     }
                     variants.push(variant);
@@ -580,6 +612,55 @@ fn mesh(m: MeshFile) -> Mesh {
                 material: crate::MaterialId(t.material),
             })
             .collect(),
+    }
+}
+
+fn modifier_file(m: &Modifier) -> ModifierFile {
+    ModifierFile {
+        enabled: m.enabled,
+        kind: match m.kind {
+            ModifierKind::Mirror(m) => ModifierKindFile::Mirror {
+                axes: match m.axes {
+                    Axes::X => AxesFile::X,
+                    Axes::Y => AxesFile::Y,
+                    Axes::Both => AxesFile::Both,
+                },
+                at: m.at.to_vec2().to_array(),
+            },
+            ModifierKind::Radial(r) => ModifierKindFile::Radial {
+                turns: match r.turns() {
+                    Turns::Half => TurnsFile::Half,
+                    Turns::Quarter => TurnsFile::Quarter,
+                },
+                center: r.center().to_vec2().to_array(),
+            },
+        },
+    }
+}
+
+/// A modifier from its file form, with lines and centers moved to the
+/// nearest place they can be.
+fn modifier(m: ModifierFile) -> Modifier {
+    let kind = match m.kind {
+        ModifierKindFile::Mirror { axes, at } => ModifierKind::Mirror(Mirror {
+            axes: match axes {
+                AxesFile::X => Axes::X,
+                AxesFile::Y => Axes::Y,
+                AxesFile::Both => Axes::Both,
+            },
+            at: HalfPoint::nearest(Vec2::from_array(at)),
+        }),
+        ModifierKindFile::Radial { turns, center } => {
+            let turns = match turns {
+                TurnsFile::Half => Turns::Half,
+                TurnsFile::Quarter => Turns::Quarter,
+            };
+            ModifierKind::Radial(Radial::nearest(turns, Vec2::from_array(center)))
+        }
+    };
+    Modifier {
+        enabled: m.enabled,
+        kind,
     }
 }
 
@@ -904,11 +985,28 @@ mod tests {
             high.opacity = 0.5;
             high.locked = true;
             high.insert_shape(0, ring.unwrap());
+            high.modifiers = vec![
+                Modifier {
+                    enabled: false,
+                    ..Modifier::new(ModifierKind::Mirror(Mirror {
+                        axes: Axes::Both,
+                        at: HalfPoint { x: 3, y: 2 },
+                    }))
+                },
+                Modifier::new(ModifierKind::Radial(Radial::nearest(
+                    Turns::Quarter,
+                    Vec2::new(1.5, 0.5),
+                ))),
+            ];
             // Set and unset pixels, over the base layer.
             let mut dots = Raster::clear(UVec2::new(4, 2));
             dots.draw_line(Vec2::ZERO, Vec2::new(3.5, 0.5), 1.0, Some(PaletteIndex(1)));
             let mut dots = Layer::raster("dots", dots);
             dots.visible = false;
+            dots.modifiers = vec![Modifier::new(ModifierKind::Radial(Radial::nearest(
+                Turns::Half,
+                Vec2::new(2.0, 0.5),
+            )))];
             v.insert_layer(1, low);
             v.insert_layer(2, high);
             v.insert_layer(0, dots);
