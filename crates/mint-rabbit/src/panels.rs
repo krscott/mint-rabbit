@@ -428,6 +428,10 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
         ui.weak("None on this layer");
     }
     let count = modifiers.len();
+    // Changes to the stack wait until every row's fields have entered their
+    // edits, which a click elsewhere does in the same frame, so those edits
+    // reach the modifier they were made on.
+    let mut restack = None;
     // A long stack scrolls rather than squeezing out the layer list.
     let max_height = ui.ctx().content_rect().height() * 0.35;
     egui::ScrollArea::vertical()
@@ -467,15 +471,15 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
                                         };
                                     let first = (k == 0).then_some("It applies first");
                                     if item(ui, first, "Apply sooner") {
-                                        t.edit(|v| v.layers_mut()[i].modifiers.swap(k - 1, k));
+                                        restack = Some(Restack::Swap(k - 1));
                                     }
                                     let last = (k + 1 == count).then_some("It applies last");
                                     if item(ui, last, "Apply later") {
-                                        t.edit(|v| v.layers_mut()[i].modifiers.swap(k, k + 1));
+                                        restack = Some(Restack::Swap(k));
                                     }
                                     ui.separator();
                                     if item(ui, None, "Delete") {
-                                        t.edit(|v| v.layers_mut()[i].modifiers.remove(k));
+                                        restack = Some(Restack::Delete(k));
                                     }
                                 });
                             more.response.on_hover_text("Reorder or delete");
@@ -502,7 +506,7 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
                                 .on_hover_text(hover)
                                 .on_disabled_hover_text(refusal.unwrap_or_default());
                             if apply.clicked() {
-                                apply_first_modifier(t);
+                                restack = Some(Restack::Apply);
                             }
                         });
                     });
@@ -514,6 +518,25 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
                 });
             }
         });
+    match restack {
+        Some(Restack::Apply) => apply_first_modifier(t),
+        Some(Restack::Swap(k)) => {
+            t.edit(|v| v.layers_mut()[i].modifiers.swap(k, k + 1));
+        }
+        Some(Restack::Delete(k)) => {
+            t.edit(|v| v.layers_mut()[i].modifiers.remove(k));
+        }
+        None => {}
+    }
+}
+
+/// A change to the order of the picked layer's modifiers.
+enum Restack {
+    /// Apply the first.
+    Apply,
+    /// Swap modifier `k` with the next.
+    Swap(usize),
+    Delete(usize),
 }
 
 /// Applies the picked layer's first modifier, keeping its picked shapes

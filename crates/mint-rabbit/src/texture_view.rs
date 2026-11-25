@@ -5,7 +5,7 @@ use eframe::egui::{
     self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke,
     pos2, vec2,
 };
-use glam::{Affine2, UVec2, Vec2};
+use glam::{Affine2, Vec2};
 use mint_core::{
     Anchor, Layer, LayerKind, ModifierKind, PaletteIndex, Project, Raster, Shape, Style, TextureId,
     VariantRef, shape,
@@ -1027,34 +1027,36 @@ fn box_anchors(tool: Tool, a: Vec2, b: Vec2) -> Vec<Anchor> {
     }
 }
 
-/// Whether shape `s` is under texture point `p`: covering it, within reach
-/// of its outline, or covering the center of the pixel of a texture of
-/// `size` under `p`, as it covers pixels.
-fn under(s: &Shape, p: Vec2, at: Placement, size: UVec2) -> bool {
-    let o = s.outline();
-    let on_image = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64).is_some();
-    o.covers(p) || o.distance(p) <= at.hit() || (on_image && o.covers(p.floor() + Vec2::splat(0.5)))
-}
-
 /// The topmost shape under `p` in a visible, unlocked layer, as `(layer,
 /// shape)`, unless a visible layer above it, locked or not, shows a pixel
-/// there (painted, or a copy) at some opacity.
+/// there (painted, or a copy) at some opacity. Within a layer, a shape
+/// covering `p` or the center of the pixel under it, as it covers pixels,
+/// comes first; where the layer shows nothing, one within reach of its
+/// outline does.
 fn shape_under(project: &Project, r: VariantRef, p: Vec2, at: Placement) -> Option<(usize, usize)> {
     let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
     let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
+    let center = p.floor() + Vec2::splat(0.5);
+    let covers = |s: &Shape| {
+        let o = s.outline();
+        o.covers(p) || (pixel.is_some() && o.covers(center))
+    };
+    let near = |s: &Shape| s.outline().distance(p) <= at.hit();
     for (li, l) in layers.iter().enumerate().rev() {
         if !l.visible {
             continue;
         }
-        if !l.locked
-            && let Some(si) = l.shapes().iter().rposition(|s| under(s, p, at, size))
-        {
+        let shapes = if l.locked { &[][..] } else { l.shapes() };
+        if let Some(si) = shapes.iter().rposition(covers) {
             return Some((li, si));
         }
         // What the layer shows hides the layers under it, pixels and copies
         // alike, unless it shows at no opacity.
         if l.opacity > 0.0 && pixel.is_some_and(|i| l.coverage(size)[i].is_some()) {
             return None;
+        }
+        if let Some(si) = shapes.iter().rposition(near) {
+            return Some((li, si));
         }
     }
     None
@@ -1845,6 +1847,35 @@ mod tests {
             l.visible = false;
         });
         assert_eq!(picked(&editor, 0.5, 0.5), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_copy_beside_its_shape_is_no_handle_for_it() {
+        use mint_core::{Axes, Mirror, Modifier};
+        let (mut editor, r) = layerless();
+        // A shape on pixel (1, 0), mirrored onto (2, 0) right beside it.
+        editor
+            .edit_variant(r, |v| {
+                let mut l = Layer::new("l");
+                let s = shape::rectangle(Vec2::new(1.0, 0.0), Vec2::new(2.0, 1.0));
+                l.insert_shape(0, Shape::new(s, Style::Fill, PaletteIndex(0)).unwrap());
+                l.modifiers.push(Modifier::new(ModifierKind::Mirror(Mirror {
+                    axes: Axes::X,
+                    at: mint_core::HalfPoint { x: 4, y: 0 },
+                })));
+                v.insert_layer(0, l);
+            })
+            .unwrap();
+        let at = Placement {
+            view: Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0)),
+            image: Rect::from_min_size(pos2(20.0, 20.0), vec2(160.0, 160.0)),
+            scale: 40.0,
+        };
+        let under = |x: f32, y: f32| shape_under(editor.project(), r, Vec2::new(x, y), at);
+        // On the copy, within reach of the shape's outline: nothing.
+        assert_eq!(under(2.1, 0.5), None);
+        // Within reach of the outline where nothing shows: the shape.
+        assert_eq!(under(1.5, 1.1), Some((0, 0)));
     }
 
     #[test]
