@@ -549,9 +549,9 @@ impl Layer {
     /// copies included, and each pixel it writes is stored at that pixel,
     /// even with the value it showed.
     /// The change also reaches every pixel the modifiers show as the same
-    /// one: a cleared pixel clears them all, so no copy of it is left, and a
-    /// set pixel recolors those the layer holds, while those it doesn't
-    /// hold show the new pixel's copies. What the layer holds then stays
+    /// one: clearing a pixel that showed something clears them all, so no
+    /// copy of it is left, and a set pixel recolors those the layer holds,
+    /// while those it doesn't hold show the new pixel's copies. What the layer holds then stays
     /// what was drawn, and moving the modifiers moves its copies.
     pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
         let size = self.raster_pixels()?.size;
@@ -566,13 +566,23 @@ impl Layer {
         let mut edited = Raster {
             size,
             written: vec![false; shown.len()],
-            pixels: shown,
+            pixels: shown.clone(),
         };
         let out = f(&mut edited);
-        // Written pixels by their value, which the tools make one.
+        // A raster `f` put in place of the copy counts as written where it
+        // differs.
+        if edited.written.len() != shown.len() {
+            edited.written = shown
+                .iter()
+                .zip(&edited.pixels)
+                .map(|(a, b)| a != b)
+                .collect();
+        }
+        // Written pixels by their value, which the tools make one. Clearing
+        // a pixel that showed nothing reaches no others.
         let mut changes: Vec<(Option<PaletteIndex>, Vec<usize>)> = Vec::new();
         for (i, &now) in edited.pixels.iter().enumerate() {
-            if !edited.written[i] {
+            if !edited.written[i] || (now.is_none() && shown[i].is_none()) {
                 continue;
             }
             r.pixels[i] = now;
@@ -1125,6 +1135,19 @@ mod tests {
         assert_eq!(shown(&l), "5..5");
         dot(&mut l, 3.5, None);
         assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("....", "...."));
+
+        // Erasing where nothing shows clears nothing elsewhere.
+        let mut l = raster_layer(&["..7....."]);
+        l.modifiers = vec![mirror_x(4), mirror_x(6)];
+        assert_eq!(shown(&l), ".7777...");
+        dot(&mut l, 0.5, None);
+        assert_eq!(shown(&l), ".7777...");
+
+        // A raster put in place of the one shown counts where it differs.
+        let mut l = raster_layer(&["5..."]);
+        l.modifiers.push(mirror_x(4));
+        l.edit_raster(|r| *r = Raster::clear(r.size()));
+        assert_eq!(stored(&l), "....");
 
         // Painting stores only what is drawn, recoloring what the layer
         // holds at matching pixels; the rest shows as copies.
