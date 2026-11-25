@@ -1032,9 +1032,10 @@ fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     o.covers(p) || o.distance(p) <= slack
 }
 
-/// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
-/// set pixel of such a raster layer, at some opacity, covers it, or with
-/// `add`, adds or removes it from a selection in the same layer.
+/// Picks the topmost shape under `p` in a visible, unlocked layer, unless
+/// such a layer above it, at some opacity, shows a pixel there (painted, or
+/// a copy), or with `add`, adds or removes it from a selection in the same
+/// layer.
 fn pick(
     project: &Project,
     r: VariantRef,
@@ -1049,17 +1050,15 @@ fn pick(
         if !l.visible || l.locked {
             continue;
         }
-        // Pixels painted over a shape, or copies of them, hide it from
-        // picks too, unless their layer shows at no opacity.
-        let shown = |px: &Raster| {
-            let i = mint_core::texel_index(px.size(), p.x.floor() as i64, p.y.floor() as i64);
-            i.is_some_and(|i| l.coverage(px.size())[i].is_some())
-        };
-        if l.opacity > 0.0 && l.raster_pixels().is_some_and(shown) {
-            break;
-        }
         if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {
             hit = Some((li, si));
+            break;
+        }
+        // What the layer shows hides the layers under it, pixels and copies
+        // alike, unless it shows at no opacity.
+        let size = project.variant(r).size();
+        let i = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
+        if l.opacity > 0.0 && i.is_some_and(|i| l.coverage(size)[i].is_some()) {
             break;
         }
     }

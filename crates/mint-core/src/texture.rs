@@ -547,12 +547,13 @@ impl Layer {
     /// Edits a raster layer with `f`, returning its result, or `None` for a
     /// vector layer. With modifiers on, `f` edits the pixels the layer shows,
     /// copies included, and each pixel it writes is stored at that pixel,
-    /// even with the value it showed.
-    /// The change also reaches every pixel the modifiers show as the same
-    /// one: clearing a pixel that showed something clears them all, so no
-    /// copy of it is left, and a set pixel recolors those the layer holds,
-    /// while those it doesn't hold show the new pixel's copies. What the layer holds then stays
-    /// what was drawn, and moving the modifiers moves its copies.
+    /// even with the value it showed. The change also reaches every pixel
+    /// the modifiers show as the same one: clearing a pixel that showed
+    /// something clears them all, so no copy of it is left, and a set pixel
+    /// recolors those the layer holds, while those it doesn't hold show the
+    /// new pixel's copies. What the layer holds then stays what was drawn,
+    /// and moving the modifiers moves its copies. A raster `f` puts in place
+    /// of the one it is given replaces the layer's as it is.
     pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
         let size = self.raster_pixels()?.size;
         let stack = modifier::stack(&self.modifiers);
@@ -569,14 +570,10 @@ impl Layer {
             pixels: shown.clone(),
         };
         let out = f(&mut edited);
-        // A raster `f` put in place of the copy counts as written where it
-        // differs.
         if edited.written.len() != shown.len() {
-            edited.written = shown
-                .iter()
-                .zip(&edited.pixels)
-                .map(|(a, b)| a != b)
-                .collect();
+            edited.written.clear();
+            *r = edited;
+            return Some(out);
         }
         // Written pixels by their value, which the tools make one. Clearing
         // a pixel that showed nothing reaches no others.
@@ -1143,11 +1140,11 @@ mod tests {
         dot(&mut l, 0.5, None);
         assert_eq!(shown(&l), ".7777...");
 
-        // A raster put in place of the one shown counts where it differs.
+        // A raster put in place of the one shown replaces the layer's.
         let mut l = raster_layer(&["5..."]);
         l.modifiers.push(mirror_x(4));
-        l.edit_raster(|r| *r = Raster::clear(r.size()));
-        assert_eq!(stored(&l), "....");
+        l.edit_raster(|r| *r = raster_layer(&["..3."]).raster_pixels().unwrap().clone());
+        assert_eq!(stored(&l), "..3.");
 
         // Painting stores only what is drawn, recoloring what the layer
         // holds at matching pixels; the rest shows as copies.
