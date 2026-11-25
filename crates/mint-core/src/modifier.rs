@@ -197,6 +197,59 @@ pub enum ModifierKind {
     Radial(Radial),
 }
 
+impl ModifierKind {
+    /// Where the modifier's guide lines cross, and whether it has the
+    /// vertical line (`[0]`) and the horizontal one (`[1]`). A radial
+    /// center is where its two lines cross.
+    #[must_use]
+    pub fn guides(self) -> (HalfPoint, [bool; 2]) {
+        match self {
+            Self::Mirror(m) => (m.at, [m.axes.x(), m.axes.y()]),
+            Self::Radial(r) => (r.center, [true, true]),
+        }
+    }
+
+    /// The modifier with guide line `axis` (0 the vertical line, 1 the
+    /// horizontal one) moved to the nearest place to `v`, in texels, it can
+    /// be on a texture of `size`; see [`Self::step`].
+    #[must_use]
+    pub fn with_coordinate(self, axis: usize, v: f32, size: UVec2) -> Self {
+        match self {
+            Self::Mirror(mut m) => {
+                let max = 2 * size[axis] as i32;
+                if axis == 0 {
+                    m.at.x = snap(v * 2.0, max, None);
+                } else {
+                    m.at.y = snap(v * 2.0, max, None);
+                }
+                Self::Mirror(m)
+            }
+            Self::Radial(r) => Self::Radial(r.with_coordinate(axis, v, size)),
+        }
+    }
+
+    /// How far, in texels, a guide line moves at a time: half a texel, or a
+    /// whole one for quarter turns.
+    #[must_use]
+    pub fn step(self) -> f32 {
+        match self {
+            Self::Radial(r) if r.turns == Turns::Quarter => 1.0,
+            _ => 0.5,
+        }
+    }
+
+    /// The modifier with its guides through the center of a texture of
+    /// `size`, or as near as it allows.
+    #[must_use]
+    pub fn centered(self, size: UVec2) -> Self {
+        let c = HalfPoint::center(size);
+        match self {
+            Self::Mirror(m) => Self::Mirror(Mirror { at: c, ..m }),
+            Self::Radial(r) => Self::Radial(Radial::nearest(r.turns, c.to_vec2(), size)),
+        }
+    }
+}
+
 /// One step of a layer's modifier stack. A modifier that is off neither
 /// shows nor exports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

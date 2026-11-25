@@ -5,10 +5,10 @@ use eframe::egui::{
     self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke,
     pos2, vec2,
 };
-use glam::{Affine2, UVec2, Vec2};
+use glam::{Affine2, Vec2};
 use mint_core::{
-    Anchor, HalfPoint, Layer, LayerKind, ModifierKind, PaletteIndex, Project, Raster, Shape, Style,
-    TextureId, VariantRef, shape,
+    Anchor, Layer, LayerKind, ModifierKind, PaletteIndex, Project, Raster, Shape, Style, TextureId,
+    VariantRef, shape,
 };
 
 use crate::editor::Editor;
@@ -228,11 +228,12 @@ enum Drag {
 }
 
 /// The line of a modifier guide that a handle moves: the vertical line (X)
-/// or the horizontal one (Y). A radial center is where the two cross.
+/// or the horizontal one (Y), numbered as [`ModifierKind::guides`] gives
+/// them. A radial center is where the two cross.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuidePart {
-    X,
-    Y,
+    X = 0,
+    Y = 1,
 }
 
 /// A handle of a modifier guide, on screen.
@@ -888,7 +889,7 @@ fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
         if !m.enabled {
             continue;
         }
-        let (c, x, y) = guide_lines(m.kind);
+        let (c, [x, y]) = m.kind.guides();
         let c = at.to_screen(c.to_vec2());
         if x {
             for end in [image.top() - GUIDE_REACH, image.bottom() + GUIDE_REACH] {
@@ -913,15 +914,6 @@ fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
     }
     out.retain(|h| at.view.contains(h.at));
     out
-}
-
-/// Where a modifier's guide lines cross, and whether it has a vertical and
-/// a horizontal one.
-fn guide_lines(kind: ModifierKind) -> (HalfPoint, bool, bool) {
-    match kind {
-        ModifierKind::Mirror(m) => (m.at, m.axes.x(), m.axes.y()),
-        ModifierKind::Radial(r) => (r.center(), true, true),
-    }
 }
 
 /// The guide handle nearest screen point `q` within reach, among those of
@@ -959,7 +951,7 @@ fn draw_guides(painter: &egui::Painter, layer: &Layer, at: Placement) {
     let stroke = Stroke::new(1.5, color);
     let image = at.image;
     for m in layer.modifiers.iter().filter(|m| m.enabled) {
-        let (c, x, y) = guide_lines(m.kind);
+        let (c, [x, y]) = m.kind.guides();
         let c = at.to_screen(c.to_vec2());
         if x {
             let line = [pos2(c.x, image.top()), pos2(c.x, image.bottom())];
@@ -989,27 +981,6 @@ fn draw_guides(painter: &egui::Painter, layer: &Layer, at: Placement) {
             color,
             Stroke::NONE,
         ));
-    }
-}
-
-/// `kind` with its guide line `part` moved to texel `p`, on a texture of
-/// `size`.
-fn move_guide(kind: ModifierKind, part: GuidePart, p: Vec2, size: UVec2) -> ModifierKind {
-    let axis = match part {
-        GuidePart::X => 0,
-        GuidePart::Y => 1,
-    };
-    match kind {
-        ModifierKind::Mirror(mut m) => {
-            let snapped = HalfPoint::nearest(p, size);
-            if axis == 0 {
-                m.at.x = snapped.x;
-            } else {
-                m.at.y = snapped.y;
-            }
-            ModifierKind::Mirror(m)
-        }
-        ModifierKind::Radial(r) => ModifierKind::Radial(r.with_coordinate(axis, p[axis], size)),
     }
 }
 
@@ -1324,7 +1295,8 @@ fn continue_drag(
                     .get_mut(layer)
                     .and_then(|l| l.modifiers.get_mut(modifier))
                 {
-                    m.kind = move_guide(m.kind, part, p, size);
+                    let axis = part as usize;
+                    m.kind = m.kind.with_coordinate(axis, p[axis], size);
                 }
             });
         }
@@ -1688,7 +1660,7 @@ mod tests {
 
     #[test]
     fn guides_move_on_the_half_texel_grid_within_the_texture() {
-        use mint_core::{Axes, Mirror, Modifier, Radial, Turns};
+        use mint_core::{Axes, HalfPoint, Mirror, Modifier, Radial, Turns};
         let (mut editor, r) = layerless();
         let mirror = Mirror {
             axes: Axes::Both,

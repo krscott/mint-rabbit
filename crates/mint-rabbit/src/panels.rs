@@ -548,99 +548,78 @@ fn modifier_settings(
         };
         report(result, t.message);
     };
-    let centered = |ui: &mut egui::Ui| {
-        ui.button(icons::text(Icon::LocateFixed, icons::SMALL))
-            .on_hover_text("Move to the texture's center")
-            .clicked()
-    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         // Narrow fields, so the row fits the narrowest dock.
         ui.spacing_mut().interact_size.x = 36.0;
-        match kind {
-            ModifierKind::Mirror(m) => {
-                for (axis, label, max) in [(0, "X", size.x), (1, "Y", size.y)] {
-                    let on = if axis == 0 { m.axes.x() } else { m.axes.y() };
-                    let mut checked = on;
-                    // The last axis stays; deleting the modifier removes it.
-                    let alone = on
-                        && Axes::from_flags(m.axes.x() != (axis == 0), m.axes.y() != (axis == 1))
-                            .is_none();
-                    let hover = if axis == 0 {
-                        "Reflect left and right across a vertical line"
-                    } else {
-                        "Reflect top and bottom across a horizontal line"
-                    };
-                    let box_ = ui
-                        .add_enabled(!alone, egui::Checkbox::new(&mut checked, label))
-                        .on_hover_text(hover)
-                        .on_disabled_hover_text("A mirror needs a line; delete it to remove it");
-                    if box_.changed()
-                        && let Some(axes) = Axes::from_flags(
-                            if axis == 0 { checked } else { m.axes.x() },
-                            if axis == 1 { checked } else { m.axes.y() },
-                        )
-                    {
-                        set(t, ModifierKind::Mirror(Mirror { axes, ..m }), None);
-                    }
-                    let mut at = m.at.to_vec2();
-                    let field = ui.add_enabled(on, position(&mut at[axis], max, 0.5));
-                    if field.changed() {
-                        let at = HalfPoint::nearest(at, size);
-                        set(t, ModifierKind::Mirror(Mirror { at, ..m }), Some(label));
-                    }
-                }
-                if centered(ui) {
-                    let at = HalfPoint::center(size);
-                    set(t, ModifierKind::Mirror(Mirror { at, ..m }), None);
-                }
-            }
-            ModifierKind::Radial(r) => {
-                for (turns, label, hover) in [
-                    (Turns::Half, "180°", "One copy, half a turn around"),
-                    (Turns::Quarter, "90°", "Three copies, a quarter turn apart"),
-                ] {
-                    if ui
-                        .selectable_label(r.turns() == turns, label)
-                        .on_hover_text(hover)
-                        .clicked()
-                        && r.turns() != turns
-                    {
-                        let r = Radial::nearest(turns, r.center().to_vec2(), size);
-                        set(t, ModifierKind::Radial(r), None);
-                    }
-                }
-                // With quarter turns, each coordinate moves a whole texel at
-                // a time, keeping the center on a pixel corner or center.
-                let c = r.center().to_vec2();
-                let step = if r.turns() == Turns::Quarter {
-                    1.0
-                } else {
-                    0.5
-                };
-                for (axis, label, hover) in [(0, "x", "Center, across"), (1, "y", "Center, down")] {
-                    let mut v = c[axis];
-                    if ui
-                        .add(position(&mut v, size[axis], step))
-                        .on_hover_text(hover)
-                        .changed()
-                    {
-                        let r = r.with_coordinate(axis, v, size);
-                        set(t, ModifierKind::Radial(r), Some(label));
-                    }
-                }
-                if centered(ui) {
-                    let r = Radial::nearest(r.turns(), HalfPoint::center(size).to_vec2(), size);
+        if let ModifierKind::Radial(r) = kind {
+            for (turns, label, hover) in [
+                (Turns::Half, "180°", "One copy, half a turn around"),
+                (Turns::Quarter, "90°", "Three copies, a quarter turn apart"),
+            ] {
+                if ui
+                    .selectable_label(r.turns() == turns, label)
+                    .on_hover_text(hover)
+                    .clicked()
+                    && r.turns() != turns
+                {
+                    let r = Radial::nearest(turns, r.center().to_vec2(), size);
                     set(t, ModifierKind::Radial(r), None);
                 }
             }
         }
+        let (at, lines) = kind.guides();
+        let at = at.to_vec2();
+        for (axis, label) in [(0, "X"), (1, "Y")] {
+            if let ModifierKind::Mirror(m) = kind {
+                let mut checked = lines[axis];
+                let mut flags = lines;
+                flags[axis] = !checked;
+                // The last line stays; deleting the modifier removes it.
+                let other = Axes::from_flags(flags[0], flags[1]);
+                let hover = if axis == 0 {
+                    "Reflect left and right across a vertical line"
+                } else {
+                    "Reflect top and bottom across a horizontal line"
+                };
+                let box_ = ui
+                    .add_enabled(other.is_some(), egui::Checkbox::new(&mut checked, label))
+                    .on_hover_text(hover)
+                    .on_disabled_hover_text("A mirror needs a line; delete it to remove it");
+                if box_.changed()
+                    && let Some(axes) = other
+                {
+                    set(t, ModifierKind::Mirror(Mirror { axes, ..m }), None);
+                }
+            }
+            let hover = if axis == 0 {
+                "The vertical line, in texels from the left"
+            } else {
+                "The horizontal line, in texels from the top"
+            };
+            let mut v = at[axis];
+            let field = position(&mut v, size[axis], f64::from(kind.step()));
+            if ui
+                .add_enabled(lines[axis], field)
+                .on_hover_text(hover)
+                .changed()
+            {
+                set(t, kind.with_coordinate(axis, v, size), Some(label));
+            }
+        }
+        if ui
+            .button(icons::text(Icon::LocateFixed, icons::SMALL))
+            .on_hover_text("Move to the texture's center")
+            .clicked()
+        {
+            set(t, kind.centered(size), None);
+        }
     });
 }
 
-/// A field for a guide's position in texels, up to `max`, stepping by `step`
-/// texels (as the arrow keys do); the edit moves it to the nearest place the
-/// modifier allows.
+/// A field for a guide line's position in texels, up to `max`, stepping by
+/// `step` texels (as the arrow keys do); the edit moves it to the nearest
+/// place the modifier allows.
 fn position(value: &mut f32, max: u32, step: f64) -> egui::DragValue<'_> {
     egui::DragValue::new(value)
         .range(0.0..=max as f32)

@@ -47,8 +47,8 @@ layer's own shapes and pixels and are cut off at the texture's edges. Drag the
 arrow handles of a guide's lines in the Texture View, or type their positions;
 they snap to half texels, and a 90° center to a pixel corner or center. Pixel
 tools on a raster layer edit what it shows, copies included: the layer keeps
-only what was drawn, recolors its own pixels at matching places, and erasing a
-copy erases what it copies. Apply writes the first modifier's copies into the
+only what was drawn, recolors its own pixels at matching places, and erasing
+clears every matching pixel, so erasing a copy erases what it copies. Apply writes the first modifier's copies into the
 layer and removes it; a locked layer's modifiers can only be turned on and off.
 
 - Select: drag a shape to move it, the square handles outside its corners to
