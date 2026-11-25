@@ -238,10 +238,12 @@ impl Raster {
         &self.pixels
     }
 
-    /// The pixel at `(x, y)`, or `None` outside the raster.
+    /// The palette entry of the pixel under `p`, or `None` where it is
+    /// unset or outside the raster.
     #[must_use]
-    pub fn pixel(&self, x: i64, y: i64) -> Option<Option<PaletteIndex>> {
-        self.index(x, y).map(|i| self.pixels[i])
+    pub fn at(&self, p: Vec2) -> Option<PaletteIndex> {
+        let i = self.index(p.x.floor() as i64, p.y.floor() as i64)?;
+        self.pixels[i]
     }
 
     fn index(&self, x: i64, y: i64) -> Option<usize> {
@@ -256,34 +258,15 @@ impl Raster {
     }
 
     /// Sets the pixels a pencil `width` texels wide covers from `from` to
-    /// `to` to `value`, as a round tip stepped one pixel at a time so that
-    /// no gap opens. At width 1 the tip is the pixel under the point.
+    /// `to` to `value`: its tip, as [`pencil_tip`] places it, stepped one
+    /// pixel at a time so that no gap opens.
     pub fn draw_line(&mut self, from: Vec2, to: Vec2, width: f32, value: Option<PaletteIndex>) {
-        let width = width.round().max(1.0) as i64;
-        // An odd tip centers on a pixel, an even one on a pixel corner, so
-        // its tip lands on whole pixels either way.
-        let lattice = |p: Vec2| {
-            if width % 2 == 1 {
-                (p.x.floor() as i64, p.y.floor() as i64)
-            } else {
-                (p.x.round() as i64, p.y.round() as i64)
-            }
-        };
-        let (mut x, mut y) = lattice(from);
-        let (x1, y1) = lattice(to);
-        // Offsets from the tip's lattice point of the pixels it covers:
-        // those whose centers lie within half the width of its center.
-        let half = width as f32 / 2.0;
-        let center = if width % 2 == 1 { 0.5 } else { 0.0 };
-        let reach = width / 2 + 1;
-        let tip: Vec<(i64, i64)> = (-reach..=reach)
-            .flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy)))
-            .filter(|&(dx, dy)| {
-                let d = Vec2::new(dx as f32 + 0.5 - center, dy as f32 + 0.5 - center);
-                d.length_squared() <= half * half
-            })
-            .collect();
-        // Bresenham between the two lattice points.
+        let (x0, y0) = tip_origin(from, width);
+        let (x1, y1) = tip_origin(to, width);
+        // Offsets from a tip's origin, which is (0, 0) at the origin.
+        let tip = pencil_tip(Vec2::ZERO, width);
+        // Bresenham between the two tip origins.
+        let (mut x, mut y) = (x0, y0);
         let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
         let (sx, sy) = ((x1 - x).signum(), (y1 - y).signum());
         let mut err = dx + dy;
@@ -337,6 +320,44 @@ impl Raster {
     }
 }
 
+/// The whole pixels a pencil tip `width` texels wide (rounded, at least 1)
+/// covers at `at`: those whose centers lie within half the width of the
+/// tip's center, which is the center of the pixel under `at` for odd widths
+/// and the nearest pixel corner for even ones. At width 1 it is the pixel
+/// under `at`.
+#[must_use]
+pub fn pencil_tip(at: Vec2, width: f32) -> Vec<(i64, i64)> {
+    let w = tip_width(width);
+    let (x, y) = tip_origin(at, width);
+    // The tip's center relative to its origin pixel's top-left corner.
+    let center = if w % 2 == 1 { 0.5 } else { 0.0 };
+    let half = w as f32 / 2.0;
+    let reach = w / 2 + 1;
+    (-reach..=reach)
+        .flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy)))
+        .filter(|&(dx, dy)| {
+            let d = Vec2::new(dx as f32 + 0.5 - center, dy as f32 + 0.5 - center);
+            d.length_squared() <= half * half
+        })
+        .map(|(dx, dy)| (x + dx, y + dy))
+        .collect()
+}
+
+fn tip_width(width: f32) -> i64 {
+    width.round().max(1.0) as i64
+}
+
+/// The pixel a tip is placed from: the one under `at` for odd widths, the
+/// one right and below the nearest corner for even ones.
+fn tip_origin(at: Vec2, width: f32) -> (i64, i64) {
+    let p = if tip_width(width) % 2 == 1 {
+        at.floor()
+    } else {
+        at.round()
+    };
+    (p.x as i64, p.y as i64)
+}
+
 impl From<IndexedImage> for Raster {
     fn from(image: IndexedImage) -> Self {
         Self {
@@ -355,7 +376,7 @@ pub enum LayerKind {
 
 /// What a layer holds.
 #[derive(Clone, Debug, PartialEq)]
-pub enum LayerContent {
+pub(crate) enum LayerContent {
     /// Shapes, later ones drawing over earlier ones.
     Vector(Vec<Shape>),
     Raster(Raster),
@@ -371,7 +392,7 @@ pub struct Layer {
     pub locked: bool,
     /// Opacity in the views only, from 0 to 1; export ignores it.
     pub opacity: f32,
-    pub content: LayerContent,
+    pub(crate) content: LayerContent,
 }
 
 impl Layer {
@@ -489,7 +510,7 @@ impl Layer {
 
     /// Turns a vector layer into a raster layer of `size` holding the
     /// pixels its shapes cover. A raster layer stays as it is.
-    pub fn rasterize(&mut self, size: UVec2) {
+    fn rasterize(&mut self, size: UVec2) {
         if self.kind() == LayerKind::Vector {
             let pixels = self.coverage(size);
             self.content = LayerContent::Raster(Raster { size, pixels });
@@ -517,7 +538,7 @@ impl Layer {
 }
 
 /// The name of the raster layer an imported image arrives in.
-pub const BASE_LAYER: &str = "Base";
+const BASE_LAYER: &str = "Base";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Variant {
@@ -554,13 +575,17 @@ impl Variant {
         self.size
     }
 
-    /// The size of a raster layer that doesn't match the variant's.
-    pub(crate) fn mismatched_raster(&self) -> Option<UVec2> {
-        self.layers
-            .iter()
-            .filter_map(Layer::raster_pixels)
-            .map(Raster::size)
-            .find(|&s| s != self.size)
+    /// The size of the variant, or else of one of its raster layers, that
+    /// isn't `expected`.
+    pub(crate) fn size_mismatch(&self, expected: UVec2) -> Option<UVec2> {
+        std::iter::once(self.size)
+            .chain(
+                self.layers
+                    .iter()
+                    .filter_map(Layer::raster_pixels)
+                    .map(Raster::size),
+            )
+            .find(|&s| s != expected)
     }
 
     /// The layers, bottom to top.
@@ -585,6 +610,13 @@ impl Variant {
     pub fn move_layer(&mut self, from: usize, to: usize) {
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
+    }
+
+    /// Turns layer `index`, if a vector layer, into a raster layer holding
+    /// the pixels its shapes cover.
+    pub fn rasterize_layer(&mut self, index: usize) {
+        let size = self.size;
+        self.layers[index].rasterize(size);
     }
 
     /// The palette entries the variant's layers use.
@@ -617,7 +649,7 @@ pub enum TextureError {
     #[error("texture {texture:?} needs at least one variant")]
     NoVariants { texture: String },
     #[error(
-        "variant {variant:?} of texture {texture:?} has a layer of {actual} but the texture is {expected}"
+        "variant {variant:?} of texture {texture:?} has an image of {actual}, but the texture is {expected}"
     )]
     SizeMismatch {
         texture: String,
@@ -639,12 +671,7 @@ impl Texture {
         let name = name.into();
         let variants: Vec<Variant> = variants.into_iter().collect();
         for v in &variants {
-            let actual = if v.size == size {
-                v.mismatched_raster()
-            } else {
-                Some(v.size)
-            };
-            if let Some(actual) = actual {
+            if let Some(actual) = v.size_mismatch(size) {
                 return Err(TextureError::SizeMismatch {
                     texture: name,
                     variant: v.name.clone(),
@@ -810,7 +837,10 @@ mod tests {
         let square = shape::rectangle(Vec2::ZERO, Vec2::new(1.0, 2.0));
         l.insert_shape(0, Shape::new(square, Style::Fill, PaletteIndex(7)).unwrap());
         let before = l.coverage(UVec2::new(2, 2));
-        l.rasterize(UVec2::new(2, 2));
+        let mut v = Variant::new("1", UVec2::new(2, 2));
+        v.insert_layer(0, l);
+        v.rasterize_layer(0);
+        let l = &v.layers()[0];
         assert_eq!(l.kind(), LayerKind::Raster);
         assert!(l.locked && (l.opacity - 0.5).abs() < f32::EPSILON);
         assert_eq!(l.coverage(UVec2::new(2, 2)), before);
@@ -829,15 +859,18 @@ mod tests {
             1.0,
             Some(PaletteIndex(1)),
         );
-        let on = |x: u32| {
-            (0..3)
-                .filter(|&y| r.pixel(i64::from(x), y) == Some(Some(PaletteIndex(1))))
-                .count()
-        };
-        // One pixel per column from the first to the last.
-        assert!((0..5).all(|x| on(x) == 1), "{:?}", px(&r));
-        assert_eq!(r.pixel(0, 0), Some(Some(PaletteIndex(1))));
-        assert_eq!(r.pixel(4, 2), Some(Some(PaletteIndex(1))));
+        // One pixel per column, from the pixel under the start to the one
+        // under the end.
+        let rows: Vec<Vec<Option<u8>>> = px(&r).chunks(5).map(<[_]>::to_vec).collect();
+        let one = Some(1);
+        assert_eq!(
+            rows,
+            [
+                [one, None, None, None, None],
+                [None, one, one, None, None],
+                [None, None, None, one, one],
+            ]
+        );
 
         // A dot of width 1 is the pixel under the point; erasing clears it.
         let mut r = Raster::clear(UVec2::new(3, 3));
@@ -848,7 +881,7 @@ mod tests {
             Some(PaletteIndex(2)),
         );
         assert_eq!(px(&r).iter().flatten().count(), 1);
-        assert_eq!(r.pixel(1, 1), Some(Some(PaletteIndex(2))));
+        assert_eq!(r.pixels()[4], Some(PaletteIndex(2)));
         r.draw_line(Vec2::new(1.5, 1.5), Vec2::new(1.5, 1.5), 1.0, None);
         assert_eq!(r, Raster::clear(UVec2::new(3, 3)));
     }
@@ -867,6 +900,10 @@ mod tests {
         assert_eq!(count(4.0, Vec2::new(4.2, 3.9)), 12);
         // Tips are clipped at the edge.
         assert_eq!(count(3.0, Vec2::new(0.1, 0.1)), 4);
+        // The tip the views outline is the one drawn.
+        let mut tip = pencil_tip(Vec2::new(4.2, 3.9), 2.0);
+        tip.sort_unstable();
+        assert_eq!(tip, [(3, 3), (3, 4), (4, 3), (4, 4)]);
     }
 
     #[test]

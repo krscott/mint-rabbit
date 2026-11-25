@@ -583,13 +583,15 @@ impl App {
     }
 
     /// The kind of the picked layer, or `None` with no painted variant
-    /// shown or no layers in it.
-    fn picked_kind(&mut self) -> Option<LayerKind> {
-        let doc = self.doc.as_mut()?;
-        let variant = doc.variant()?;
-        doc.selection.fit(doc.editor.project(), variant);
-        let layers = doc.editor.project().variant(variant).layers();
-        layers.get(doc.selection.layer).map(Layer::kind)
+    /// shown or no layers in it. A pick past the top, as after an undo, is
+    /// of the top layer, as [`Selection::fit`] makes it.
+    fn picked_kind(&self) -> Option<LayerKind> {
+        let doc = self.doc.as_ref()?;
+        let layers = doc.editor.project().variant(doc.variant()?).layers();
+        layers
+            .get(doc.selection.layer)
+            .or(layers.last())
+            .map(Layer::kind)
     }
 
     /// Switches to a tool that works on the picked layer, if the current one

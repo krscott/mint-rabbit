@@ -307,20 +307,29 @@ pub fn layer_list(
             if pick && !picked {
                 t.pick_layer(i);
             }
+            let mut chosen = None;
             for row in rows {
                 row.context_menu(|ui| {
                     if let Some(a) = layer_menu(ui, t, i) {
-                        action = Some(a);
+                        chosen = Some(a);
                         ui.close();
                     }
                 });
+            }
+            // The action is for the row whose menu was open, whatever is
+            // picked by now.
+            if let Some(a) = chosen {
+                if t.selection.layer != i {
+                    t.pick_layer(i);
+                }
+                action = Some(a);
             }
         });
     }
     action
 }
 
-/// The options for layer `i`, the picked layer, in its right-click menu.
+/// The options for layer `i` in its right-click menu.
 fn layer_menu(ui: &mut egui::Ui, t: &Target<'_>, i: usize) -> Option<LayerAction> {
     let layer = t.layers().get(i)?;
     let mut action = None;
@@ -486,10 +495,7 @@ pub fn apply_layer_action(t: &mut Target<'_>, rename: &mut Option<Rename>, actio
         // action was chosen.
         LayerAction::Rasterize | LayerAction::Delete if t.layers()[i].locked => {}
         LayerAction::Rasterize => {
-            t.edit(|v| {
-                let size = v.size();
-                v.layers_mut()[i].rasterize(size);
-            });
+            t.edit(|v| v.rasterize_layer(i));
             t.pick_layer(i);
         }
         LayerAction::Delete => {

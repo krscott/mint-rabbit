@@ -93,8 +93,9 @@ such as the image a variant was imported with.
 _Avoid_: Underlay, base texture, bitmap, pixel layer
 
 **Rasterize**:
-To turn a vector layer into a raster layer of the pixels its shapes cover.
-_Avoid_: Flatten, bake
+To turn shapes into the pixels they cover: a vector layer into a raster layer,
+or a variant's visible layers into the image it exports.
+_Avoid_: Bake
 
 **Shape**:
 A single vector element in texture space: a Bézier path drawn in one style and

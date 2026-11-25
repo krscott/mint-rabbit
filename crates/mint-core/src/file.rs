@@ -14,9 +14,10 @@ use std::path::{Component, Path, PathBuf};
 use glam::{Quat, UVec2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::texture::LayerContent;
 use crate::{
-    AlphaMode, Anchor, Corner, ExportTarget, Layer, LayerContent, Material, Mesh, Model, NodeId,
-    Palette, PaletteIndex, Pose, Project, Raster, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
+    AlphaMode, Anchor, Corner, ExportTarget, Layer, Material, Mesh, Model, NodeId, Palette,
+    PaletteIndex, Pose, Project, Raster, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
     TextureContent, TextureId, Transform, Triangle, Variant, Vertex, Wrap,
 };
 

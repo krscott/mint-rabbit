@@ -467,6 +467,7 @@ impl TextureView {
                         editor,
                         selection,
                         r,
+                        tool,
                         vec![Anchor::corner(p)],
                         paint.style(false),
                         paint.color,
@@ -564,6 +565,7 @@ impl TextureView {
                     editor,
                     selection,
                     r,
+                    Tool::Pen,
                     anchors,
                     paint.style(false),
                     paint.color,
@@ -671,6 +673,7 @@ impl TextureView {
                 editor,
                 selection,
                 r,
+                Tool::Pen,
                 anchors,
                 paint.style(true),
                 paint.color,
@@ -770,18 +773,16 @@ impl TextureView {
                 }
             }
         }
-        // The pixels a pencil or eraser tip would cover, as a square.
+        // The pixels a pencil or eraser tip would cover.
         if matches!(tool, Tool::Pencil | Tool::Eraser)
             && let Some(p) = cursor
         {
-            let (min, max) = tip_bounds(p, paint.width);
-            let rect = Rect::from_min_max(at.to_screen(min), at.to_screen(max));
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 160)),
-                egui::StrokeKind::Outside,
-            );
+            let shade = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+            for (x, y) in mint_core::pencil_tip(p, paint.width) {
+                let min = Vec2::new(x as f32, y as f32);
+                let rect = Rect::from_min_max(at.to_screen(min), at.to_screen(min + Vec2::ONE));
+                painter.rect_filled(rect, 0.0, shade);
+            }
         }
         // Drawing in progress.
         let preview = Stroke::new(1.5, Color32::from_rgb(255, 120, 200));
@@ -826,20 +827,6 @@ impl TextureView {
     }
 }
 
-/// The square of whole pixels around a pencil tip `width` wide at `p`, as
-/// [`Raster::draw_line`] places it: on the pixel under `p` for odd widths,
-/// on the nearest pixel corner for even ones.
-fn tip_bounds(p: Vec2, width: f32) -> (Vec2, Vec2) {
-    let width = width.round().max(1.0) as u32;
-    let center = if width % 2 == 1 {
-        p.floor() + 0.5
-    } else {
-        p.round()
-    };
-    let half = width as f32 / 2.0;
-    (center - half, center + half)
-}
-
 fn bounds<'a>(shapes: impl Iterator<Item = &'a Shape>) -> Option<(Vec2, Vec2)> {
     shapes
         .map(|s| s.outline().bounds())
@@ -882,8 +869,9 @@ fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     o.covers(p) || o.distance(p) <= slack
 }
 
-/// Picks the topmost shape under `p` in a visible, unlocked layer, or with
-/// `add`, adds or removes it from a selection in the same layer.
+/// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
+/// set pixel of such a raster layer covers it, or with `add`, adds or removes
+/// it from a selection in the same layer.
 fn pick(
     project: &Project,
     r: VariantRef,
@@ -893,19 +881,20 @@ fn pick(
     add: bool,
 ) {
     let layers = project.variant(r).layers();
-    let hit = layers
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, l)| l.visible && !l.locked)
-        .find_map(|(li, l)| {
-            l.shapes()
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, s)| hits(s, p, at.hit()))
-                .map(|(si, _)| (li, si))
-        });
+    let mut hit = None;
+    for (li, l) in layers.iter().enumerate().rev() {
+        if !l.visible || l.locked {
+            continue;
+        }
+        // Pixels painted over a shape hide it from picks too.
+        if l.raster_pixels().is_some_and(|px| px.at(p).is_some()) {
+            break;
+        }
+        if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {
+            hit = Some((li, si));
+            break;
+        }
+    }
     match hit {
         Some((layer, shape)) if add && layer == selection.layer => {
             if let Some(k) = selection.shapes.iter().position(|&s| s == shape) {
@@ -1186,6 +1175,7 @@ fn finish_drag(
                 editor,
                 selection,
                 r,
+                Tool::Brush,
                 anchors,
                 paint.style(false),
                 paint.color,
@@ -1198,6 +1188,7 @@ fn finish_drag(
                 editor,
                 selection,
                 r,
+                tool,
                 box_anchors(tool, start, end),
                 style,
                 paint.color,
@@ -1222,10 +1213,58 @@ fn pixel_value(tool: Tool, paint: Paint) -> Option<PaletteIndex> {
     (tool != Tool::Eraser).then_some(paint.color)
 }
 
-/// Paints with `f` on the picked raster layer, or on a new one if the
-/// variant has no layers, as a step of its own or as part of the continuous
-/// edit `continuous`. Returns the layer painted, or reports why it couldn't
-/// be.
+/// Edits the picked layer with `f` for `tool`, or a new layer of the kind
+/// `tool` draws on if the variant has none, as a step of its own or as part
+/// of the continuous edit `continuous`, and picks that layer. Refuses a
+/// locked or hidden layer, or one `tool` doesn't draw on.
+fn edit_picked_layer<T>(
+    editor: &mut Editor,
+    selection: &mut Selection,
+    r: VariantRef,
+    tool: Tool,
+    continuous: Option<&str>,
+    f: impl FnOnce(&mut Layer) -> T,
+) -> Result<T, String> {
+    drawable(editor.project(), r, selection)?;
+    let layers = editor.project().variant(r).layers();
+    let layer = if layers.is_empty() {
+        0
+    } else {
+        selection.layer
+    };
+    if let Some(l) = layers.get(layer)
+        && !tool.works_on(l.kind())
+    {
+        let kind = match l.kind() {
+            LayerKind::Vector => "vector",
+            LayerKind::Raster => "raster",
+        };
+        let tool = tool.label().to_lowercase();
+        return Err(format!("The {tool} doesn't draw on {kind} layers."));
+    }
+    let edit = |v: &mut mint_core::Variant| {
+        if v.layers().is_empty() {
+            let first = if tool.works_on(LayerKind::Vector) {
+                Layer::new("Layer 1")
+            } else {
+                Layer::raster("Layer 1", Raster::clear(v.size()))
+            };
+            v.insert_layer(0, first);
+        }
+        f(&mut v.layers_mut()[layer])
+    };
+    let out = match continuous {
+        Some(key) => editor.edit_variant_continuous(key, r, edit),
+        None => editor.edit_variant(r, edit),
+    };
+    let out = out.map_err(|e| e.to_string())?;
+    selection.layer = layer;
+    Ok(out)
+}
+
+/// Paints with `f` on the picked raster layer for `tool`, as
+/// [`edit_picked_layer`] does. Returns the layer painted, or reports why it
+/// couldn't be.
 #[allow(clippy::too_many_arguments)]
 fn paint_pixels(
     editor: &mut Editor,
@@ -1236,58 +1275,29 @@ fn paint_pixels(
     message: &mut Option<String>,
     f: impl FnOnce(&mut Raster),
 ) -> Option<usize> {
-    let refuse = |message: &mut Option<String>, why: String| {
-        *message = Some(why);
-        None
-    };
-    if let Err(why) = drawable(editor.project(), r, selection) {
-        return refuse(message, why);
-    }
-    let layers = editor.project().variant(r).layers();
-    let layer = if layers.is_empty() {
-        0
-    } else {
-        selection.layer
-    };
-    if layers
-        .get(layer)
-        .is_some_and(|l| l.kind() != LayerKind::Raster)
-    {
-        let why = format!(
-            "The {} paints on raster layers.",
-            tool.label().to_lowercase()
-        );
-        return refuse(message, why);
-    }
-    let paint = |v: &mut mint_core::Variant| {
-        if v.layers().is_empty() {
-            let raster = Raster::clear(v.size());
-            v.insert_layer(0, Layer::raster("Layer 1", raster));
-        }
-        if let Some(raster) = v.layers_mut()[layer].raster_pixels_mut() {
+    let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {
+        if let Some(raster) = l.raster_pixels_mut() {
             f(raster);
         }
-    };
-    let result = match continuous {
-        Some(key) => editor.edit_variant_continuous(key, r, paint),
-        None => editor.edit_variant(r, paint),
-    };
-    match result {
-        Ok(()) => {
-            selection.layer = layer;
-            Some(layer)
+    });
+    match painted {
+        Ok(()) => Some(selection.layer),
+        Err(why) => {
+            *message = Some(why);
+            None
         }
-        Err(e) => refuse(message, e.to_string()),
     }
 }
 
-/// Adds a shape on top of the selected layer, creating a first layer if the
-/// variant has none, and picks it. On a raster layer, the shape is painted
-/// into its pixels instead.
+/// Adds a shape drawn with `tool` on top of the picked layer, creating a
+/// first layer if the variant has none, and picks it. On a raster layer, the
+/// shape is painted into its pixels instead.
+#[allow(clippy::too_many_arguments)]
 pub fn add_shape(
     editor: &mut Editor,
     selection: &mut Selection,
     r: VariantRef,
+    tool: Tool,
     anchors: Vec<Anchor>,
     style: Style,
     color: PaletteIndex,
@@ -1300,21 +1310,7 @@ pub fn add_shape(
             return;
         }
     };
-    if let Err(why) = drawable(editor.project(), r, selection) {
-        *message = Some(why);
-        return;
-    }
-    let layers = editor.project().variant(r).layers();
-    let layer = if layers.is_empty() {
-        0
-    } else {
-        selection.layer
-    };
-    let result = editor.edit_variant(r, |v| {
-        if v.layers().is_empty() {
-            v.insert_layer(0, Layer::new("Layer 1"));
-        }
-        let l = &mut v.layers_mut()[layer];
+    let added = edit_picked_layer(editor, selection, r, tool, None, |l| {
         if let Some(raster) = l.raster_pixels_mut() {
             raster.paint_shape(&shape);
             return None;
@@ -1322,15 +1318,12 @@ pub fn add_shape(
         l.insert_shape(l.shapes().len(), shape);
         Some(l.shapes().len() - 1)
     });
-    match result {
+    match added {
         Ok(index) => {
-            *selection = Selection {
-                layer,
-                shapes: index.into_iter().collect(),
-                anchor: None,
-            };
+            selection.shapes = index.into_iter().collect();
+            selection.anchor = None;
         }
-        Err(e) => *message = Some(e.to_string()),
+        Err(why) => *message = Some(why),
     }
 }
 
@@ -1445,4 +1438,34 @@ fn insert_anchor(
 fn cubic([p0, p1, p2, p3]: [Vec2; 4], t: f32) -> Vec2 {
     let u = 1.0 - t;
     u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_follow_the_picked_layer_kind() {
+        use LayerKind::{Raster, Vector};
+        // Brush and Pencil trade places; tools with no counterpart fall
+        // back to Select; tools that draw on both kinds stay.
+        let cases = [
+            (Tool::Brush, Raster, Tool::Pencil),
+            (Tool::Pencil, Vector, Tool::Brush),
+            (Tool::Eraser, Vector, Tool::Select),
+            (Tool::Fill, Vector, Tool::Select),
+            (Tool::Pen, Raster, Tool::Pen),
+            (Tool::Ellipse, Raster, Tool::Ellipse),
+            (Tool::Rectangle, Vector, Tool::Rectangle),
+            (Tool::Select, Raster, Tool::Select),
+        ];
+        for (tool, kind, expected) in cases {
+            assert_eq!(tool.on(kind), expected, "{tool:?} on {kind:?}");
+        }
+        for tool in Tool::ALL {
+            for kind in [Vector, Raster] {
+                assert!(tool.on(kind).works_on(kind), "{tool:?} on {kind:?}");
+            }
+        }
+    }
 }

@@ -65,7 +65,7 @@ pub enum PaletteError {
 pub enum EditError {
     #[error("palette entry {index} does not exist; the palette has {len}")]
     MissingColor { index: u8, len: usize },
-    #[error("a raster layer of {actual} can't go in a variant of {expected}")]
+    #[error("an image of {actual} can't go in a texture of {expected}")]
     SizeMismatch { expected: UVec2, actual: UVec2 },
 }
 
@@ -236,12 +236,7 @@ impl Project {
         let mut draft = variant.clone();
         let out = f(&mut draft);
         let expected = variant.size();
-        let actual = if draft.size() == expected {
-            draft.mismatched_raster()
-        } else {
-            Some(draft.size())
-        };
-        if let Some(actual) = actual {
+        if let Some(actual) = draft.size_mismatch(expected) {
             return Err(EditError::SizeMismatch { expected, actual });
         }
         if let Some(PaletteIndex(index)) = missing_color(&self.palette, draft.colors()) {
