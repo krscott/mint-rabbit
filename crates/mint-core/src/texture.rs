@@ -301,8 +301,11 @@ impl Raster {
             return;
         }
         // Scanline fill: each run of a row is filled as it is queued, so it
-        // is queued once, and runs are taken in the order queued, which
-        // keeps the queue to about a row's width of runs.
+        // is queued once and the queue never holds more runs than the
+        // raster has. Taking runs in the order queued usually keeps it near
+        // a row's width of runs, as for open areas and dithers; a branching
+        // maze whose dead ends all lie equally far from the start can still
+        // queue them all at once.
         let mut runs = std::collections::VecDeque::new();
         runs.push_back(self.fill_run(x, y, old, value));
         while let Some((left, right, y)) = runs.pop_front() {

@@ -1275,14 +1275,11 @@ fn press_pixels(
     // A click off the texture paints nothing, so it adds no first layer
     // either. A drag that starts off it still paints where it enters.
     let size = editor.project().variant(r).size();
-    let touches = if tool == Tool::Fill {
-        let pixel = p.floor();
-        mint_core::texel_index(size, pixel.x as i64, pixel.y as i64).is_some()
-    } else {
-        let tip = mint_core::pencil_tip(p, paint.width);
-        tip.iter()
-            .any(|&(x, y)| mint_core::texel_index(size, x, y).is_some())
-    };
+    // A fill starts from the pixel under `p`, a width-1 tip.
+    let width = if tool == Tool::Fill { 1.0 } else { paint.width };
+    let touches = mint_core::pencil_tip(p, width)
+        .iter()
+        .any(|&(x, y)| mint_core::texel_index(size, x, y).is_some());
     if continuous.is_none() && !touches {
         return None;
     }
@@ -1458,7 +1455,79 @@ fn cubic([p0, p1, p2, p3]: [Vec2; 4], t: f32) -> Vec2 {
 
 #[cfg(test)]
 mod tests {
+    use glam::UVec2;
+    use mint_core::{ExportTarget, Model, Palette, Pose, Rgba8, Slot, Texture, Transform, Variant};
+
     use super::*;
+
+    /// An editor on a project with one 4x4 texture whose one variant has
+    /// no layers.
+    fn layerless() -> (Editor, VariantRef) {
+        let size = UVec2::new(4, 4);
+        let texture =
+            Texture::painted("t", Slot("body".into()), size, [Variant::new("1", size)]).unwrap();
+        let project = Project::new(
+            ExportTarget::new("test"),
+            Palette::from_colors([Rgba8::new(0, 0, 0, 255)]).unwrap(),
+            Model::new("root", Transform::default()),
+            vec![texture],
+            Vec::new(),
+            Pose::default(),
+        )
+        .unwrap();
+        let r = VariantRef {
+            texture: TextureId(0),
+            variant: 0,
+        };
+        (Editor::new(project, None), r)
+    }
+
+    #[test]
+    fn clicks_off_the_texture_add_no_layer() {
+        let (mut editor, r) = layerless();
+        let (mut selection, mut message) = (Selection::default(), None);
+        let paint = Paint {
+            color: PaletteIndex(0),
+            fill: true,
+            width: 1.0,
+        };
+        let margin = Vec2::new(-0.5, 1.5);
+        for tool in [Tool::Pencil, Tool::Eraser, Tool::Fill] {
+            let pressed = press_pixels(
+                &mut editor,
+                &mut selection,
+                r,
+                tool,
+                paint,
+                margin,
+                None,
+                &mut message,
+            );
+            assert_eq!(pressed, None, "{tool:?}");
+        }
+        assert!(editor.project().variant(r).layers().is_empty());
+        assert!(!editor.can_undo());
+
+        // A wide tip hanging over the edge reaches the texture.
+        let wide = Paint {
+            width: 3.0,
+            ..paint
+        };
+        let pressed = press_pixels(
+            &mut editor,
+            &mut selection,
+            r,
+            Tool::Pencil,
+            wide,
+            margin,
+            None,
+            &mut message,
+        );
+        assert_eq!(pressed, Some(0));
+        let layers = editor.project().variant(r).layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].kind(), LayerKind::Raster);
+    }
 
     #[test]
     fn tools_follow_the_picked_layer_kind() {
