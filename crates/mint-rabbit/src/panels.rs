@@ -584,7 +584,7 @@ fn modifier_settings(
                         set(t, ModifierKind::Mirror(Mirror { axes, ..m }), None);
                     }
                     let mut at = m.at.to_vec2();
-                    let field = ui.add_enabled(on, position(&mut at[axis], max));
+                    let field = ui.add_enabled(on, position(&mut at[axis], max, 0.5));
                     if field.changed() {
                         let at = HalfPoint::nearest(at, size);
                         set(t, ModifierKind::Mirror(Mirror { at, ..m }), Some(label));
@@ -613,10 +613,15 @@ fn modifier_settings(
                 // With quarter turns, each coordinate moves a whole texel at
                 // a time, keeping the center on a pixel corner or center.
                 let c = r.center().to_vec2();
+                let step = if r.turns() == Turns::Quarter {
+                    1.0
+                } else {
+                    0.5
+                };
                 for (axis, label, hover) in [(0, "x", "Center, across"), (1, "y", "Center, down")] {
                     let mut v = c[axis];
                     if ui
-                        .add(position(&mut v, size[axis]))
+                        .add(position(&mut v, size[axis], step))
                         .on_hover_text(hover)
                         .changed()
                     {
@@ -633,12 +638,13 @@ fn modifier_settings(
     });
 }
 
-/// A field for a guide's position in texels, up to `max`; the edit moves it
-/// to the nearest place the modifier allows.
-fn position(value: &mut f32, max: u32) -> egui::DragValue<'_> {
+/// A field for a guide's position in texels, up to `max`, stepping by `step`
+/// texels (as the arrow keys do); the edit moves it to the nearest place the
+/// modifier allows.
+fn position(value: &mut f32, max: u32, step: f64) -> egui::DragValue<'_> {
     egui::DragValue::new(value)
         .range(0.0..=max as f32)
-        .speed(0.1)
+        .speed(step)
         .fixed_decimals(1)
 }
 
