@@ -1027,24 +1027,41 @@ fn box_anchors(tool: Tool, a: Vec2, b: Vec2) -> Vec<Anchor> {
     }
 }
 
-/// Whether point `p` hits shape `s`, within `slack` texels of its path.
-/// Whether shape `s` is under texture point `p`: near its outline, or
-/// covering the center of the pixel of a texture of `size` under `p`, as it
-/// covers pixels.
+/// Whether shape `s` is under texture point `p`: covering it, within reach
+/// of its outline, or covering the center of the pixel of a texture of
+/// `size` under `p`, as it covers pixels.
 fn under(s: &Shape, p: Vec2, at: Placement, size: UVec2) -> bool {
-    let on_image = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64).is_some();
-    hits(s, p, at.hit()) || (on_image && s.outline().covers(p.floor() + Vec2::splat(0.5)))
-}
-
-fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     let o = s.outline();
-    o.covers(p) || o.distance(p) <= slack
+    let on_image = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64).is_some();
+    o.covers(p) || o.distance(p) <= at.hit() || (on_image && o.covers(p.floor() + Vec2::splat(0.5)))
 }
 
-/// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
-/// visible layer above it, locked or not, shows a pixel there (painted, or a
-/// copy) at some opacity, or with `add`, adds or removes it from a selection
-/// in the same layer.
+/// The topmost shape under `p` in a visible, unlocked layer, as `(layer,
+/// shape)`, unless a visible layer above it, locked or not, shows a pixel
+/// there (painted, or a copy) at some opacity.
+fn shape_under(project: &Project, r: VariantRef, p: Vec2, at: Placement) -> Option<(usize, usize)> {
+    let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
+    let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
+    for (li, l) in layers.iter().enumerate().rev() {
+        if !l.visible {
+            continue;
+        }
+        if !l.locked
+            && let Some(si) = l.shapes().iter().rposition(|s| under(s, p, at, size))
+        {
+            return Some((li, si));
+        }
+        // What the layer shows hides the layers under it, pixels and copies
+        // alike, unless it shows at no opacity.
+        if l.opacity > 0.0 && pixel.is_some_and(|i| l.coverage(size)[i].is_some()) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Picks the [`shape_under`] `p`, or with `add`, adds or removes it from a
+/// selection in the same layer.
 fn pick(
     project: &Project,
     r: VariantRef,
@@ -1053,27 +1070,7 @@ fn pick(
     at: Placement,
     add: bool,
 ) {
-    let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
-    let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
-    let is_under = |s: &Shape| under(s, p, at, size);
-    let mut hit = None;
-    for (li, l) in layers.iter().enumerate().rev() {
-        if !l.visible {
-            continue;
-        }
-        if !l.locked
-            && let Some(si) = l.shapes().iter().rposition(is_under)
-        {
-            hit = Some((li, si));
-            break;
-        }
-        // What the layer shows hides the layers under it, pixels and copies
-        // alike, unless it shows at no opacity.
-        if l.opacity > 0.0 && pixel.is_some_and(|i| l.coverage(size)[i].is_some()) {
-            break;
-        }
-    }
-    match hit {
+    match shape_under(project, r, p, at) {
         Some((layer, shape)) if add && layer == selection.layer => {
             if let Some(k) = selection.shapes.iter().position(|&s| s == shape) {
                 selection.shapes.remove(k);
@@ -1159,10 +1156,9 @@ fn start_select(
                 original: picked,
             });
         }
-        if picked
-            .iter()
-            .any(|s| under(s, p, at, project.variant(r).size()))
-        {
+        // A press where a picked shape shows on top moves them all.
+        let on_top = shape_under(project, r, p, at);
+        if on_top.is_some_and(|(l, s)| l == selection.layer && selection.shapes.contains(&s)) {
             return Some(Drag::Move {
                 start: p,
                 original: picked,
@@ -1825,6 +1821,18 @@ mod tests {
         assert_eq!(picked(&editor, 2.5, 2.5), Some((0, 0)));
         // A click off a shape's outline, on a pixel it covers, picks it.
         assert_eq!(picked(&editor, 3.05, 0.5), Some((1, 0)));
+        // A press drags what a click there picks: not the picked bottom
+        // shape where the top one, or its copy, shows over it.
+        let mut picked_bottom = Selection {
+            layer: 0,
+            shapes: vec![0],
+            anchor: None,
+        };
+        let grab = |s: &mut Selection, x: f32| {
+            start_select(editor.project(), r, s, Vec2::new(x, 0.5), at).map(|_| s.layer)
+        };
+        assert_eq!(grab(&mut picked_bottom.clone(), 3.5), Some(1));
+        assert_eq!(grab(&mut picked_bottom, 0.5), None);
         // A locked layer still hides what is under it.
         set(&mut editor, |l| l.locked = true);
         assert_eq!(picked(&editor, 3.5, 0.5), None);
