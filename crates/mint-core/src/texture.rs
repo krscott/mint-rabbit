@@ -263,8 +263,7 @@ impl Raster {
     pub fn draw_line(&mut self, from: Vec2, to: Vec2, width: f32, value: Option<PaletteIndex>) {
         let (x0, y0) = tip_origin(from, width);
         let (x1, y1) = tip_origin(to, width);
-        // Offsets from a tip's origin, which is (0, 0) at the origin.
-        let tip = pencil_tip(Vec2::ZERO, width);
+        let tip = tip_offsets(width);
         // Bresenham between the two tip origins.
         let (mut x, mut y) = (x0, y0);
         let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
@@ -327,8 +326,16 @@ impl Raster {
 /// under `at`.
 #[must_use]
 pub fn pencil_tip(at: Vec2, width: f32) -> Vec<(i64, i64)> {
-    let w = tip_width(width);
     let (x, y) = tip_origin(at, width);
+    tip_offsets(width)
+        .into_iter()
+        .map(|(dx, dy)| (x + dx, y + dy))
+        .collect()
+}
+
+/// The pixels of a tip `width` wide, relative to its origin pixel.
+fn tip_offsets(width: f32) -> Vec<(i64, i64)> {
+    let w = tip_width(width);
     // The tip's center relative to its origin pixel's top-left corner.
     let center = if w % 2 == 1 { 0.5 } else { 0.0 };
     let half = w as f32 / 2.0;
@@ -339,7 +346,6 @@ pub fn pencil_tip(at: Vec2, width: f32) -> Vec<(i64, i64)> {
             let d = Vec2::new(dx as f32 + 0.5 - center, dy as f32 + 0.5 - center);
             d.length_squared() <= half * half
         })
-        .map(|(dx, dy)| (x + dx, y + dy))
         .collect()
 }
 

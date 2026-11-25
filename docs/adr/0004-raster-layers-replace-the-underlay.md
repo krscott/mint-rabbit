@@ -17,10 +17,9 @@ don't scale with output resolution as shapes do.
 
 ## Consequences
 
-- Pixels that no visible layer covers show and export as palette entry 0.
+- Pixels that no visible layer covers show and export as palette entry 0,
+  by position, so entry 0 can't be merged away while any exist.
 - Rasterizing a vector layer is one-way; only undo brings its shapes back.
-- Pixels no visible layer covers take entry 0 by position, so entry 0 can't
-  be merged away while any such pixels exist.
 - Raster layers hold pixels at the texture's size. An export at a multiple
   of that size, which ADR 0001 keeps possible for shapes, would scale their
   pixels up rather than redraw them.

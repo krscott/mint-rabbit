@@ -766,7 +766,14 @@ impl TextureView {
             && let Some(p) = cursor
         {
             let shade = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
-            for (x, y) in mint_core::pencil_tip(p, paint.width) {
+            let size = project.variant(r).size();
+            let inside = |&(x, y): &(i64, i64)| {
+                (0..i64::from(size.x)).contains(&x) && (0..i64::from(size.y)).contains(&y)
+            };
+            for (x, y) in mint_core::pencil_tip(p, paint.width)
+                .into_iter()
+                .filter(inside)
+            {
                 let min = Vec2::new(x as f32, y as f32);
                 let rect = Rect::from_min_max(at.to_screen(min), at.to_screen(min + Vec2::ONE));
                 painter.rect_filled(rect, 0.0, shade);
@@ -858,8 +865,8 @@ fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
 }
 
 /// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
-/// set pixel of such a raster layer covers it, or with `add`, adds or removes
-/// it from a selection in the same layer.
+/// set pixel of such a raster layer, at some opacity, covers it, or with
+/// `add`, adds or removes it from a selection in the same layer.
 fn pick(
     project: &Project,
     r: VariantRef,
@@ -874,8 +881,9 @@ fn pick(
         if !l.visible || l.locked {
             continue;
         }
-        // Pixels painted over a shape hide it from picks too.
-        if l.raster_pixels().is_some_and(|px| px.at(p).is_some()) {
+        // Pixels painted over a shape hide it from picks too, unless their
+        // layer shows at no opacity.
+        if l.opacity > 0.0 && l.raster_pixels().is_some_and(|px| px.at(p).is_some()) {
             break;
         }
         if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {

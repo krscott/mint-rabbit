@@ -48,9 +48,9 @@ other variants, rasterize, or delete it.
   anchor closes the path, Enter finishes it open, and Delete removes the last
   anchor.
 - Pencil and Eraser: click or drag to set or clear pixels with a round tip as
-  wide as the bar's width, rounded to whole pixels. Fill: click to recolor the
-  pixels joined to the one clicked that share its color, on the picked layer
-  only.
+  wide as the bar's width, rounded to whole pixels. Fill: click to fill the
+  pixels joined to the one clicked that match it (a color, or empty), on the
+  picked layer only.
 - Escape drops a drawing in progress, puts shapes back during a transform, and
   otherwise clears the picks. Backspace works like Delete. Scroll to zoom,
   middle-drag to pan, and middle double-click to fit.

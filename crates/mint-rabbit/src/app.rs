@@ -922,11 +922,12 @@ impl App {
     /// The Texture View under its texture strip and style bar, with the
     /// tools at its left. `idle` is whether the controls take input.
     fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool) {
-        // After the dock, where the picked layer may have changed, and
-        // before the style bar, which shows the tool's settings.
-        self.fit_tool();
         ui.add_enabled_ui(idle, |ui| {
             self.texture_strip(ui);
+            // After the dock and the texture strip, where the picked layer
+            // may have changed, and before the style bar, which shows the
+            // tool's settings.
+            self.fit_tool();
             self.style_bar(ui);
         });
         ui.separator();
@@ -1005,14 +1006,18 @@ impl App {
         if ctx.text_edit_focused() || self.dialog.is_some() || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
-        if pressed(&REDO) || pressed(&REDO_Y) {
-            if let Some(d) = &mut self.doc {
-                d.redo();
-            }
-        } else if pressed(&UNDO)
-            && let Some(d) = &mut self.doc
+        let (redo, undo) = (pressed(&REDO) || pressed(&REDO_Y), pressed(&UNDO));
+        if let Some(d) = &mut self.doc
+            && (redo || undo)
         {
-            d.undo();
+            if redo {
+                d.redo();
+            } else {
+                d.undo();
+            }
+            // An open menu, such as a layer's, would otherwise stay open on
+            // whatever now holds its place.
+            egui::Popup::close_all(ctx);
         }
         if pressed(&SAVE) && self.doc.is_some() {
             self.save();
