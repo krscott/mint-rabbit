@@ -521,7 +521,8 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
                         layer.visible = l.visible;
                         layer.locked = l.locked;
                         layer.opacity = l.opacity;
-                        layer.modifiers = l.modifiers.into_iter().map(modifier).collect();
+                        layer.modifiers =
+                            l.modifiers.into_iter().map(|m| modifier(m, size)).collect();
                         variant.insert_layer(i, layer);
                     }
                     variants.push(variant);
@@ -639,8 +640,8 @@ fn modifier_file(m: &Modifier) -> ModifierFile {
 }
 
 /// A modifier from its file form, with lines and centers moved to the
-/// nearest place they can be.
-fn modifier(m: ModifierFile) -> Modifier {
+/// nearest place they can be on a texture of `size`.
+fn modifier(m: ModifierFile, size: UVec2) -> Modifier {
     let kind = match m.kind {
         ModifierKindFile::Mirror { axes, at } => ModifierKind::Mirror(Mirror {
             axes: match axes {
@@ -648,14 +649,14 @@ fn modifier(m: ModifierFile) -> Modifier {
                 AxesFile::Y => Axes::Y,
                 AxesFile::Both => Axes::Both,
             },
-            at: HalfPoint::nearest(Vec2::from_array(at)),
+            at: HalfPoint::nearest(Vec2::from_array(at), size),
         }),
         ModifierKindFile::Radial { turns, center } => {
             let turns = match turns {
                 TurnsFile::Half => Turns::Half,
                 TurnsFile::Quarter => Turns::Quarter,
             };
-            ModifierKind::Radial(Radial::nearest(turns, Vec2::from_array(center)))
+            ModifierKind::Radial(Radial::nearest(turns, Vec2::from_array(center), size))
         }
     };
     Modifier {
@@ -996,6 +997,7 @@ mod tests {
                 Modifier::new(ModifierKind::Radial(Radial::nearest(
                     Turns::Quarter,
                     Vec2::new(1.5, 0.5),
+                    UVec2::new(4, 2),
                 ))),
             ];
             // Set and unset pixels, over the base layer.
@@ -1006,6 +1008,7 @@ mod tests {
             dots.modifiers = vec![Modifier::new(ModifierKind::Radial(Radial::nearest(
                 Turns::Half,
                 Vec2::new(2.0, 0.5),
+                UVec2::new(4, 2),
             )))];
             v.insert_layer(1, low);
             v.insert_layer(2, high);

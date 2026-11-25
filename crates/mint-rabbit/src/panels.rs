@@ -412,7 +412,7 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
                         .on_hover_text("Turn copies of the layer about a point")
                         .clicked()
                     {
-                        let r = Radial::nearest(Turns::Half, center.to_vec2());
+                        let r = Radial::nearest(Turns::Half, center.to_vec2(), size);
                         added = Some(ModifierKind::Radial(r));
                     }
                     if let Some(kind) = added {
@@ -428,77 +428,89 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
         ui.weak("None on this layer");
     }
     let count = modifiers.len();
-    for (k, m) in modifiers.into_iter().enumerate() {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let eye = if m.enabled { Icon::Eye } else { Icon::EyeOff };
-                if row_toggle(ui, eye, !m.enabled)
-                    .on_hover_text("On; a modifier that is off neither shows nor exports")
-                    .clicked()
-                {
-                    t.edit(|v| v.layers_mut()[i].modifiers[k].enabled = !m.enabled);
-                }
-                let name = match m.kind {
-                    ModifierKind::Mirror(_) => "Mirror",
-                    ModifierKind::Radial(_) => "Radial",
-                };
-                ui.strong(name);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let more = ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
-                        // A menu item, disabled with the reason `refusal`.
-                        let item = |ui: &mut egui::Ui, refusal: Option<&str>, label: &str| {
-                            let refusal = if locked { Some(why_locked) } else { refusal };
-                            ui.add_enabled(refusal.is_none(), egui::Button::new(label))
-                                .on_disabled_hover_text(refusal.unwrap_or_default())
-                                .clicked()
+    // A long stack scrolls rather than squeezing out the layer list.
+    let max_height = ui.ctx().content_rect().height() * 0.35;
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .show(ui, |ui| {
+            for (k, m) in modifiers.into_iter().enumerate() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let eye = if m.enabled { Icon::Eye } else { Icon::EyeOff };
+                        if row_toggle(ui, eye, !m.enabled)
+                            .on_hover_text("On; a modifier that is off neither shows nor exports")
+                            .clicked()
+                        {
+                            t.edit(|v| v.layers_mut()[i].modifiers[k].enabled = !m.enabled);
+                        }
+                        let name = match m.kind {
+                            ModifierKind::Mirror(_) => "Mirror",
+                            ModifierKind::Radial(_) => "Radial",
                         };
-                        let first = (k == 0).then_some("It applies first");
-                        if item(ui, first, "Apply sooner") {
-                            t.edit(|v| v.layers_mut()[i].modifiers.swap(k - 1, k));
-                        }
-                        let last = (k + 1 == count).then_some("It applies last");
-                        if item(ui, last, "Apply later") {
-                            t.edit(|v| v.layers_mut()[i].modifiers.swap(k, k + 1));
-                        }
-                        ui.separator();
-                        if item(ui, None, "Delete") {
-                            t.edit(|v| v.layers_mut()[i].modifiers.remove(k));
-                        }
+                        ui.strong(name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let more =
+                                ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
+                                    // A menu item, disabled with the reason `refusal`.
+                                    let item =
+                                        |ui: &mut egui::Ui, refusal: Option<&str>, label: &str| {
+                                            let refusal =
+                                                if locked { Some(why_locked) } else { refusal };
+                                            ui.add_enabled(
+                                                refusal.is_none(),
+                                                egui::Button::new(label),
+                                            )
+                                            .on_disabled_hover_text(refusal.unwrap_or_default())
+                                            .clicked()
+                                        };
+                                    let first = (k == 0).then_some("It applies first");
+                                    if item(ui, first, "Apply sooner") {
+                                        t.edit(|v| v.layers_mut()[i].modifiers.swap(k - 1, k));
+                                    }
+                                    let last = (k + 1 == count).then_some("It applies last");
+                                    if item(ui, last, "Apply later") {
+                                        t.edit(|v| v.layers_mut()[i].modifiers.swap(k, k + 1));
+                                    }
+                                    ui.separator();
+                                    if item(ui, None, "Delete") {
+                                        t.edit(|v| v.layers_mut()[i].modifiers.remove(k));
+                                    }
+                                });
+                            more.response.on_hover_text("Reorder or delete");
+                            let refusal = if locked {
+                                Some(why_locked)
+                            } else if k > 0 {
+                                Some("Apply the modifiers above it first")
+                            } else if !m.enabled {
+                                Some("Turn it on to apply it")
+                            } else {
+                                None
+                            };
+                            let what = match kind {
+                                LayerKind::Vector => "shapes",
+                                LayerKind::Raster => "pixels",
+                            };
+                            let apply = ui
+                                .add_enabled(refusal.is_none(), egui::Button::new("Apply"))
+                                .on_hover_text(format!(
+                                    "Write its copies into the layer as {what} and remove it"
+                                ))
+                                .on_disabled_hover_text(refusal.unwrap_or_default());
+                            if apply.clicked() {
+                                apply_first_modifier(t);
+                            }
+                        });
                     });
-                    more.response.on_hover_text("Reorder or delete");
-                    let refusal = if locked {
-                        Some(why_locked)
-                    } else if k > 0 {
-                        Some("Apply the modifiers above it first")
-                    } else if !m.enabled {
-                        Some("Turn it on to apply it")
-                    } else {
-                        None
-                    };
-                    let what = match kind {
-                        LayerKind::Vector => "shapes",
-                        LayerKind::Raster => "pixels",
-                    };
-                    let apply = ui
-                        .add_enabled(refusal.is_none(), egui::Button::new("Apply"))
-                        .on_hover_text(format!(
-                            "Write its copies into the layer as {what} and remove it"
-                        ))
-                        .on_disabled_hover_text(refusal.unwrap_or_default());
-                    if apply.clicked() {
-                        apply_first_modifier(t);
-                    }
+                    ui.add_enabled_ui(!locked, |ui| {
+                        modifier_settings(ui, t, k, m.kind, size);
+                    })
+                    .response
+                    .on_disabled_hover_text(why_locked);
                 });
-            });
-            ui.add_enabled_ui(!locked, |ui| {
-                modifier_settings(ui, t, k, m.kind, size);
-            })
-            .response
-            .on_disabled_hover_text(why_locked);
+            }
         });
-    }
 }
 
 /// Applies the picked layer's first modifier, keeping its picked shapes
@@ -574,7 +586,7 @@ fn modifier_settings(
                     let mut at = m.at.to_vec2();
                     let field = ui.add_enabled(on, position(&mut at[axis], max));
                     if field.changed() {
-                        let at = HalfPoint::nearest(at);
+                        let at = HalfPoint::nearest(at, size);
                         set(t, ModifierKind::Mirror(Mirror { at, ..m }), Some(label));
                     }
                 }
@@ -594,24 +606,26 @@ fn modifier_settings(
                         .clicked()
                         && r.turns() != turns
                     {
-                        let r = Radial::nearest(turns, r.center().to_vec2());
+                        let r = Radial::nearest(turns, r.center().to_vec2(), size);
                         set(t, ModifierKind::Radial(r), None);
                     }
                 }
-                let mut c = r.center().to_vec2();
-                let x = ui
-                    .add(position(&mut c.x, size.x))
-                    .on_hover_text("Center, across");
-                let y = ui
-                    .add(position(&mut c.y, size.y))
-                    .on_hover_text("Center, down");
-                if x.changed() || y.changed() {
-                    let what = if x.changed() { "x" } else { "y" };
-                    let r = Radial::nearest(r.turns(), c);
-                    set(t, ModifierKind::Radial(r), Some(what));
+                // With quarter turns, each coordinate moves a whole texel at
+                // a time, keeping the center on a pixel corner or center.
+                let c = r.center().to_vec2();
+                for (axis, label, hover) in [(0, "x", "Center, across"), (1, "y", "Center, down")] {
+                    let mut v = c[axis];
+                    if ui
+                        .add(position(&mut v, size[axis]))
+                        .on_hover_text(hover)
+                        .changed()
+                    {
+                        let r = r.with_coordinate(axis, v, size);
+                        set(t, ModifierKind::Radial(r), Some(label));
+                    }
                 }
                 if centered(ui) {
-                    let r = Radial::nearest(r.turns(), HalfPoint::center(size).to_vec2());
+                    let r = Radial::nearest(r.turns(), HalfPoint::center(size).to_vec2(), size);
                     set(t, ModifierKind::Radial(r), None);
                 }
             }

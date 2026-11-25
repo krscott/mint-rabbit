@@ -86,8 +86,8 @@ _Avoid_: Group, folder
 **Modifier**:
 One step of a layer's ordered stack that changes what the layer shows and
 exports without changing the shapes or pixels it holds; each can be turned off,
-which removes it from both, or applied, which writes its result into the layer
-and removes it.
+which hides its result from both, or applied, which writes its result into the
+layer and removes it.
 _Avoid_: Effect, filter
 
 **Mirror**:

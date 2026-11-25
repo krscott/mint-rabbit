@@ -4,11 +4,11 @@
 //! Mirror and Radial add copies of the layer's content. Copies draw beneath
 //! the content they copy, and a later copy over an earlier one, so a pixel
 //! the content covers keeps its value. Their lines and centers lie on the
-//! half-texel grid, where reflections and turns carry each pixel exactly
-//! onto another, so a modifier gives the same pixels whether its layer holds
-//! shapes or the pixels those shapes cover.
+//! half-texel grid within the texture, where reflections and turns carry
+//! each pixel exactly onto another, so a modifier gives the same pixels
+//! whether its layer holds shapes or the pixels those shapes cover.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use glam::{Affine2, Mat2, UVec2, Vec2};
 
@@ -33,12 +33,12 @@ impl HalfPoint {
         }
     }
 
-    /// The grid point nearest `p`, in texels.
+    /// The grid point nearest `p`, in texels, on a texture of `size`.
     #[must_use]
-    pub fn nearest(p: Vec2) -> Self {
+    pub fn nearest(p: Vec2, size: UVec2) -> Self {
         Self {
-            x: (p.x * 2.0).round() as i32,
-            y: (p.y * 2.0).round() as i32,
+            x: snap(p.x * 2.0, 2 * size.x as i32, None),
+            y: snap(p.y * 2.0, 2 * size.y as i32, None),
         }
     }
 
@@ -46,6 +46,29 @@ impl HalfPoint {
     #[must_use]
     pub fn to_vec2(self) -> Vec2 {
         Vec2::new(self.x as f32, self.y as f32) / 2.0
+    }
+}
+
+/// The whole number nearest `v` from 0 to `max` (at least 2), and with
+/// `parity` of that parity.
+fn snap(v: f32, max: i32, parity: Option<i32>) -> i32 {
+    let v = if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(0.0, max as f32)
+    };
+    let r = v.round() as i32;
+    match parity {
+        Some(p) if (r - p).rem_euclid(2) != 0 => {
+            // One step toward `v`, or the other way at the ends.
+            let toward = if v >= r as f32 { r + 1 } else { r - 1 };
+            if (0..=max).contains(&toward) {
+                toward
+            } else {
+                2 * r - toward
+            }
+        }
+        _ => r,
     }
 }
 
@@ -98,7 +121,7 @@ pub enum Turns {
     Quarter,
 }
 
-/// Copies of a layer turned about a center.
+/// Copies of a layer turned about a center within its texture.
 ///
 /// A quarter turn carries pixels onto pixels only about a pixel corner or a
 /// pixel center, where both coordinates are whole or both are halves, so a
@@ -110,25 +133,51 @@ pub struct Radial {
 }
 
 impl Radial {
-    /// A radial modifier about the center nearest `p` that `turns` allows.
+    /// A radial modifier about the center nearest `p`, in texels, that
+    /// `turns` allows on a texture of `size`.
     #[must_use]
-    pub fn nearest(turns: Turns, p: Vec2) -> Self {
-        let mut center = HalfPoint::nearest(p);
-        if !Self::allows(turns, center) {
-            // The nearest point whose coordinates are both whole or both
-            // halves is one step along the axis rounded farthest.
-            let off = p * 2.0 - center.to_vec2() * 2.0;
-            if off.x.abs() >= off.y.abs() {
-                center.x += if off.x >= 0.0 { 1 } else { -1 };
-            } else {
-                center.y += if off.y >= 0.0 { 1 } else { -1 };
+    pub fn nearest(turns: Turns, p: Vec2, size: UVec2) -> Self {
+        let (vx, vy) = (p.x * 2.0, p.y * 2.0);
+        let (mx, my) = (2 * size.x as i32, 2 * size.y as i32);
+        let center = match turns {
+            Turns::Half => HalfPoint {
+                x: snap(vx, mx, None),
+                y: snap(vy, my, None),
+            },
+            Turns::Quarter => {
+                // Round one coordinate freely and the other to match it,
+                // whichever lands nearer.
+                let x = snap(vx, mx, None);
+                let a = HalfPoint {
+                    x,
+                    y: snap(vy, my, Some(x)),
+                };
+                let y = snap(vy, my, None);
+                let b = HalfPoint {
+                    x: snap(vx, mx, Some(y)),
+                    y,
+                };
+                let target = Vec2::new(vx, vy).clamp(Vec2::ZERO, Vec2::new(mx as f32, my as f32));
+                let d = |c: HalfPoint| Vec2::new(c.x as f32, c.y as f32).distance_squared(target);
+                if d(b) < d(a) { b } else { a }
             }
-        }
+        };
         Self { turns, center }
     }
 
-    fn allows(turns: Turns, c: HalfPoint) -> bool {
-        turns == Turns::Half || (c.x + c.y).rem_euclid(2) == 0
+    /// The modifier with its center's coordinate `axis` (0 across, 1 down)
+    /// moved to the nearest value to `v`, in texels, on a texture of `size`.
+    /// The other coordinate stays, so with quarter turns this one moves a
+    /// whole texel at a time.
+    #[must_use]
+    pub fn with_coordinate(self, axis: usize, v: f32, size: UVec2) -> Self {
+        let mut c = [self.center.x, self.center.y];
+        let parity = (self.turns == Turns::Quarter).then_some(c[1 - axis]);
+        c[axis] = snap(v * 2.0, 2 * size[axis] as i32, parity);
+        Self {
+            turns: self.turns,
+            center: HalfPoint { x: c[0], y: c[1] },
+        }
     }
 
     #[must_use]
@@ -168,13 +217,13 @@ impl Modifier {
 
     /// The motions that place the modifier's copies, in drawing order.
     fn copies(self) -> Vec<Motion> {
-        const FLIP_X: [i32; 4] = [-1, 0, 0, 1];
-        const FLIP_Y: [i32; 4] = [1, 0, 0, -1];
-        const HALF: [i32; 4] = [-1, 0, 0, -1];
+        const FLIP_X: [i64; 4] = [-1, 0, 0, 1];
+        const FLIP_Y: [i64; 4] = [1, 0, 0, -1];
+        const HALF: [i64; 4] = [-1, 0, 0, -1];
         // Clockwise on screen, where y points down.
-        const QUARTER: [i32; 4] = [0, -1, 1, 0];
-        const THREE_QUARTERS: [i32; 4] = [0, 1, -1, 0];
-        let (center, ms): (_, &[[i32; 4]]) = match self.kind {
+        const QUARTER: [i64; 4] = [0, -1, 1, 0];
+        const THREE_QUARTERS: [i64; 4] = [0, 1, -1, 0];
+        let (center, ms): (_, &[[i64; 4]]) = match self.kind {
             ModifierKind::Mirror(m) => (
                 m.at,
                 match m.axes {
@@ -191,7 +240,7 @@ impl Modifier {
                 },
             ),
         };
-        ms.iter().map(|&m| Motion { m, center }).collect()
+        ms.iter().map(|&m| Motion::about(m, center)).collect()
     }
 
     /// `pixels`, of an image of `size`, with the modifier's copies beneath
@@ -207,18 +256,20 @@ impl Modifier {
             if px.is_some() {
                 continue;
             }
-            let (x, y) = pixel_xy(size, i);
             // The last copy drawn over this pixel wins.
             *px = copies
                 .iter()
                 .rev()
-                .filter_map(|c| c.inverse().pixel(size, x, y))
+                .filter_map(|c| c.inverse().pixel(size, i))
                 .find_map(|j| pixels[j]);
         }
         out
     }
 
-    /// `shapes` with the modifier's copies beneath them, as shapes.
+    /// `shapes` with the modifier's copies beneath them, as shapes. A pixel
+    /// center lying exactly on a copied shape's edge can fall the other way
+    /// than on the shape it copies, so these can differ by a pixel there from
+    /// [`Self::apply_pixels`] on the shapes' pixels.
     pub(crate) fn apply_shapes(self, shapes: &[Shape]) -> Vec<Shape> {
         let mut out = Vec::new();
         for c in self.copies() {
@@ -234,74 +285,96 @@ impl Modifier {
     }
 }
 
-/// The row-major pixel indices of an image of `size` that `modifiers` show
-/// as copies of pixel `i`, or that show copies of it, and so on: every pixel
-/// an edit at `i` must also make for the layer to look edited there. Holds
-/// `i` itself.
-pub(crate) fn orbit(modifiers: &[Modifier], size: UVec2, i: usize) -> Vec<usize> {
-    let motions: Vec<Motion> = modifiers
-        .iter()
-        .filter(|m| m.enabled)
-        .flat_map(|m| m.copies())
-        .flat_map(|c| [c, c.inverse()])
-        .collect();
-    let mut seen = HashSet::from([i]);
-    let mut queue = VecDeque::from([i]);
-    while let Some(j) = queue.pop_front() {
-        let (x, y) = pixel_xy(size, j);
-        for k in motions.iter().filter_map(|c| c.pixel(size, x, y)) {
-            if seen.insert(k) {
-                queue.push_back(k);
-            }
-        }
+/// The motions that carry a pixel to another that the enabled `modifiers`
+/// show as the same one: each way the stack places a copy (one of each
+/// modifier's copies, or none, in stack order), and the way back from each.
+/// The identity is left out.
+pub(crate) fn matching(modifiers: &[Modifier]) -> Vec<Motion> {
+    let mut placements = vec![Motion::IDENTITY];
+    for m in modifiers.iter().filter(|m| m.enabled) {
+        let copies = m.copies();
+        placements = placements
+            .iter()
+            .flat_map(|&p| std::iter::once(p).chain(copies.iter().map(move |&c| p.then(c))))
+            .collect();
     }
-    let mut out: Vec<usize> = seen.into_iter().collect();
-    out.sort_unstable();
-    out
+    let mut seen = HashSet::from([Motion::IDENTITY]);
+    placements
+        .into_iter()
+        .flat_map(|p| [p, p.inverse()])
+        .filter(|&p| seen.insert(p))
+        .collect()
 }
 
-fn pixel_xy(size: UVec2, i: usize) -> (i64, i64) {
-    let w = size.x as usize;
-    ((i % w) as i64, (i / w) as i64)
-}
-
-/// A reflection or turn about `center`: a point `p` goes to
-/// `center + m (p - center)`, with `m` row-major.
-#[derive(Clone, Copy, Debug)]
-struct Motion {
-    m: [i32; 4],
-    center: HalfPoint,
+/// A rigid motion of texture space that carries pixels onto pixels: a point
+/// `p`, in half texels, goes to `m p + t`, with `m` a row-major reflection
+/// or turn and `t` even.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Motion {
+    m: [i64; 4],
+    t: [i64; 2],
 }
 
 impl Motion {
+    const IDENTITY: Self = Self {
+        m: [1, 0, 0, 1],
+        t: [0, 0],
+    };
+
+    /// `m` about `center`, which fixes it.
+    fn about(m: [i64; 4], center: HalfPoint) -> Self {
+        let c = [i64::from(center.x), i64::from(center.y)];
+        let mc = mul(m, c);
+        Self {
+            m,
+            t: [c[0] - mc[0], c[1] - mc[1]],
+        }
+    }
+
+    /// This motion, then `next`.
+    fn then(self, next: Self) -> Self {
+        let [a, b, c, d] = next.m;
+        let [e, f, g, h] = self.m;
+        let t = mul(next.m, self.t);
+        Self {
+            m: [a * e + b * g, a * f + b * h, c * e + d * g, c * f + d * h],
+            t: [t[0] + next.t[0], t[1] + next.t[1]],
+        }
+    }
+
     fn inverse(self) -> Self {
         // Reflections and turns are orthogonal: the inverse is the
         // transpose.
         let [a, b, c, d] = self.m;
+        let m = [a, c, b, d];
+        let t = mul(m, self.t);
         Self {
-            m: [a, c, b, d],
-            center: self.center,
+            m,
+            t: [-t[0], -t[1]],
         }
     }
 
     fn affine(self) -> Affine2 {
         let [a, b, c, d] = self.m.map(|v| v as f32);
-        let center = self.center.to_vec2();
         let m = Mat2::from_cols(Vec2::new(a, c), Vec2::new(b, d));
-        Affine2::from_mat2_translation(m, center - m * center)
+        Affine2::from_mat2_translation(m, Vec2::new(self.t[0] as f32, self.t[1] as f32) / 2.0)
     }
 
-    /// The row-major index of the pixel that pixel `(x, y)` goes to in an
-    /// image of `size`, or `None` outside it.
-    fn pixel(self, size: UVec2, x: i64, y: i64) -> Option<usize> {
-        let [a, b, c, d] = self.m.map(i64::from);
-        let (cx, cy) = (i64::from(self.center.x), i64::from(self.center.y));
-        // Pixel centers in half texels, which are odd.
-        let (px, py) = (2 * x + 1 - cx, 2 * y + 1 - cy);
-        let (qx, qy) = (a * px + b * py + cx, c * px + d * py + cy);
+    /// The row-major index of the pixel that pixel `i` goes to in an image
+    /// of `size`, or `None` outside it.
+    pub(crate) fn pixel(self, size: UVec2, i: usize) -> Option<usize> {
+        let w = size.x as usize;
+        // The pixel's center in half texels, which is odd.
+        let p = [2 * (i % w) as i64 + 1, 2 * (i / w) as i64 + 1];
+        let q = mul(self.m, p);
+        let (qx, qy) = (q[0] + self.t[0], q[1] + self.t[1]);
         debug_assert!(qx.rem_euclid(2) == 1 && qy.rem_euclid(2) == 1);
         texel_index(size, (qx - 1).div_euclid(2), (qy - 1).div_euclid(2))
     }
+}
+
+fn mul([a, b, c, d]: [i64; 4], [x, y]: [i64; 2]) -> [i64; 2] {
+    [a * x + b * y, c * x + d * y]
 }
 
 #[cfg(test)]
@@ -317,7 +390,16 @@ mod tests {
     }
 
     fn radial(turns: Turns, p: Vec2) -> Modifier {
-        Modifier::new(ModifierKind::Radial(Radial::nearest(turns, p)))
+        Modifier::new(ModifierKind::Radial(Radial::nearest(
+            turns,
+            p,
+            UVec2::splat(64),
+        )))
+    }
+
+    fn pixel_xy(size: UVec2, i: usize) -> (i64, i64) {
+        let w = size.x as usize;
+        ((i % w) as i64, (i / w) as i64)
     }
 
     /// An image of `size` from rows of `.` (unset) and digits.
@@ -383,14 +465,30 @@ mod tests {
 
     #[test]
     fn radial_centers_snap_to_where_quarter_turns_stay_on_pixels() {
-        let r = Radial::nearest(Turns::Quarter, Vec2::new(2.4, 2.0));
-        assert_eq!(r.center(), HalfPoint { x: 4, y: 4 });
-        let r = Radial::nearest(Turns::Quarter, Vec2::new(2.6, 2.1));
-        assert_eq!(r.center(), HalfPoint { x: 6, y: 4 });
-        let r = Radial::nearest(Turns::Quarter, Vec2::new(2.5, 2.5));
-        assert_eq!(r.center(), HalfPoint { x: 5, y: 5 });
-        let r = Radial::nearest(Turns::Half, Vec2::new(2.5, 2.0));
-        assert_eq!(r.center(), HalfPoint { x: 5, y: 4 });
+        let big = UVec2::splat(64);
+        let at = |turns, x, y| Radial::nearest(turns, Vec2::new(x, y), big).center();
+        assert_eq!(at(Turns::Quarter, 2.4, 2.0), HalfPoint { x: 4, y: 4 });
+        assert_eq!(at(Turns::Quarter, 2.6, 2.2), HalfPoint { x: 5, y: 5 });
+        assert_eq!(at(Turns::Quarter, 2.5, 2.5), HalfPoint { x: 5, y: 5 });
+        assert_eq!(at(Turns::Half, 2.5, 2.0), HalfPoint { x: 5, y: 4 });
+        // Centers stay on the texture, also when snapping pushes them.
+        let small = UVec2::splat(4);
+        let r = Radial::nearest(Turns::Quarter, Vec2::new(4.0, 0.5), small);
+        assert_eq!(r.center(), HalfPoint { x: 8, y: 2 });
+        let r = Radial::nearest(Turns::Half, Vec2::new(1e30, f32::NAN), small);
+        assert_eq!(r.center(), HalfPoint { x: 8, y: 0 });
+        // Moving one coordinate keeps the other, a whole texel at a time.
+        let r = r.with_coordinate(1, 2.6, small);
+        assert_eq!(r.center(), HalfPoint { x: 8, y: 5 });
+        let q = Radial::nearest(Turns::Quarter, Vec2::new(2.0, 2.0), small);
+        assert_eq!(
+            q.with_coordinate(0, 2.6, small).center(),
+            HalfPoint { x: 6, y: 4 }
+        );
+        assert_eq!(
+            q.with_coordinate(1, 4.0, small).center(),
+            HalfPoint { x: 4, y: 8 }
+        );
     }
 
     #[test]
@@ -440,15 +538,34 @@ mod tests {
         }
     }
 
+    /// The pixels `matching` carries pixel `i` of an image of `size` to.
+    fn matches(ms: &[Modifier], size: UVec2, i: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = matching(ms)
+            .into_iter()
+            .filter_map(|m| m.pixel(size, i))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     #[test]
-    fn an_orbit_holds_every_pixel_an_edit_must_reach() {
+    fn matching_pixels_follow_the_stack() {
         let size = UVec2::new(4, 4);
         let ms = [mirror(Axes::X, 4, 0), mirror(Axes::Y, 0, 4)];
-        assert_eq!(orbit(&ms, size, 0), [0, 3, 12, 15]);
+        assert_eq!(matches(&ms, size, 0), [3, 12, 15]);
         let mut off = ms;
         off[1].enabled = false;
-        assert_eq!(orbit(&off, size, 0), [0, 3]);
+        assert_eq!(matches(&off, size, 0), [3]);
         // Copies off the image don't count.
-        assert_eq!(orbit(&[mirror(Axes::X, 2, 0)], size, 2), [2]);
+        assert_eq!(
+            matches(&[mirror(Axes::X, 2, 0)], size, 2),
+            Vec::<usize>::new()
+        );
+        // Mirrors on different lines reach only what one pass through the
+        // stack shows, and the way back.
+        let size = UVec2::new(8, 1);
+        let ms = [mirror(Axes::X, 4, 0), mirror(Axes::X, 6, 0)];
+        assert_eq!(matches(&ms, size, 0), [2, 3, 5]);
     }
 }

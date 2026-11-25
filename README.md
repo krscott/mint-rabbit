@@ -43,12 +43,13 @@ Under the layers, Modifiers lists the picked layer's modifiers, which change
 what it shows and exports without changing what it holds. Mirror reflects the
 layer across a vertical line (X), a horizontal line (Y), or both; Radial turns
 copies of it about a point, one at 180° or three at 90°. Copies draw beneath the
-layer's own shapes and pixels and are cut off at the texture's edges. Drag a
-mirror's arrow handles, or a radial center, in the Texture View, or type their
-positions; they snap to half texels. Painting a raster layer also paints each
-matching pixel the modifiers copy to or from, so the Eraser clears copies too.
-Apply writes the first modifier's copies into the layer and removes it; a
-locked layer's modifiers can only be turned on and off.
+layer's own shapes and pixels and are cut off at the texture's edges. Drag the
+arrow handles of a guide's lines in the Texture View, or type their positions;
+they snap to half texels, and a 90° center to a pixel corner or center. Pixel
+tools on a raster layer edit what it shows, copies included: the layer keeps
+only what was drawn, recolors its own pixels at matching places, and erasing a
+copy erases what it copies. Apply writes the first modifier's copies into the
+layer and removes it; a locked layer's modifiers can only be turned on and off.
 
 - Select: drag a shape to move it, the square handles outside its corners to
   scale (Shift keeps proportions), and the round handle to rotate (Shift snaps

@@ -505,26 +505,38 @@ impl Layer {
         }
     }
 
-    /// Edits the pixels of a raster layer with `f`, returning its result,
-    /// or `None` for a vector layer. Each pixel `f` changes takes its new
-    /// value everywhere the enabled modifiers show copies of it or show it
-    /// as a copy, so the layer looks edited wherever `f` edited it.
+    /// Edits a raster layer with `f`, returning its result, or `None` for a
+    /// vector layer. With modifiers on, `f` edits the pixels the layer shows,
+    /// copies included, and each pixel it changes is stored at that pixel.
+    /// The change also reaches every pixel the modifiers show as the same
+    /// one: a cleared pixel clears them all, so no copy of it is left, and a
+    /// set pixel recolors those the layer holds, while those it doesn't
+    /// hold show the new pixel's copies. What the layer holds then stays
+    /// what was drawn, and moving the modifiers moves its copies.
     pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
+        let size = self.raster_pixels()?.size;
+        let matching = modifier::matching(&self.modifiers);
+        let shown = (!matching.is_empty()).then(|| self.coverage(size));
         let LayerContent::Raster(r) = &mut self.content else {
             return None;
         };
-        if !self.modifiers.iter().any(|m| m.enabled) {
+        let Some(shown) = shown else {
             return Some(f(r));
-        }
-        let before = r.pixels.clone();
-        let out = f(r);
-        let changed: Vec<usize> = (0..before.len())
-            .filter(|&i| r.pixels[i] != before[i])
-            .collect();
-        for i in changed {
-            let value = r.pixels[i];
-            for j in modifier::orbit(&self.modifiers, r.size, i) {
-                r.pixels[j] = value;
+        };
+        let mut edited = Raster {
+            size,
+            pixels: shown.clone(),
+        };
+        let out = f(&mut edited);
+        for (i, (&was, &now)) in shown.iter().zip(&edited.pixels).enumerate() {
+            if was == now {
+                continue;
+            }
+            r.pixels[i] = now;
+            for j in matching.iter().filter_map(|m| m.pixel(size, i)) {
+                if now.is_none() || r.pixels[j].is_some() {
+                    r.pixels[j] = now;
+                }
             }
         }
         Some(out)
@@ -1021,27 +1033,68 @@ mod tests {
         assert_eq!(l.shapes()[0].outline().bounds().0, Vec2::new(3.0, 0.0));
     }
 
+    /// A raster layer of `rows` of `.` (unset) and digits.
+    fn raster_layer(rows: &[&str]) -> Layer {
+        let size = UVec2::new(rows[0].len() as u32, rows.len() as u32);
+        let px = rows
+            .iter()
+            .flat_map(|r| r.chars())
+            .map(|c| c.to_digit(10).map(|d| PaletteIndex(d as u8)))
+            .collect();
+        Layer::raster("r", Raster::new(size, px).unwrap())
+    }
+
+    fn row(px: &[Option<PaletteIndex>]) -> String {
+        px.iter()
+            .map(|p| p.map_or('.', |i| char::from(b'0' + i.0)))
+            .collect()
+    }
+
+    fn stored(l: &Layer) -> String {
+        row(l.raster_pixels().unwrap().pixels())
+    }
+
+    fn shown(l: &Layer) -> String {
+        row(&l.coverage(l.raster_pixels().unwrap().size()))
+    }
+
+    fn dot(l: &mut Layer, x: f32, value: Option<u8>) {
+        let value = value.map(PaletteIndex);
+        let at = Vec2::new(x, 0.5);
+        l.edit_raster(|r| r.draw_line(at, at, 1.0, value));
+    }
+
     #[test]
-    fn raster_edits_reach_every_copy() {
-        let size = UVec2::new(4, 1);
-        let mut l = Layer::raster("r", Raster::clear(size));
+    fn raster_edits_act_on_what_shows() {
+        // Erasing a copy clears its source.
+        let mut l = raster_layer(&["5..."]);
         l.modifiers.push(mirror_x(4));
-        // Painting a pixel shown as a copy paints its source too, so the
-        // eraser can then clear it from either side.
-        let paint = |l: &mut Layer, x: f32, value| {
-            l.edit_raster(|r| r.draw_line(Vec2::new(x, 0.5), Vec2::new(x, 0.5), 1.0, value));
-        };
-        paint(&mut l, 3.5, Some(PaletteIndex(5)));
-        assert_eq!(
-            px(l.raster_pixels().unwrap()),
-            [Some(5), None, None, Some(5)]
-        );
-        paint(&mut l, 0.5, None);
-        assert_eq!(px(l.raster_pixels().unwrap()), [None; 4]);
-        // Off, the modifier leaves edits where they are.
+        assert_eq!(shown(&l), "5..5");
+        dot(&mut l, 3.5, None);
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("....", "...."));
+
+        // Painting stores only what is drawn, recoloring what the layer
+        // holds at matching pixels; the rest shows as copies.
+        let mut l = raster_layer(&["5..4"]);
+        l.modifiers.push(mirror_x(4));
+        dot(&mut l, 1.5, Some(2));
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("52.4", "5224"));
+        dot(&mut l, 3.5, Some(7));
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("72.7", "7227"));
+
+        // Fill stops at copies.
+        let mut l = raster_layer(&["1.1...."]);
+        l.modifiers.push(mirror_x(7));
+        assert_eq!(shown(&l), "1.1.1.1");
+        l.edit_raster(|r| r.fill(Vec2::new(5.5, 0.5), Some(PaletteIndex(2))));
+        assert_eq!(shown(&l), "121.121");
+
+        // Off, a modifier leaves edits where they are.
+        let mut l = raster_layer(&["...."]);
+        l.modifiers.push(mirror_x(4));
         l.modifiers[0].enabled = false;
-        paint(&mut l, 3.5, Some(PaletteIndex(5)));
-        assert_eq!(px(l.raster_pixels().unwrap()), [None, None, None, Some(5)]);
+        dot(&mut l, 3.5, Some(5));
+        assert_eq!(stored(&l), "...5");
         assert!(Layer::new("v").edit_raster(|_| ()).is_none());
     }
 
