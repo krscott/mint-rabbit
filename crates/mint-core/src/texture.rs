@@ -270,6 +270,12 @@ impl Raster {
         texel_index(self.size, x, y)
     }
 
+    /// Whether a fill of pixels of value `old` still has pixel `i` to fill:
+    /// it has that value and, while writes are tracked, isn't written yet.
+    fn fillable(&self, i: usize, old: Option<PaletteIndex>) -> bool {
+        self.pixels[i] == old && !self.written.get(i).is_some_and(|&w| w)
+    }
+
     /// Writes `value` to pixel `i`.
     fn write(&mut self, i: usize, value: Option<PaletteIndex>) {
         self.pixels[i] = value;
@@ -326,7 +332,9 @@ impl Raster {
             return;
         };
         let old = self.pixels[start];
-        if old == value {
+        // Filling with the value a region has changes nothing, but while
+        // written pixels are tracked it still writes them, each once.
+        if old == value && self.written.is_empty() {
             return;
         }
         // Scanline fill: each run of a row is filled as it is queued, so it
@@ -341,7 +349,7 @@ impl Raster {
             for ny in [y - 1, y + 1] {
                 let mut fx = left;
                 while fx <= right {
-                    if self.index(fx, ny).is_some_and(|i| self.pixels[i] == old) {
+                    if self.index(fx, ny).is_some_and(|i| self.fillable(i, old)) {
                         let run = self.fill_run(fx, ny, old, value);
                         fx = run.1 + 1;
                         runs.push_back(run);
@@ -362,7 +370,7 @@ impl Raster {
         old: Option<PaletteIndex>,
         value: Option<PaletteIndex>,
     ) -> (i64, i64, i64) {
-        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.pixels[i] == old);
+        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.fillable(i, old));
         let (mut left, mut right) = (x, x);
         while matches(self, left - 1) {
             left -= 1;
@@ -1132,6 +1140,11 @@ mod tests {
         l.modifiers.push(mirror_x(4));
         dot(&mut l, 0.5, Some(1));
         assert_eq!(stored(&l), "1..1");
+        // So does filling, through the region that shows, copies included.
+        let mut l = raster_layer(&["11.2"]);
+        l.modifiers.push(mirror_x(4));
+        l.edit_raster(|r| r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(1))));
+        assert_eq!(stored(&l), "1111");
 
         // Fill stops at copies.
         let mut l = raster_layer(&["1.1...."]);

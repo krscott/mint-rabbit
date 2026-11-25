@@ -1049,9 +1049,13 @@ fn pick(
         if !l.visible || l.locked {
             continue;
         }
-        // Pixels painted over a shape hide it from picks too, unless their
-        // layer shows at no opacity.
-        if l.opacity > 0.0 && l.raster_pixels().is_some_and(|px| px.at(p).is_some()) {
+        // Pixels painted over a shape, or copies of them, hide it from
+        // picks too, unless their layer shows at no opacity.
+        let shown = |px: &Raster| {
+            let i = mint_core::texel_index(px.size(), p.x.floor() as i64, p.y.floor() as i64);
+            i.is_some_and(|i| l.coverage(px.size())[i].is_some())
+        };
+        if l.opacity > 0.0 && l.raster_pixels().is_some_and(shown) {
             break;
         }
         if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {
