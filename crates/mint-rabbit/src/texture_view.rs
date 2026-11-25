@@ -1704,6 +1704,31 @@ mod tests {
         assert!(guide_hit(editor.project(), r, 0, at, pos2(60.0, 60.0)).is_none());
 
         let kind = |e: &Editor, k: usize| e.project().variant(r).layers()[0].modifiers[k].kind;
+        // A drag keeps the offset it grabbed the handle at: grabbed 0.15
+        // texels right of the line and moved 0.2 right, the line stays put.
+        let mut view = TextureView::default();
+        let paint = Paint {
+            color: PaletteIndex(0),
+            fill: true,
+            width: 1.0,
+        };
+        let grab = at.to_texture(pos2(106.0, 20.0 - GUIDE_REACH));
+        let mut d = view
+            .start(
+                &mut editor,
+                Tool::Pencil,
+                paint,
+                &mut Selection::default(),
+                r,
+                grab,
+                at,
+                &mut None,
+            )
+            .unwrap();
+        let to = grab + Vec2::new(0.2, 3.0);
+        continue_drag(&mut editor, &mut d, &(0, Vec::new()), r, to, &mut [], false);
+        assert_eq!(kind(&editor, 0), ModifierKind::Mirror(mirror));
+        editor.end_gesture();
         let drag = |e: &mut Editor, modifier, part, p| {
             let mut d = Drag::Guide {
                 layer: 0,
