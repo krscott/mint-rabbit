@@ -876,14 +876,13 @@ impl TextureView {
 
 /// The handles of the guides of layer `layer`'s enabled Mirror and Radial
 /// modifiers, if the layer is visible: each line has one past either end of
-/// the image, kept inside the view where it can.
+/// the image, where the view shows it. Zoomed in past the image's edges, a
+/// line has no handle there, so that nothing on the image is a handle.
 fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
     if !layer.visible {
         return Vec::new();
     }
-    let (image, view) = (at.image, at.view.shrink(GUIDE_REACH));
-    // Within the view's inset, unless the view is too small for one.
-    let inside = |v: f32, lo: f32, hi: f32| v.min(hi).max(lo);
+    let image = at.image;
     let mut out = Vec::new();
     for (modifier, m) in layer.modifiers.iter().enumerate() {
         if !m.enabled {
@@ -893,7 +892,7 @@ fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
         let c = at.to_screen(c.to_vec2());
         if x {
             for end in [image.top() - GUIDE_REACH, image.bottom() + GUIDE_REACH] {
-                let at = pos2(c.x, inside(end, view.top(), view.bottom()));
+                let at = pos2(c.x, end);
                 out.push(GuideHandle {
                     modifier,
                     part: GuidePart::X,
@@ -903,7 +902,7 @@ fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
         }
         if y {
             for end in [image.left() - GUIDE_REACH, image.right() + GUIDE_REACH] {
-                let at = pos2(inside(end, view.left(), view.right()), c.y);
+                let at = pos2(end, c.y);
                 out.push(GuideHandle {
                     modifier,
                     part: GuidePart::Y,
@@ -912,6 +911,7 @@ fn guide_handles(layer: &Layer, at: Placement) -> Vec<GuideHandle> {
             }
         }
     }
+    out.retain(|h| at.view.contains(h.at));
     out
 }
 
@@ -937,8 +937,11 @@ fn guide_hit(
     if layer.locked {
         return None;
     }
+    // Of handles in one place, the later modifier's, as the one added or
+    // moved last; the fields move the others.
     guide_handles(layer, at)
         .into_iter()
+        .rev()
         .map(|h| (h.at.distance(q), h))
         .filter(|(d, _)| *d <= HIT)
         .min_by(|a, b| a.0.total_cmp(&b.0))

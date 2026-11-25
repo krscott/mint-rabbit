@@ -1,14 +1,14 @@
 //! Modifiers: steps of a layer's stack that change what the layer shows and
 //! exports without changing the shapes or pixels it holds.
 //!
-//! Mirror and Radial add copies of the layer's content. Copies draw beneath
-//! the content they copy, and a later copy over an earlier one, so a pixel
-//! the content covers keeps its value. Their lines and centers lie on the
+//! Mirror and Radial add copies of the layer's content: of a vector layer's
+//! shapes, or of the pixels a raster layer holds. Copies draw beneath the
+//! content they copy, and a later copy over an earlier one, so a pixel the
+//! content covers keeps its value. Their lines and centers lie on the
 //! half-texel grid within the texture, where reflections and turns carry
-//! each pixel exactly onto another, so a modifier gives the same pixels
-//! whether its layer holds shapes or the pixels those shapes cover.
-
-use std::collections::HashSet;
+//! each pixel exactly onto another, so copying shapes covers the same pixels
+//! as copying the pixels they cover, except where shapes reach past the
+//! texture's edge or a pixel center lies exactly on a shape's edge.
 
 use glam::{Affine2, Mat2, UVec2, Vec2};
 
@@ -266,10 +266,7 @@ impl Modifier {
         out
     }
 
-    /// `shapes` with the modifier's copies beneath them, as shapes. A pixel
-    /// center lying exactly on a copied shape's edge can fall the other way
-    /// than on the shape it copies, so these can differ by a pixel there from
-    /// [`Self::apply_pixels`] on the shapes' pixels.
+    /// `shapes` with the modifier's copies beneath them, as shapes.
     pub(crate) fn apply_shapes(self, shapes: &[Shape]) -> Vec<Shape> {
         let mut out = Vec::new();
         for c in self.copies() {
@@ -285,42 +282,57 @@ impl Modifier {
     }
 }
 
-/// The motions that carry a pixel to another that the enabled `modifiers`
-/// show as the same one: each way the stack places a copy (one of each
-/// modifier's copies, or none, in stack order), and the way back from each.
-/// The identity is left out.
-pub(crate) fn matching(modifiers: &[Modifier]) -> Vec<Motion> {
-    let mut placements = vec![Motion::IDENTITY];
-    for m in modifiers.iter().filter(|m| m.enabled) {
-        let copies = m.copies();
-        placements = placements
-            .iter()
-            .flat_map(|&p| std::iter::once(p).chain(copies.iter().map(move |&c| p.then(c))))
-            .collect();
-    }
-    let mut seen = HashSet::from([Motion::IDENTITY]);
-    placements
-        .into_iter()
-        .flat_map(|p| [p, p.inverse()])
-        .filter(|&p| seen.insert(p))
+/// The copies of each enabled modifier of `modifiers`, in stack order.
+pub(crate) fn stack(modifiers: &[Modifier]) -> Vec<Vec<Motion>> {
+    modifiers
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.copies())
         .collect()
+}
+
+/// The pixels of an image of `size` where `stack` shows a copy of pixel `i`
+/// and those it shows copies of at `i`, through copies on the image only, as
+/// the stack draws them. Leaves out `i`.
+pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, i: usize) -> Vec<usize> {
+    let walk = |steps: &mut dyn Iterator<Item = Vec<Motion>>| {
+        let mut reached = vec![i];
+        for copies in steps {
+            for k in 0..reached.len() {
+                for c in &copies {
+                    if let Some(j) = c.pixel(size, reached[k])
+                        && !reached.contains(&j)
+                    {
+                        reached.push(j);
+                    }
+                }
+            }
+        }
+        reached
+    };
+    let mut out = walk(&mut stack.iter().cloned());
+    out.extend(walk(
+        &mut stack
+            .iter()
+            .rev()
+            .map(|copies| copies.iter().map(|c| c.inverse()).collect()),
+    ));
+    out.sort_unstable();
+    out.dedup();
+    out.retain(|&j| j != i);
+    out
 }
 
 /// A rigid motion of texture space that carries pixels onto pixels: a point
 /// `p`, in half texels, goes to `m p + t`, with `m` a row-major reflection
 /// or turn and `t` even.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Motion {
     m: [i64; 4],
     t: [i64; 2],
 }
 
 impl Motion {
-    const IDENTITY: Self = Self {
-        m: [1, 0, 0, 1],
-        t: [0, 0],
-    };
-
     /// `m` about `center`, which fixes it.
     fn about(m: [i64; 4], center: HalfPoint) -> Self {
         let c = [i64::from(center.x), i64::from(center.y)];
@@ -328,17 +340,6 @@ impl Motion {
         Self {
             m,
             t: [c[0] - mc[0], c[1] - mc[1]],
-        }
-    }
-
-    /// This motion, then `next`.
-    fn then(self, next: Self) -> Self {
-        let [a, b, c, d] = next.m;
-        let [e, f, g, h] = self.m;
-        let t = mul(next.m, self.t);
-        Self {
-            m: [a * e + b * g, a * f + b * h, c * e + d * g, c * f + d * h],
-            t: [t[0] + next.t[0], t[1] + next.t[1]],
         }
     }
 
@@ -538,15 +539,8 @@ mod tests {
         }
     }
 
-    /// The pixels `matching` carries pixel `i` of an image of `size` to.
     fn matches(ms: &[Modifier], size: UVec2, i: usize) -> Vec<usize> {
-        let mut out: Vec<usize> = matching(ms)
-            .into_iter()
-            .filter_map(|m| m.pixel(size, i))
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+        matching(&stack(ms), size, i)
     }
 
     #[test]
@@ -567,5 +561,11 @@ mod tests {
         let size = UVec2::new(8, 1);
         let ms = [mirror(Axes::X, 4, 0), mirror(Axes::X, 6, 0)];
         assert_eq!(matches(&ms, size, 0), [2, 3, 5]);
+        // A copy cut off at the edge carries nothing on to later modifiers.
+        let ms = [mirror(Axes::X, 2, 0), mirror(Axes::X, 6, 0)];
+        assert_eq!(matches(&ms, size, 2), [3]);
+        // Repeated modifiers add nothing new.
+        let ms = [mirror(Axes::Both, 4, 4); 13];
+        assert_eq!(matches(&ms, UVec2::new(4, 4), 0), [3, 12, 15]);
     }
 }

@@ -131,6 +131,16 @@ impl IndexedImage {
     }
 }
 
+/// The palette entry each pixel of an image of `size` takes from the topmost
+/// of `shapes` covering its center, row-major, or `None` where none does.
+fn shape_coverage(shapes: &[Shape], size: UVec2) -> Vec<Option<PaletteIndex>> {
+    let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
+    for shape in shapes {
+        covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
+    }
+    out
+}
+
 /// Calls `f` with the row-major index of each pixel of an image of `size`
 /// whose center `shape` covers.
 fn covered_pixels(shape: &Shape, size: UVec2, mut f: impl FnMut(usize)) {
@@ -515,8 +525,8 @@ impl Layer {
     /// what was drawn, and moving the modifiers moves its copies.
     pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
         let size = self.raster_pixels()?.size;
-        let matching = modifier::matching(&self.modifiers);
-        let shown = (!matching.is_empty()).then(|| self.coverage(size));
+        let stack = modifier::stack(&self.modifiers);
+        let shown = (!stack.is_empty()).then(|| self.coverage(size));
         let LayerContent::Raster(r) = &mut self.content else {
             return None;
         };
@@ -533,7 +543,7 @@ impl Layer {
                 continue;
             }
             r.pixels[i] = now;
-            for j in matching.iter().filter_map(|m| m.pixel(size, i)) {
+            for j in modifier::matching(&stack, size, i) {
                 if now.is_none() || r.pixels[j].is_some() {
                     r.pixels[j] = now;
                 }
@@ -571,42 +581,33 @@ impl Layer {
 
     /// The palette entry each pixel of an image of `size` takes from this
     /// layer, row-major, after its enabled modifiers: for a vector layer,
-    /// from the topmost shape covering its center, or `None` where nothing
-    /// does. Visibility and opacity are not applied. A raster layer must be
-    /// of `size`.
+    /// from the topmost shape or copied shape covering its center, or `None`
+    /// where nothing does. Visibility and opacity are not applied. A raster
+    /// layer must be of `size`.
     #[must_use]
     pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
-        self.modifiers
-            .iter()
-            .filter(|m| m.enabled)
-            .fold(self.content_coverage(size), |px, m| {
-                m.apply_pixels(size, &px)
-            })
-    }
-
-    /// [`Self::coverage`] of what the layer holds, before its modifiers.
-    fn content_coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
+        let on = || self.modifiers.iter().filter(|m| m.enabled);
         match &self.content {
-            LayerContent::Vector(shapes) => {
-                let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
-                for shape in shapes {
-                    covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
-                }
-                out
+            LayerContent::Vector(shapes) if on().next().is_some() => {
+                let copied = on().fold(shapes.clone(), |s, m| m.apply_shapes(&s));
+                shape_coverage(&copied, size)
             }
+            LayerContent::Vector(shapes) => shape_coverage(shapes, size),
             LayerContent::Raster(r) => {
                 debug_assert_eq!(r.size, size);
-                r.pixels.clone()
+                on().fold(r.pixels.clone(), |px, m| m.apply_pixels(size, &px))
             }
         }
     }
 
     /// Turns a vector layer into a raster layer of `size` holding the
-    /// pixels its shapes cover, keeping its modifiers. A raster layer stays
-    /// as it is.
+    /// pixels its shapes cover, keeping its modifiers, which then copy those
+    /// pixels: what shows can change where shapes reach past the texture's
+    /// edge or a pixel center lies exactly on a copied shape's edge. A raster
+    /// layer stays as it is.
     fn rasterize(&mut self, size: UVec2) {
-        if self.kind() == LayerKind::Vector {
-            let pixels = self.content_coverage(size);
+        if let LayerContent::Vector(shapes) = &self.content {
+            let pixels = shape_coverage(shapes, size);
             self.content = LayerContent::Raster(Raster { size, pixels });
         }
     }
@@ -1022,6 +1023,15 @@ mod tests {
             assert_eq!(l.modifiers, [mirror_x(2)]);
             assert_eq!(l.coverage(size), shown);
         }
+        // Copied shapes reach in from past the texture's edge, before and
+        // after Apply.
+        let mut l = Layer::new("v");
+        let wide = shape::rectangle(Vec2::new(-2.0, 0.0), Vec2::new(1.0, 1.0));
+        l.insert_shape(0, Shape::new(wide, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(2));
+        assert_eq!(l.coverage(size), [Some(PaletteIndex(7)); 4]);
+        l.apply_first_modifier();
+        assert_eq!(l.coverage(size), [Some(PaletteIndex(7)); 4]);
         // The copy goes beneath the shape it copies.
         let mut l = Layer::new("v");
         let dot = shape::rectangle(Vec2::ZERO, Vec2::ONE);
