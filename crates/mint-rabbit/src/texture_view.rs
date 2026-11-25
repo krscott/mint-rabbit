@@ -1273,6 +1273,11 @@ fn press_pixels(
     message: &mut Option<String>,
 ) -> Option<usize> {
     let value = pixel_value(tool, paint);
+    // A fill off the texture has nothing to fill, and adds no first layer.
+    let size = editor.project().variant(r).size().as_vec2();
+    if tool == Tool::Fill && !(p.cmpge(Vec2::ZERO).all() && p.cmplt(size).all()) {
+        return None;
+    }
     let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {
         let Some(raster) = l.raster_pixels_mut() else {
             return;

@@ -302,13 +302,39 @@ impl Raster {
         if old == value {
             return;
         }
-        let mut stack = vec![(x, y)];
-        while let Some((x, y)) = stack.pop() {
-            let Some(i) = self.index(x, y).filter(|&i| self.pixels[i] == old) else {
+        let matches = |r: &Self, x: i64, y: i64| r.index(x, y).is_some_and(|i| r.pixels[i] == old);
+        // Scanline fill: each popped seed fills its whole run of the row,
+        // then queues one seed per run of matching pixels just above and
+        // below it, which keeps the queue small on any texture.
+        let mut seeds = vec![(x, y)];
+        while let Some((x, y)) = seeds.pop() {
+            if !matches(self, x, y) {
                 continue;
-            };
-            self.pixels[i] = value;
-            stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]);
+            }
+            let (mut left, mut right) = (x, x);
+            while matches(self, left - 1, y) {
+                left -= 1;
+            }
+            while matches(self, right + 1, y) {
+                right += 1;
+            }
+            for fx in left..=right {
+                let i = self.index(fx, y).expect("the run is inside the raster");
+                self.pixels[i] = value;
+            }
+            for ny in [y - 1, y + 1] {
+                let mut fx = left;
+                while fx <= right {
+                    if matches(self, fx, ny) {
+                        seeds.push((fx, ny));
+                        while fx <= right && matches(self, fx, ny) {
+                            fx += 1;
+                        }
+                    } else {
+                        fx += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -951,8 +977,19 @@ mod tests {
                 None
             ]
         );
+        // Around the outside of a cup-shaped wall, not into the cup.
+        let mut r = Raster::clear(UVec2::new(5, 4));
+        for (x, y) in [(1, 1), (2, 1), (3, 1), (1, 2), (3, 2), (1, 3), (3, 3)] {
+            r.pixels[y * 5 + x] = one;
+        }
+        r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
+        let filled = px(&r).iter().filter(|&&p| p == Some(2)).count();
+        // All 20 pixels but the 7 of the wall and the 2 it encloses.
+        assert_eq!(filled, 11);
+        assert_eq!(px(&r)[2 * 5 + 2], None);
         let before = r.clone();
         r.fill(Vec2::new(-1.0, 0.5), None);
+
         r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
         assert_eq!(r, before);
     }
