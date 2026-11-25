@@ -1,5 +1,5 @@
-//! The application window: decomp and villager picker, project and export
-//! actions, the editing panels, and the split Model View / Texture View.
+//! The application window: menus, the Model View beside the Texture View
+//! with its painting controls, the palette and layer dock, and dialogs.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,14 +8,36 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
 use glam::Vec3;
 use mint_ac::{Decomp, VillagerRef};
-use mint_core::{PaletteIndex, Project, TextureContent, TextureId, VariantRef};
+use mint_core::{PaletteIndex, Project, Texture, TextureContent, TextureId, VariantRef};
 
 use crate::camera::Orbit;
 use crate::editor::Editor;
-use crate::panels;
+use crate::icons::{self, Icon};
+use crate::panels::{self, Target};
 use crate::picker::{self, Gpu, Picker};
+use crate::previews::{Previews, thumbnail};
 use crate::render::{ModelCallback, Renderer, SceneData};
 use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
+
+const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+const REDO: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
+const REDO_Y: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+
+const WARNING: Color32 = Color32::from_rgb(255, 170, 90);
+const ERROR: Color32 = Color32::from_rgb(255, 110, 110);
+
+/// Shown in place of the views while no project is open.
+const NOTHING_OPEN: &str =
+    "Use the File menu to open a project, or to open a decomp and import a villager.";
+
+/// Size of a texture's or variant's thumbnail above the Texture View.
+const THUMBNAIL: egui::Vec2 = egui::vec2(40.0, 32.0);
+
+/// Width of the tool strip at the Texture View's left.
+const TOOLS_WIDTH: f32 = 36.0;
 
 pub struct Options {
     pub decomp: Option<PathBuf>,
@@ -33,6 +55,9 @@ struct Doc {
     /// Texture shown in the Texture View; `None` when there are none.
     selected: Option<TextureId>,
     selection: Selection,
+    previews: Previews,
+    /// The layer name being typed in the layer list.
+    rename: Option<panels::Rename>,
     scene: Arc<SceneData>,
     /// What `scene` was built from.
     scene_for: (u64, Vec<usize>),
@@ -56,6 +81,8 @@ impl Doc {
             variants,
             selected,
             selection: Selection::default(),
+            previews: Previews::default(),
+            rename: None,
             scene,
             check: None,
         }
@@ -124,10 +151,92 @@ enum Status {
     Error(String),
 }
 
-/// An export the side panel asks for, run once its borrows end.
-enum Request {
-    ExportInPlace,
-    ExportToFolder,
+/// The one dialog open over the window.
+enum Dialog {
+    Confirm(Confirm),
+    /// The decomp checkout and game version to open, as typed so far.
+    OpenDecomp {
+        path: String,
+        version: String,
+    },
+    /// The name of a texture set to export to a folder, as typed so far.
+    ExportSet {
+        name: String,
+    },
+}
+
+/// A texture's name and pixel size.
+fn texture_label(texture: &Texture) -> String {
+    let size = texture.size();
+    let external = matches!(texture.content(), TextureContent::External { .. });
+    format!(
+        "{} {}×{}{}",
+        texture.name,
+        size.x,
+        size.y,
+        if external { " (external)" } else { "" }
+    )
+}
+
+/// A dim label after a row of thumbnails, kept in one piece when the row
+/// wraps.
+fn caption(ui: &mut egui::Ui, text: String) {
+    ui.add(egui::Label::new(egui::RichText::new(text).weak()).extend());
+}
+
+fn tool_icon(tool: Tool) -> Icon {
+    match tool {
+        Tool::Select => Icon::MousePointer2,
+        Tool::Pen => Icon::PenTool,
+        Tool::Brush => Icon::Brush,
+        Tool::Ellipse => Icon::Circle,
+        Tool::Rectangle => Icon::Square,
+    }
+}
+
+/// Gives a dialog's first text field the keyboard while nothing else has it,
+/// so the dialog opens ready for typing.
+fn focus_if_none(ui: &egui::Ui, field: &egui::Response) {
+    if ui.memory(|m| m.focused().is_none()) {
+        field.request_focus();
+    }
+}
+
+/// Whether Enter was pressed in a text field.
+fn entered(ui: &egui::Ui, field: &egui::Response) -> bool {
+    field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+}
+
+/// Shows a dialog with `body`, a button for `action`, which `enabled`
+/// allows, and Cancel. `body` returns whether it asks for the action itself,
+/// as by Enter in its text field. Returns whether the action was chosen, once
+/// the dialog is answered; Escape or a click outside cancels.
+fn modal(
+    ctx: &egui::Context,
+    title: &str,
+    action: &str,
+    enabled: bool,
+    body: impl FnOnce(&mut egui::Ui) -> bool,
+) -> Option<bool> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
+        ui.heading(title);
+        if body(ui) && enabled {
+            choice = Some(true);
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(enabled, egui::Button::new(action)).clicked() {
+                choice = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(false);
+            }
+        });
+    });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(false);
+    }
+    choice
 }
 
 /// Where a replacing project comes from.
@@ -139,6 +248,7 @@ enum Replace {
 }
 
 pub struct App {
+    /// The decomp checkout and game version last asked for.
     decomp_path: String,
     version: String,
     /// The open decomp, and its villagers to import.
@@ -155,11 +265,11 @@ pub struct App {
     /// Why the last edit in a panel or view was refused, moved into
     /// `status` after them.
     refusal: Option<String>,
-    confirm: Option<Confirm>,
+    dialog: Option<Dialog>,
     texture_view: TextureView,
     tool: Tool,
     paint: Paint,
-    /// Name for a texture set exported to a folder.
+    /// Name last given to a texture set exported to a folder.
     folder_set: String,
     /// The window title last set.
     title: String,
@@ -181,6 +291,7 @@ impl App {
         cc.egui_ctx.options_mut(|o| {
             o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Presses;
         });
+        icons::install(&cc.egui_ctx);
         let mut app = Self {
             decomp_path: options
                 .decomp
@@ -197,7 +308,7 @@ impl App {
             show_uv: true,
             status: None,
             refusal: None,
-            confirm: None,
+            dialog: None,
             texture_view: TextureView::default(),
             tool: Tool::Select,
             paint: Paint {
@@ -225,6 +336,10 @@ impl App {
 
     fn tell(&mut self, message: impl Into<String>) {
         self.status = Some(Status::Info(message.into()));
+    }
+
+    fn ask(&mut self, confirm: Confirm) {
+        self.dialog = Some(Dialog::Confirm(confirm));
     }
 
     fn open_decomp(&mut self) {
@@ -273,7 +388,7 @@ impl App {
     /// Runs `replace` now, or asks first when it would lose changes.
     fn replace(&mut self, replace: Replace, ctx: &egui::Context) {
         if self.dirty() {
-            self.confirm = Some(Confirm::Discard(replace));
+            self.ask(Confirm::Discard(replace));
         } else {
             self.do_replace(replace, ctx);
         }
@@ -337,7 +452,7 @@ impl App {
         };
         let current = self.doc.as_ref().and_then(|d| d.editor.path());
         if dir.join(mint_core::file::PROJECT_FILE).exists() && current != Some(&dir) {
-            self.confirm = Some(Confirm::SaveOver(dir));
+            self.ask(Confirm::SaveOver(dir));
         } else {
             self.save_to(dir);
         }
@@ -369,13 +484,13 @@ impl App {
                 .map_err(|e| e.to_string())
         });
         match result {
-            Ok((export, path)) => self.confirm = Some(Confirm::ReplaceInDecomp(export, path)),
+            Ok((export, path)) => self.ask(Confirm::ReplaceInDecomp(export, path)),
             Err(e) => self.fail(e),
         }
     }
 
-    /// Asks for a folder to export a new texture set to, and whether to
-    /// overwrite an earlier export there.
+    /// Asks for a folder to export the texture set named `folder_set` to,
+    /// and whether to overwrite an earlier export there.
     fn export_to_folder(&mut self) {
         let Some(dir) = rfd::FileDialog::new()
             .set_title("Export texture set to folder")
@@ -388,7 +503,7 @@ impl App {
             .iter()
             .any(|f| f.exists());
         if taken {
-            self.confirm = Some(Confirm::OverwriteFolder(dir));
+            self.ask(Confirm::OverwriteFolder(dir));
         } else {
             self.write_folder(&dir);
         }
@@ -423,225 +538,365 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    /// Whether the open project can export now, or why not; `None` with no
+    /// project open.
+    fn export_ready(&mut self) -> Option<Result<(), String>> {
+        // The picker holds the open decomp.
+        let has_decomp = self.picker.is_some();
+        let doc = self.doc.as_mut()?;
+        let generation = doc.editor.generation();
+        if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let result = export_imported(doc.editor.project()).map(|_| ());
+            doc.check = Some((generation, result));
+        }
+        let (_, check) = doc.check.as_ref()?;
+        Some(match check {
+            Err(e) => Err(e.clone()),
+            Ok(()) if !has_decomp => Err("Open the decomp this project came from".into()),
+            Ok(()) => Ok(()),
+        })
+    }
+
+    /// The painted variant shown and what is picked in it, for a control to
+    /// edit.
+    fn target(&mut self) -> Option<Target<'_>> {
+        let doc = self.doc.as_mut()?;
+        let variant = doc.variant()?;
+        Some(Target::new(
+            &mut doc.editor,
+            variant,
+            &mut doc.selection,
+            &mut self.refusal,
+        ))
+    }
+
+    fn set_tool(&mut self, tool: Tool) {
+        if self.tool != tool {
+            self.tool = tool;
+            self.texture_view.clear_pen();
+        }
+    }
+
+    /// Shows a variant in the Texture View, and that variant of its texture
+    /// in the Model View. Picks don't carry over to another variant.
+    fn show_variant(&mut self, r: VariantRef) {
+        let Some(doc) = &mut self.doc else { return };
+        let i = r.texture.index();
+        if (doc.selected, doc.variants[i]) != (Some(r.texture), r.variant) {
+            doc.selected = Some(r.texture);
+            doc.variants[i] = r.variant;
+            doc.selection = Selection::default();
+            self.texture_view.clear_pen();
+        }
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("Edit", |ui| self.edit_menu(ui));
+            ui.menu_button("View", |ui| self.view_menu(ui));
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let has_doc = self.doc.is_some();
+        if ui.button("Open project…").clicked()
+            && let Some(dir) = rfd::FileDialog::new()
+                .set_title("Open project folder")
+                .pick_folder()
+        {
+            self.replace(Replace::Open(dir), &ctx);
+        }
+        let save = egui::Button::new("Save").shortcut_text(ctx.format_shortcut(&SAVE));
+        if ui.add_enabled(has_doc, save).clicked() {
+            self.save();
+        }
+        if ui
+            .add_enabled(has_doc, egui::Button::new("Save as…"))
+            .clicked()
+        {
+            self.save_as();
+        }
+        ui.separator();
+        if ui.button("Open decomp…").clicked() {
+            self.dialog = Some(Dialog::OpenDecomp {
+                path: self.decomp_path.clone(),
+                version: self.version.clone(),
+            });
+        }
+        let import = egui::Button::new("Import villager…");
+        if ui
+            .add_enabled(self.picker.is_some(), import)
+            .on_disabled_hover_text("Open a decomp first")
+            .clicked()
+            && let Some(picker) = &mut self.picker
+        {
+            picker.open();
+        }
+        ui.separator();
+        let ready = self.export_ready();
+        let can_export = matches!(ready, Some(Ok(())));
+        let why_not = match &ready {
+            Some(Err(e)) => e.as_str(),
+            _ => "No project is open",
+        };
+        let set = self.doc.as_ref().and_then(|d| {
+            mint_ac::imported_from(d.editor.project())
+                .ok()
+                .map(|i| i.texture_set.to_owned())
+        });
+        let replace = set.map_or_else(
+            || "Replace in the decomp…".to_owned(),
+            |set| format!("Replace {set} in the decomp…"),
+        );
+        if ui
+            .add_enabled(can_export, egui::Button::new(replace))
+            .on_disabled_hover_text(why_not)
+            .clicked()
+        {
+            self.export_in_place();
+        }
+        if ui
+            .add_enabled(can_export, egui::Button::new("Export new texture set…"))
+            .on_hover_text("A new texture set, based on this villager, with the steps to add it")
+            .on_disabled_hover_text(why_not)
+            .clicked()
+        {
+            self.dialog = Some(Dialog::ExportSet {
+                name: self.folder_set.clone(),
+            });
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let item = |text: &str, shortcut: &KeyboardShortcut| {
+            egui::Button::new(text.to_owned()).shortcut_text(ctx.format_shortcut(shortcut))
+        };
+        let (undo, redo) = self.doc.as_ref().map_or((false, false), |d| {
+            (d.editor.can_undo(), d.editor.can_redo())
+        });
+        if ui.add_enabled(undo, item("Undo", &UNDO)).clicked()
+            && let Some(d) = &mut self.doc
+        {
+            d.undo();
+        }
+        if ui.add_enabled(redo, item("Redo", &REDO)).clicked()
+            && let Some(d) = &mut self.doc
+        {
+            d.redo();
+        }
+        ui.separator();
+        let (shapes, anchor) = self.target().map_or((false, false), |t| {
+            let picked = t.selection();
+            (!picked.shapes.is_empty(), picked.anchor.is_some())
+        });
+        if ui
+            .add_enabled(shapes, item("Duplicate shapes", &DUPLICATE))
+            .clicked()
+            && let Some(mut t) = self.target()
+        {
+            panels::duplicate(&mut t);
+        }
+        let delete = if anchor {
+            "Delete anchor"
+        } else {
+            "Delete shapes"
+        };
+        if ui.add_enabled(shapes, egui::Button::new(delete)).clicked()
+            && let Some(mut t) = self.target()
+        {
+            panels::delete(&mut t);
+        }
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.linear_filter, "Smooth filtering (as in game)");
+        ui.checkbox(&mut self.show_uv, "UV layout in the Texture View");
+        ui.separator();
+        if ui.button("Fit texture to view").clicked() {
+            self.texture_view.fit();
+        }
+        ui.separator();
+        ui.weak("Texture View: scroll to zoom, middle-drag to pan,");
+        ui.weak("middle double-click to fit.");
+        ui.weak("Model View: drag to turn, scroll to zoom.");
+    }
+
+    /// The last thing done or what went wrong, and at the right whether the
+    /// project can export.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let ready = self.export_ready();
         ui.horizontal(|ui| {
-            if ui.button("Open…").clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Open project folder")
-                    .pick_folder()
-            {
-                self.replace(Replace::Open(dir), ui.ctx());
-            }
-            let has_doc = self.doc.is_some();
-            if ui.add_enabled(has_doc, egui::Button::new("Save")).clicked() {
-                self.save();
-            }
-            if ui
-                .add_enabled(has_doc, egui::Button::new("Save as…"))
-                .clicked()
-            {
-                self.save_as();
-            }
-            ui.separator();
-            ui.label("Decomp");
-            let path = ui.add(
-                egui::TextEdit::singleline(&mut self.decomp_path)
-                    .hint_text("path to a built ac-decomp checkout")
-                    .desired_width(260.0),
-            );
-            ui.label("Version");
-            ui.add(egui::TextEdit::singleline(&mut self.version).desired_width(90.0));
-            let enter = path.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.button("Open decomp").clicked() || enter {
-                self.open_decomp();
-                self.offer_import();
-            }
-            if let Some(picker) = &mut self.picker {
-                ui.separator();
-                if ui.button("Import…").clicked() {
-                    picker.open();
+            let half = ui.available_width() * 0.5;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &ready {
+                    Some(Ok(())) => {
+                        ui.label("Ready to export");
+                    }
+                    Some(Err(e)) => {
+                        let text = egui::RichText::new(format!("Can't export: {e}")).color(WARNING);
+                        ui.scope(|ui| {
+                            ui.set_max_width(half);
+                            // Hovering a cut-off label shows all of it.
+                            ui.add(egui::Label::new(text).truncate());
+                        });
+                    }
+                    None => {}
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let text = match &self.status {
+                        Some(Status::Error(e)) => egui::RichText::new(e).color(ERROR),
+                        Some(Status::Info(m)) => egui::RichText::new(m),
+                        None => egui::RichText::new(" "),
+                    };
+                    ui.add(egui::Label::new(text).truncate());
+                });
+            });
+        });
+    }
+
+    /// The palette, and the layers of the variant shown.
+    fn dock(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = &mut self.doc else { return };
+        panels::palette(ui, &mut doc.editor, &mut self.paint, &mut self.refusal);
+        ui.separator();
+        ui.strong("Layers");
+        let Some(variant) = doc.variant() else {
+            ui.weak("An external texture has no layers.");
+            return;
+        };
+        let mut target = Target::new(
+            &mut doc.editor,
+            variant,
+            &mut doc.selection,
+            &mut self.refusal,
+        );
+        // The actions keep to the bottom, and the list scrolls in the rest.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let action = panels::layer_actions(ui, &target);
+            panels::layer_opacity(ui, &mut target);
+            ui.separator();
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        panels::layer_list(ui, &mut target, &mut doc.previews, &mut doc.rename);
+                    });
+            });
+            if let Some(action) = action {
+                panels::apply_layer_action(&mut target, action);
             }
         });
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui) -> Option<Request> {
-        let Some(doc) = &mut self.doc else {
-            ui.label("Open a project, or open a decomp and import a villager.");
-            return None;
-        };
-        let mut request = None;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(doc.editor.can_undo(), egui::Button::new("Undo"))
-                .clicked()
-            {
-                doc.undo();
-            }
-            if ui
-                .add_enabled(doc.editor.can_redo(), egui::Button::new("Redo"))
-                .clicked()
-            {
-                doc.redo();
-            }
-        });
-        // Panel edits, such as deleting a layer or locking it, can leave
-        // picks that no longer apply.
-        if let Some(r) = doc.variant() {
-            doc.selection.fit(doc.editor.project(), r);
-        }
-
-        egui::CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
-            let generation = doc.editor.generation();
-            if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
-                let project = doc.editor.project();
-                let result = export_imported(project).map(|_| ());
-                doc.check = Some((generation, result));
-            }
-            match &doc.check {
-                Some((_, Ok(()))) => {
-                    ui.label("Ready to export.");
-                }
-                Some((_, Err(e))) => {
-                    ui.colored_label(Color32::from_rgb(255, 170, 90), e);
-                }
-                None => {}
-            }
-            // The picker holds the open decomp.
-            let ready = matches!(doc.check, Some((_, Ok(())))) && self.picker.is_some();
-            let why_not = if self.picker.is_none() {
-                "Open the decomp this project came from"
-            } else {
-                "Fix what the export check above reports"
-            };
-            let set = mint_ac::imported_from(doc.editor.project()).map(|i| i.texture_set.to_owned());
-            if let Ok(set) = &set {
-                if ui
-                    .add_enabled(ready, egui::Button::new(format!("Replace {set} in the decomp…")))
-                    .on_disabled_hover_text(why_not)
+    /// A thumbnail of each texture, and under them one of each variant of
+    /// the texture shown.
+    fn texture_strip(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = &mut self.doc else { return };
+        let mut show = None;
+        let generation = doc.editor.generation();
+        let project = doc.editor.project();
+        ui.horizontal_wrapped(|ui| {
+            for (i, t) in project.textures().iter().enumerate() {
+                let r = VariantRef {
+                    texture: TextureId(i as u32),
+                    variant: doc.variants[i],
+                };
+                let picked = doc.selected == Some(r.texture);
+                let image = |ctx: &egui::Context| doc.previews.variant(ctx, project, generation, r);
+                if thumbnail(ui, THUMBNAIL, picked, image)
+                    .on_hover_text(texture_label(t))
                     .clicked()
                 {
-                    request = Some(Request::ExportInPlace);
+                    show = Some(r);
                 }
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.folder_set).desired_width(110.0));
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Export new set to folder…"))
-                        .on_hover_text("A new texture set, based on this villager, with the steps to add it")
-                        .clicked()
-                    {
-                        request = Some(Request::ExportToFolder);
-                    }
-                });
+            }
+            if let Some(texture) = doc.selected {
+                caption(ui, texture_label(project.texture(texture)));
             }
         });
-
-        egui::CollapsingHeader::new("Textures")
-            .default_open(true)
-            .show(ui, |ui| {
-                for (i, t) in doc.editor.project().textures().iter().enumerate() {
-                    let id = TextureId(i as u32);
-                    ui.horizontal(|ui| {
-                        let size = t.size();
-                        let external = matches!(t.content(), TextureContent::External { .. });
-                        let text = format!(
-                            "{} {}x{}{}",
-                            t.name,
-                            size.x,
-                            size.y,
-                            if external { " (external)" } else { "" }
-                        );
-                        if ui
-                            .selectable_value(&mut doc.selected, Some(id), text)
-                            .clicked()
-                        {
-                            doc.selection = Selection::default();
-                            self.texture_view.clear_pen();
-                        }
-                        let count = t.variants().len();
-                        if count > 1 {
-                            egui::ComboBox::from_id_salt(("variant", i))
-                                .width(40.0)
-                                .selected_text(&t.variants()[doc.variants[i]].name)
-                                .show_ui(ui, |ui| {
-                                    for (k, v) in t.variants().iter().enumerate() {
-                                        if ui
-                                            .selectable_value(&mut doc.variants[i], k, &v.name)
-                                            .changed()
-                                            && doc.selected == Some(id)
-                                        {
-                                            doc.selection = Selection::default();
-                                            self.texture_view.clear_pen();
-                                        }
-                                    }
-                                });
-                        }
-                    });
-                }
-            });
-
-        egui::CollapsingHeader::new("Paint")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for tool in Tool::ALL {
-                        if ui
-                            .selectable_label(self.tool == tool, tool.label())
-                            .clicked()
-                        {
-                            self.tool = tool;
-                            self.texture_view.clear_pen();
-                        }
+        let Some(texture) = doc.selected else { return };
+        let variants = project.texture(texture).variants();
+        if variants.len() > 1 {
+            let shown = doc.variants[texture.index()];
+            ui.horizontal_wrapped(|ui| {
+                for (variant, v) in variants.iter().enumerate() {
+                    let r = VariantRef { texture, variant };
+                    let image =
+                        |ctx: &egui::Context| doc.previews.variant(ctx, project, generation, r);
+                    if thumbnail(ui, THUMBNAIL, shown == variant, image)
+                        .on_hover_text(format!("Variant {}", v.name))
+                        .clicked()
+                    {
+                        show = Some(r);
                     }
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.paint.fill, true, "Fill");
-                    ui.radio_value(&mut self.paint.fill, false, "Stroke");
-                    ui.add(
-                        egui::DragValue::new(&mut self.paint.width)
-                            .range(0.1..=64.0)
-                            .speed(0.05)
-                            .suffix(" px"),
-                    )
-                    .on_hover_text("Stroke width, for strokes and the brush");
-                });
-                panels::palette(ui, &mut doc.editor, &mut self.paint, &mut self.refusal);
+                }
+                caption(ui, format!("variant {}", variants[shown].name));
             });
-
-        if let Some(r) = doc.variant() {
-            egui::CollapsingHeader::new("Layers")
-                .default_open(true)
-                .show(ui, |ui| {
-                    panels::layers(
-                        ui,
-                        &mut doc.editor,
-                        r,
-                        &mut doc.selection,
-                        &mut self.refusal,
-                    );
-                });
-            egui::CollapsingHeader::new("Shapes")
-                .default_open(true)
-                .show(ui, |ui| {
-                    panels::shapes(
-                        ui,
-                        &mut doc.editor,
-                        r,
-                        &mut doc.selection,
-                        self.paint,
-                        &mut self.refusal,
-                    );
-                });
         }
+        if let Some(r) = show {
+            self.show_variant(r);
+        }
+    }
 
-        egui::CollapsingHeader::new("View").show(ui, |ui| {
-            ui.checkbox(&mut self.linear_filter, "Smooth filtering (as in game)");
-            ui.checkbox(&mut self.show_uv, "UV layout in the Texture View");
-            ui.label(
-                "Texture View: scroll to zoom, middle-drag to pan, middle double-click to fit.",
-            );
+    /// The style bar, one row high whatever it holds, so the Texture View
+    /// under it stays put when shapes are picked. What doesn't fit scrolls
+    /// with the wheel, without a scroll bar, which would cover the controls.
+    fn style_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = &mut self.doc else { return };
+        ui.style_mut().always_scroll_the_only_direction = true;
+        egui::ScrollArea::horizontal()
+            .id_salt("style bar")
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let Some(variant) = doc.variant() else {
+                        ui.weak("An external texture is filled in by the game, and isn't painted.");
+                        return;
+                    };
+                    let mut target = Target::new(
+                        &mut doc.editor,
+                        variant,
+                        &mut doc.selection,
+                        &mut self.refusal,
+                    );
+                    panels::style_bar(ui, &mut target, &mut self.paint, self.tool);
+                });
+            });
+    }
+
+    fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        for tool in Tool::ALL {
+            let icon = icons::text(tool_icon(tool), icons::LARGE);
+            let button =
+                egui::Button::selectable(self.tool == tool, icon).min_size(egui::vec2(28.0, 28.0));
+            let hover = format!("{} ({})", tool.label(), tool.key().name());
+            if ui.add(button).on_hover_text(hover).clicked() {
+                self.set_tool(tool);
+            }
+        }
+    }
+
+    /// The Texture View under its texture strip and style bar, with the
+    /// tools at its left. `idle` is whether the controls take input.
+    fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool) {
+        ui.add_enabled_ui(idle, |ui| {
+            self.texture_strip(ui);
+            self.style_bar(ui);
         });
-        request
+        ui.separator();
+        let painted = self.doc.as_ref().is_some_and(|d| d.variant().is_some());
+        let rest = ui.available_rect_before_wrap();
+        let (tools, view) = rest.split_left_right_at_x(rest.left() + TOOLS_WIDTH);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(tools), |ui| {
+            ui.add_enabled_ui(idle && painted, |ui| self.tool_strip(ui));
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(view), |ui| {
+            self.texture_view(ui);
+        });
     }
 
     fn model_view(&mut self, ui: &mut egui::Ui) {
@@ -686,13 +941,14 @@ impl App {
             ui,
             Frame {
                 editor: &mut doc.editor,
+                previews: &mut doc.previews,
                 texture: t,
                 variant: doc.variants[t.index()],
                 tool: self.tool,
                 paint: self.paint,
                 selection: &mut doc.selection,
                 show_uv: self.show_uv,
-                input: self.confirm.is_none(),
+                input: self.dialog.is_none(),
                 message: &mut self.refusal,
             },
         );
@@ -700,52 +956,48 @@ impl App {
 
     /// Keyboard shortcuts that work anywhere outside text fields.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let command = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
-        let shift_command = |key| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key);
-        let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
+        let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
         // Text fields keep their own undo, and nothing changes the project
-        // under an open confirmation.
+        // under an open dialog.
         // Nor mid-drag, which would keep editing behind them.
-        if ctx.text_edit_focused() || self.confirm.is_some() || ctx.input(|i| i.pointer.any_down())
-        {
+        if ctx.text_edit_focused() || self.dialog.is_some() || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
-        if pressed(shift_command(Key::Z)) || pressed(command(Key::Y)) {
+        if pressed(&REDO) || pressed(&REDO_Y) {
             if let Some(d) = &mut self.doc {
                 d.redo();
             }
-        } else if pressed(command(Key::Z))
+        } else if pressed(&UNDO)
             && let Some(d) = &mut self.doc
         {
             d.undo();
         }
-        if pressed(command(Key::S)) && self.doc.is_some() {
+        if pressed(&SAVE) && self.doc.is_some() {
             self.save();
         }
-        if pressed(command(Key::D))
-            && let Some(d) = &mut self.doc
-            && let Some(r) = d.variant()
+        if pressed(&DUPLICATE)
+            && let Some(mut t) = self.target()
         {
-            panels::duplicate(&mut d.editor, r, &mut d.selection, &mut self.refusal);
+            panels::duplicate(&mut t);
         }
-        let tools = [
-            (Key::V, Tool::Select),
-            (Key::P, Tool::Pen),
-            (Key::B, Tool::Brush),
-            (Key::E, Tool::Ellipse),
-            (Key::R, Tool::Rectangle),
-        ];
-        for (key, tool) in tools {
-            if ctx.input(|i| i.key_pressed(key) && i.modifiers.is_none()) && self.tool != tool {
-                self.tool = tool;
-                self.texture_view.clear_pen();
+        for tool in Tool::ALL {
+            if ctx.input(|i| i.key_pressed(tool.key()) && i.modifiers.is_none()) {
+                self.set_tool(tool);
             }
         }
     }
 
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = &self.confirm else { return };
-        let (title, body, action) = match confirm {
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        match self.dialog.take() {
+            Some(Dialog::Confirm(confirm)) => self.confirm_dialog(ctx, confirm),
+            Some(Dialog::OpenDecomp { path, version }) => self.decomp_dialog(ctx, path, version),
+            Some(Dialog::ExportSet { name }) => self.export_set_dialog(ctx, name),
+            None => {}
+        }
+    }
+
+    fn confirm_dialog(&mut self, ctx: &egui::Context, confirm: Confirm) {
+        let (title, body, action) = match &confirm {
             Confirm::Discard(_) => (
                 "Discard changes?",
                 "The open project has unsaved changes.".to_owned(),
@@ -777,49 +1029,103 @@ impl App {
                 "Replace",
             ),
         };
-        let mut choice = None;
-        let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
-            ui.heading(title);
+        let choice = modal(ctx, title, action, true, |ui| {
             ui.label(body);
-            ui.horizontal(|ui| {
-                if ui.button(action).clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(false);
-                }
-            });
+            false
         });
-        // Escape or a click outside cancels.
-        if choice.is_none() && modal.should_close() {
-            choice = Some(false);
-        }
-        match choice {
-            Some(true) => match self.confirm.take() {
-                Some(Confirm::Discard(r)) => self.do_replace(r, ctx),
-                Some(Confirm::ReplaceInDecomp(export, _)) => {
-                    let result = self.decomp().map(|d| d.write_texture_set(&export));
-                    match result {
-                        Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
-                            Ok(()) => self.tell(format!(
-                                "Wrote {}; build with `python configure.py --non-matching && ninja`",
-                                path.display()
-                            )),
-                            Err(e) => self.fail(format!(
-                                "Wrote {}, but the import list couldn't be refreshed: {e}",
-                                path.display()
-                            )),
-                        },
-                        Some(Err(e)) => self.fail(e.to_string()),
-                        None => {}
-                    }
+        match (choice, confirm) {
+            (None, confirm) => self.dialog = Some(Dialog::Confirm(confirm)),
+            (Some(false), _) => {}
+            (Some(true), Confirm::Discard(r)) => self.do_replace(r, ctx),
+            (Some(true), Confirm::ReplaceInDecomp(export, _)) => {
+                let result = self.decomp().map(|d| d.write_texture_set(&export));
+                match result {
+                    Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
+                        Ok(()) => self.tell(format!(
+                            "Wrote {}; build with `python configure.py --non-matching && ninja`",
+                            path.display()
+                        )),
+                        Err(e) => self.fail(format!(
+                            "Wrote {}, but the import list couldn't be refreshed: {e}",
+                            path.display()
+                        )),
+                    },
+                    Some(Err(e)) => self.fail(e.to_string()),
+                    None => {}
                 }
-                Some(Confirm::SaveOver(dir)) => self.save_to(dir),
-                Some(Confirm::OverwriteFolder(dir)) => self.write_folder(&dir),
-                None => {}
+            }
+            (Some(true), Confirm::SaveOver(dir)) => self.save_to(dir),
+            (Some(true), Confirm::OverwriteFolder(dir)) => self.write_folder(&dir),
+        }
+    }
+
+    fn decomp_dialog(&mut self, ctx: &egui::Context, mut path: String, mut version: String) {
+        let filled = !path.trim().is_empty() && !version.trim().is_empty();
+        let choice = modal(ctx, "Open decomp", "Open", filled, |ui| {
+            let mut enter = false;
+            egui::Grid::new("decomp").num_columns(2).show(ui, |ui| {
+                ui.label("Checkout");
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut path)
+                            .hint_text("path to a built ac-decomp checkout")
+                            .desired_width(360.0),
+                    );
+                    focus_if_none(ui, &field);
+                    enter |= entered(ui, &field);
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Open decomp checkout")
+                            .pick_folder()
+                    {
+                        path = dir.display().to_string();
+                    }
+                });
+                ui.end_row();
+                ui.label("Game version");
+                let field = ui.add(egui::TextEdit::singleline(&mut version).desired_width(120.0));
+                enter |= entered(ui, &field);
+                ui.end_row();
+            });
+            enter
+        });
+        match choice {
+            Some(true) => {
+                self.decomp_path = path;
+                self.version = version;
+                self.open_decomp();
+                self.offer_import();
+            }
+            Some(false) => {}
+            None => self.dialog = Some(Dialog::OpenDecomp { path, version }),
+        }
+    }
+
+    fn export_set_dialog(&mut self, ctx: &egui::Context, mut name: String) {
+        let filled = !name.trim().is_empty();
+        let choice = modal(
+            ctx,
+            "Export new texture set",
+            "Choose folder…",
+            filled,
+            |ui| {
+                ui.label("A new texture set, based on this villager, with the steps to add it.");
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    let field = ui.add(egui::TextEdit::singleline(&mut name).desired_width(200.0));
+                    focus_if_none(ui, &field);
+                    entered(ui, &field)
+                })
+                .inner
             },
-            Some(false) => self.confirm = None,
-            None => {}
+        );
+        match choice {
+            Some(true) => {
+                self.folder_set = name;
+                self.export_to_folder();
+            }
+            Some(false) => {}
+            None => self.dialog = Some(Dialog::ExportSet { name }),
         }
     }
 
@@ -841,41 +1147,28 @@ impl eframe::App for App {
         // Closing the window with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm = Some(Confirm::Discard(Replace::Quit));
+            self.ask(Confirm::Discard(Replace::Quit));
         }
         // Controls wait while a canvas drag is in progress, so nothing (an
         // export, a save) acts on a drag that may still be cancelled.
         let idle = !self.texture_view.dragging();
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.add_enabled_ui(idle, |ui| self.top_bar(ui));
+        egui::Panel::top("menu").show(ui, |ui| {
+            ui.add_enabled_ui(idle, |ui| self.menu_bar(ui));
         });
-        egui::Panel::bottom("status").show(ui, |ui| match &self.status {
-            Some(Status::Error(e)) => {
-                ui.colored_label(Color32::from_rgb(255, 110, 110), e);
-            }
-            Some(Status::Info(m)) => {
-                ui.label(m);
-            }
-            None => {
-                ui.label(" ");
-            }
-        });
-        let request = egui::Panel::left("side")
-            .default_size(300.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .show(ui, |ui| {
-                        ui.add_enabled_ui(idle, |ui| self.side_panel(ui)).inner
-                    })
-                    .inner
-            })
-            .inner;
-        match request {
-            Some(Request::ExportInPlace) => self.export_in_place(),
-            Some(Request::ExportToFolder) => self.export_to_folder(),
-            None => {}
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.doc.is_some() {
+            egui::Panel::right("dock")
+                .default_size(240.0)
+                .size_range(200.0..=420.0)
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(idle, |ui| self.dock(ui));
+                });
         }
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.doc.is_none() {
+                ui.centered_and_justified(|ui| ui.weak(NOTHING_OPEN));
+                return;
+            }
             let full = ui.available_rect_before_wrap();
             let half = full.width() * 0.5;
             let left = egui::Rect::from_min_size(full.min, egui::vec2(half - 2.0, full.height()));
@@ -885,7 +1178,7 @@ impl eframe::App for App {
                 self.model_view(ui);
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                self.texture_view(ui);
+                self.texture_pane(ui, idle);
             });
         });
         if let Some(picker) = &mut self.picker
@@ -895,7 +1188,7 @@ impl eframe::App for App {
         }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
-        self.confirm_dialog(&ctx);
+        self.dialogs(&ctx);
         if let Some(refusal) = self.refusal.take() {
             self.fail(refusal);
         }

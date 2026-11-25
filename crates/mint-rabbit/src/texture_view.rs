@@ -1,14 +1,12 @@
 //! The Texture View: one texture variant, pixel-exact, with its shapes drawn
 //! as outlines and edited with the drawing tools.
 
-use eframe::egui::{
-    self, Color32, ColorImage, Key, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle,
-    TextureOptions, pos2, vec2,
-};
+use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use glam::{Affine2, Vec2};
 use mint_core::{Anchor, Layer, PaletteIndex, Project, Shape, Style, TextureId, VariantRef, shape};
 
 use crate::editor::Editor;
+use crate::previews::{Previews, checkerboard};
 use crate::scene;
 
 /// Pointer distance, in screen points, within which handles and outlines
@@ -44,6 +42,17 @@ impl Tool {
             Self::Brush => "Brush",
             Self::Ellipse => "Ellipse",
             Self::Rectangle => "Rectangle",
+        }
+    }
+
+    /// The key that switches to the tool.
+    pub fn key(self) -> Key {
+        match self {
+            Self::Select => Key::V,
+            Self::Pen => Key::P,
+            Self::Brush => Key::B,
+            Self::Ellipse => Key::E,
+            Self::Rectangle => Key::R,
         }
     }
 }
@@ -119,14 +128,6 @@ impl Selection {
     }
 }
 
-/// What the shown image is, so it is uploaded again only when it changes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ImageKey {
-    generation: u64,
-    texture: TextureId,
-    variant: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
     Point,
@@ -170,6 +171,7 @@ enum Drag {
 /// Everything the view needs from the app for one frame.
 pub struct Frame<'a> {
     pub editor: &'a mut Editor,
+    pub previews: &'a mut Previews,
     pub texture: TextureId,
     pub variant: usize,
     pub tool: Tool,
@@ -185,7 +187,6 @@ pub struct Frame<'a> {
 
 #[derive(Default)]
 pub struct TextureView {
-    cached: Option<(ImageKey, TextureHandle)>,
     /// Magnification over fitting the texture to the view.
     zoom: f32,
     /// Offset of the image from the view's center, in screen points.
@@ -195,6 +196,8 @@ pub struct TextureView {
     targets: (usize, Vec<usize>),
     /// Anchors of the pen path being drawn.
     pen: Vec<Anchor>,
+    /// Whether a text field had the keyboard when the view was last shown.
+    typing: bool,
 }
 
 /// Screen placement of the image: texture space to screen and back.
@@ -252,6 +255,11 @@ impl TextureView {
         if self.zoom == 0.0 {
             self.zoom = 1.0;
         }
+        // A key that ends a text field's edit, such as Enter or Escape, was
+        // typed into the field, though the field has let go of the keyboard
+        // by now.
+        let now = ui.ctx().text_edit_focused();
+        let typing = std::mem::replace(&mut self.typing, now) || now;
         let r = VariantRef {
             texture: f.texture,
             variant: f.variant,
@@ -261,13 +269,9 @@ impl TextureView {
         if editable {
             f.selection.fit(f.editor.project(), r);
         }
-        let handle = self.image(
-            ui,
-            f.editor.project(),
-            f.editor.generation(),
-            f.texture,
-            f.variant,
-        );
+        let handle = f
+            .previews
+            .variant(ui.ctx(), f.editor.project(), f.editor.generation(), r);
 
         // Clicks and drags without keyboard focus, which would stop the
         // app's keys.
@@ -284,7 +288,7 @@ impl TextureView {
 
         self.navigate(ui, &response, at);
         let painter = ui.painter_at(rect);
-        checkerboard(&painter, image, scale);
+        checkerboard(&painter, image, (scale * 2.0).max(8.0));
         painter.image(
             handle.id(),
             image,
@@ -308,7 +312,7 @@ impl TextureView {
             return;
         }
         if f.input {
-            self.interact(ui, &response, at, f, r);
+            self.interact(ui, &response, at, f, r, typing);
         } else {
             self.cancel_drag(f.editor);
             self.pen.clear();
@@ -316,37 +320,10 @@ impl TextureView {
         }
     }
 
-    /// The composited image of a variant as an egui texture.
-    fn image(
-        &mut self,
-        ui: &egui::Ui,
-        project: &Project,
-        generation: u64,
-        texture: TextureId,
-        variant: usize,
-    ) -> TextureHandle {
-        let key = ImageKey {
-            generation,
-            texture,
-            variant,
-        };
-        if let Some((k, h)) = &self.cached
-            && *k == key
-        {
-            return h.clone();
-        }
-        let tex = project.texture(texture);
-        let size = tex.size();
-        let pixels: Vec<Color32> = scene::texture_pixels(project, tex, variant)
-            .iter()
-            .map(|c| Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a))
-            .collect();
-        let image = ColorImage::new([size.x as usize, size.y as usize], pixels);
-        let h = ui
-            .ctx()
-            .load_texture("texture view", image, TextureOptions::NEAREST);
-        self.cached = Some((key, h.clone()));
-        h
+    /// Shows the whole texture, as large as fits the view.
+    pub fn fit(&mut self) {
+        self.zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
     }
 
     /// Zooms with the scroll wheel around the pointer, and pans with the
@@ -370,8 +347,7 @@ impl TextureView {
             self.pan += response.drag_delta();
         }
         if response.double_clicked_by(PointerButton::Middle) {
-            self.zoom = 1.0;
-            self.pan = egui::Vec2::ZERO;
+            self.fit();
         }
     }
 
@@ -382,6 +358,7 @@ impl TextureView {
         at: Placement,
         f: Frame<'_>,
         r: VariantRef,
+        typing: bool,
     ) {
         let Frame {
             editor,
@@ -505,10 +482,7 @@ impl TextureView {
 
         // Keys, while the view has the pointer.
         // Keys a text field is using are its own, and none act mid-drag.
-        if (response.hovered() || !self.pen.is_empty())
-            && !ui.ctx().text_edit_focused()
-            && self.drag.is_none()
-        {
+        if (response.hovered() || !self.pen.is_empty()) && !typing && self.drag.is_none() {
             let (enter, delete) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),
@@ -746,22 +720,6 @@ impl TextureView {
                     Color32::from_rgb(255, 120, 200),
                 );
             }
-        }
-    }
-}
-
-fn checkerboard(painter: &egui::Painter, image: Rect, scale: f32) {
-    let cell = (scale * 2.0).max(8.0);
-    let (cols, rows) = (
-        (image.width() / cell).ceil() as i32,
-        (image.height() / cell).ceil() as i32,
-    );
-    for y in 0..rows {
-        for x in 0..cols {
-            let shade = if (x + y) % 2 == 0 { 70 } else { 90 };
-            let min = image.min + vec2(x as f32, y as f32) * cell;
-            let r = Rect::from_min_max(min, (min + vec2(cell, cell)).min(image.max));
-            painter.rect_filled(r, 0.0, Color32::from_gray(shade));
         }
     }
 }
@@ -1174,7 +1132,7 @@ pub fn add_shape(
 
 /// Deletes the picked anchor, or the picked shapes. A shape's last anchor
 /// takes the shape with it.
-fn delete_selected(editor: &mut Editor, r: VariantRef, selection: &mut Selection) {
+pub fn delete_selected(editor: &mut Editor, r: VariantRef, selection: &mut Selection) {
     let layer = selection.layer;
     if editor
         .project()
