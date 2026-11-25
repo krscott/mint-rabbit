@@ -43,6 +43,12 @@ fn image(size: UVec2, f: impl Fn(u32, u32) -> u8) -> IndexedImage {
     IndexedImage::new(size, pixels).expect("size matches")
 }
 
+/// The center of pixel (`x`, `y`) in texels, so shapes drawn about a whole
+/// number land symmetric about it.
+fn pixel_center(x: u32, y: u32) -> Vec2 {
+    Vec2::new(x as f32, y as f32) + 0.5
+}
+
 fn quad(
     mesh: &mut Mesh,
     corners: [Vec3; 4],
@@ -90,7 +96,8 @@ fn main() {
             (0..8).map(|k| {
                 let r = 2.0 + k as f32 * 0.6;
                 let img = image(face_size, |x, y| {
-                    let d = |cx: f32| ((x as f32 - cx).powi(2) + (y as f32 - 8.0).powi(2)).sqrt();
+                    let p = pixel_center(x, y);
+                    let d = |cx: f32| p.distance(Vec2::new(cx, 8.0));
                     if d(8.0) < r || d(24.0) < r {
                         1
                     } else if d(8.0) < 5.5 || d(24.0) < 5.5 {
@@ -109,8 +116,9 @@ fn main() {
             face_size,
             (0..6).map(|k| {
                 let img = image(face_size, |x, y| {
-                    let curve = 6.0 + ((x as f32 - 16.0) / 6.0).powi(2) * (k as f32 - 2.5) * 0.4;
-                    if (y as f32 - curve).abs() < 1.2 && (6..26).contains(&x) {
+                    let p = pixel_center(x, y);
+                    let curve = 6.0 + ((p.x - 16.0) / 6.0).powi(2) * (k as f32 - 2.5) * 0.4;
+                    if (p.y - curve).abs() < 1.2 && (6..26).contains(&x) {
                         5
                     } else {
                         2
