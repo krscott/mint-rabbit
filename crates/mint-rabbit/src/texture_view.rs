@@ -1,9 +1,15 @@
 //! The Texture View: one texture variant, pixel-exact, with its shapes drawn
 //! as outlines and edited with the drawing tools.
 
-use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use eframe::egui::{
+    self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke,
+    pos2, vec2,
+};
 use glam::{Affine2, Vec2};
-use mint_core::{Anchor, Layer, PaletteIndex, Project, Shape, Style, TextureId, VariantRef, shape};
+use mint_core::{
+    Anchor, Layer, LayerKind, PaletteIndex, Project, Raster, Shape, Style, TextureId, VariantRef,
+    shape,
+};
 
 use crate::editor::Editor;
 use crate::previews::{Previews, checkerboard};
@@ -24,15 +30,21 @@ pub enum Tool {
     Brush,
     Ellipse,
     Rectangle,
+    Pencil,
+    Eraser,
+    Fill,
 }
 
 impl Tool {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Select,
         Self::Pen,
         Self::Brush,
         Self::Ellipse,
         Self::Rectangle,
+        Self::Pencil,
+        Self::Eraser,
+        Self::Fill,
     ];
 
     pub fn label(self) -> &'static str {
@@ -42,17 +54,45 @@ impl Tool {
             Self::Brush => "Brush",
             Self::Ellipse => "Ellipse",
             Self::Rectangle => "Rectangle",
+            Self::Pencil => "Pencil",
+            Self::Eraser => "Eraser",
+            Self::Fill => "Fill",
         }
     }
 
-    /// The key that switches to the tool.
-    pub fn key(self) -> Key {
+    /// The keys that switch to the tool.
+    pub fn shortcut(self) -> KeyboardShortcut {
+        let key = |key| KeyboardShortcut::new(Modifiers::NONE, key);
         match self {
-            Self::Select => Key::V,
-            Self::Pen => Key::P,
-            Self::Brush => Key::B,
-            Self::Ellipse => Key::E,
-            Self::Rectangle => Key::R,
+            Self::Select => key(Key::V),
+            Self::Pen => key(Key::P),
+            Self::Brush => key(Key::B),
+            Self::Ellipse => key(Key::E),
+            Self::Rectangle => key(Key::R),
+            Self::Pencil => key(Key::N),
+            Self::Eraser => KeyboardShortcut::new(Modifiers::SHIFT, Key::E),
+            Self::Fill => key(Key::G),
+        }
+    }
+
+    /// Whether the tool draws on a layer of `kind`. The shape tools paint
+    /// their finished shape into a raster layer's pixels.
+    pub fn works_on(self, kind: LayerKind) -> bool {
+        match self {
+            Self::Select | Self::Pen | Self::Ellipse | Self::Rectangle => true,
+            Self::Brush => kind == LayerKind::Vector,
+            Self::Pencil | Self::Eraser | Self::Fill => kind == LayerKind::Raster,
+        }
+    }
+
+    /// The tool to use on a layer of `kind`: this one if it works there,
+    /// else its counterpart for that kind, else Select.
+    pub fn on(self, kind: LayerKind) -> Self {
+        match self {
+            _ if self.works_on(kind) => self,
+            Self::Brush => Self::Pencil,
+            Self::Pencil => Self::Brush,
+            _ => Self::Select,
         }
     }
 }
@@ -161,6 +201,14 @@ enum Drag {
     },
     PenHandle,
     Brush(Vec<Vec2>),
+    /// Pencil or eraser pixels, painted with `value` as the pointer moves
+    /// on from `last`.
+    Pixels {
+        layer: usize,
+        last: Vec2,
+        value: Option<PaletteIndex>,
+        width: f32,
+    },
     Box {
         start: Vec2,
         end: Vec2,
@@ -316,7 +364,16 @@ impl TextureView {
         } else {
             self.cancel_drag(f.editor);
             self.pen.clear();
-            self.overlay(ui, f.editor.project(), r, f.selection, at, None, f.tool);
+            self.overlay(
+                ui,
+                f.editor.project(),
+                r,
+                f.selection,
+                at,
+                None,
+                f.tool,
+                f.paint,
+            );
         }
     }
 
@@ -410,6 +467,7 @@ impl TextureView {
                         editor,
                         selection,
                         r,
+                        tool,
                         vec![Anchor::corner(p)],
                         paint.style(false),
                         paint.color,
@@ -438,6 +496,9 @@ impl TextureView {
                         Some(k) if !shift => selection.anchor = Some(k),
                         _ => pick(editor.project(), r, selection, p, at, shift),
                     }
+                }
+                Tool::Pencil | Tool::Eraser | Tool::Fill => {
+                    press_pixels(editor, selection, r, tool, paint, p, None, message);
                 }
                 Tool::Ellipse | Tool::Rectangle => {}
             }
@@ -497,6 +558,7 @@ impl TextureView {
                     editor,
                     selection,
                     r,
+                    Tool::Pen,
                     anchors,
                     paint.style(false),
                     paint.color,
@@ -524,7 +586,7 @@ impl TextureView {
             }
         }
 
-        self.overlay(ui, editor.project(), r, selection, at, pointer, tool);
+        self.overlay(ui, editor.project(), r, selection, at, pointer, tool, paint);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -547,6 +609,22 @@ impl TextureView {
         }
         match tool {
             Tool::Brush => Some(Drag::Brush(vec![p])),
+            Tool::Pencil | Tool::Eraser => {
+                let edit = Some(CANVAS_DRAG);
+                press_pixels(editor, selection, r, tool, paint, p, edit, message).map(|layer| {
+                    Drag::Pixels {
+                        layer,
+                        last: p,
+                        value: pixel_value(tool, paint),
+                        width: paint.width,
+                    }
+                })
+            }
+            // A fill acts at once, where the press began.
+            Tool::Fill => {
+                press_pixels(editor, selection, r, tool, paint, p, None, message);
+                None
+            }
             Tool::Ellipse | Tool::Rectangle => Some(Drag::Box {
                 start: p,
                 end: p,
@@ -583,6 +661,7 @@ impl TextureView {
                 editor,
                 selection,
                 r,
+                Tool::Pen,
                 anchors,
                 paint.style(true),
                 paint.color,
@@ -607,6 +686,7 @@ impl TextureView {
         at: Placement,
         cursor: Option<Vec2>,
         tool: Tool,
+        paint: Paint,
     ) {
         let painter = ui.painter_at(at.view);
         let layers = project.variant(r).layers();
@@ -679,6 +759,22 @@ impl TextureView {
                         painter.rect_filled(Rect::from_center_size(p, vec2(6.0, 6.0)), 0.0, color);
                     }
                 }
+            }
+        }
+        // The pixels a pencil or eraser tip would cover.
+        if matches!(tool, Tool::Pencil | Tool::Eraser)
+            && let Some(p) = cursor
+        {
+            let shade = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+            let size = project.variant(r).size();
+            let inside = |&(x, y): &(i64, i64)| mint_core::texel_index(size, x, y).is_some();
+            for (x, y) in mint_core::pencil_tip(p, paint.width)
+                .into_iter()
+                .filter(inside)
+            {
+                let min = Vec2::new(x as f32, y as f32);
+                let rect = Rect::from_min_max(at.to_screen(min), at.to_screen(min + Vec2::ONE));
+                painter.rect_filled(rect, 0.0, shade);
             }
         }
         // Drawing in progress.
@@ -766,7 +862,8 @@ fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     o.covers(p) || o.distance(p) <= slack
 }
 
-/// Picks the topmost shape under `p` in a visible, unlocked layer, or with
+/// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
+/// set pixel of such a raster layer, at some opacity, covers it, or with
 /// `add`, adds or removes it from a selection in the same layer.
 fn pick(
     project: &Project,
@@ -777,19 +874,21 @@ fn pick(
     add: bool,
 ) {
     let layers = project.variant(r).layers();
-    let hit = layers
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, l)| l.visible && !l.locked)
-        .find_map(|(li, l)| {
-            l.shapes()
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, s)| hits(s, p, at.hit()))
-                .map(|(si, _)| (li, si))
-        });
+    let mut hit = None;
+    for (li, l) in layers.iter().enumerate().rev() {
+        if !l.visible || l.locked {
+            continue;
+        }
+        // Pixels painted over a shape hide it from picks too, unless their
+        // layer shows at no opacity.
+        if l.opacity > 0.0 && l.raster_pixels().is_some_and(|px| px.at(p).is_some()) {
+            break;
+        }
+        if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {
+            hit = Some((li, si));
+            break;
+        }
+    }
     match hit {
         Some((layer, shape)) if add && layer == selection.layer => {
             if let Some(k) = selection.shapes.iter().position(|&s| s == shape) {
@@ -1019,6 +1118,27 @@ fn continue_drag(
             }
         }
         Drag::Box { end, .. } => *end = p,
+        Drag::Pixels {
+            layer,
+            last,
+            value,
+            width,
+        } => {
+            if p == *last {
+                return;
+            }
+            let (from, layer, value, width) = (*last, *layer, *value, *width);
+            *last = p;
+            let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
+                if let Some(raster) = v
+                    .layers_mut()
+                    .get_mut(layer)
+                    .and_then(Layer::raster_pixels_mut)
+                {
+                    raster.draw_line(from, p, width, value);
+                }
+            });
+        }
     }
 }
 
@@ -1049,6 +1169,7 @@ fn finish_drag(
                 editor,
                 selection,
                 r,
+                Tool::Brush,
                 anchors,
                 paint.style(false),
                 paint.color,
@@ -1061,6 +1182,7 @@ fn finish_drag(
                 editor,
                 selection,
                 r,
+                tool,
                 box_anchors(tool, start, end),
                 style,
                 paint.color,
@@ -1080,12 +1202,115 @@ fn drawable(project: &Project, r: VariantRef, selection: &Selection) -> Result<(
     }
 }
 
-/// Adds a shape on top of the selected layer, creating a first layer if the
-/// variant has none, and picks it.
+/// What the pencil, eraser, or fill sets pixels to.
+fn pixel_value(tool: Tool, paint: Paint) -> Option<PaletteIndex> {
+    (tool != Tool::Eraser).then_some(paint.color)
+}
+
+/// Edits the picked layer with `f` for `tool`, or a new layer of the kind
+/// `tool` draws on if the variant has none, as a step of its own or as part
+/// of the continuous edit `continuous`, and picks that layer. Refuses a
+/// locked or hidden layer, or one `tool` doesn't draw on.
+fn edit_picked_layer<T>(
+    editor: &mut Editor,
+    selection: &mut Selection,
+    r: VariantRef,
+    tool: Tool,
+    continuous: Option<&str>,
+    f: impl FnOnce(&mut Layer) -> T,
+) -> Result<T, String> {
+    drawable(editor.project(), r, selection)?;
+    let layers = editor.project().variant(r).layers();
+    let layer = if layers.is_empty() {
+        0
+    } else {
+        selection.layer
+    };
+    if let Some(l) = layers.get(layer)
+        && !tool.works_on(l.kind())
+    {
+        let kind = match l.kind() {
+            LayerKind::Vector => "vector",
+            LayerKind::Raster => "raster",
+        };
+        let tool = tool.label().to_lowercase();
+        return Err(format!("The {tool} doesn't draw on {kind} layers."));
+    }
+    let edit = |v: &mut mint_core::Variant| {
+        if v.layers().is_empty() {
+            let first = if tool.works_on(LayerKind::Vector) {
+                Layer::new("Layer 1")
+            } else {
+                Layer::raster("Layer 1", Raster::clear(v.size()))
+            };
+            v.insert_layer(0, first);
+        }
+        f(&mut v.layers_mut()[layer])
+    };
+    let out = match continuous {
+        Some(key) => editor.edit_variant_continuous(key, r, edit),
+        None => editor.edit_variant(r, edit),
+    };
+    let out = out.map_err(|e| e.to_string())?;
+    selection.layer = layer;
+    Ok(out)
+}
+
+/// A pencil or eraser dot, or a fill, at `p` on the picked raster layer, as
+/// [`edit_picked_layer`] makes it. Returns the layer painted, or reports why
+/// it couldn't be. A click (with no `continuous` edit) that touches no pixel
+/// of the texture does nothing.
+#[allow(clippy::too_many_arguments)]
+fn press_pixels(
+    editor: &mut Editor,
+    selection: &mut Selection,
+    r: VariantRef,
+    tool: Tool,
+    paint: Paint,
+    p: Vec2,
+    continuous: Option<&str>,
+    message: &mut Option<String>,
+) -> Option<usize> {
+    let value = pixel_value(tool, paint);
+    // A click off the texture paints nothing, so it adds no first layer
+    // either. A drag that starts off it still paints where it enters.
+    let size = editor.project().variant(r).size();
+    // A fill starts from the pixel under `p`, a width-1 tip.
+    let width = if tool == Tool::Fill { 1.0 } else { paint.width };
+    let touches = mint_core::pencil_tip(p, width)
+        .iter()
+        .any(|&(x, y)| mint_core::texel_index(size, x, y).is_some());
+    if continuous.is_none() && !touches {
+        return None;
+    }
+    let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {
+        let Some(raster) = l.raster_pixels_mut() else {
+            return;
+        };
+        if tool == Tool::Fill {
+            raster.fill(p, value);
+        } else {
+            raster.draw_line(p, p, paint.width, value);
+        }
+    });
+    match painted {
+        Ok(()) => Some(selection.layer),
+        Err(why) => {
+            *message = Some(why);
+            None
+        }
+    }
+}
+
+/// Adds a shape drawn with `tool` on top of the picked layer, creating a
+/// first layer if the variant has none, and picks it. On a raster layer, the
+/// shape is painted into its pixels instead.
+#[allow(clippy::too_many_arguments)]
 pub fn add_shape(
     editor: &mut Editor,
     selection: &mut Selection,
     r: VariantRef,
+    tool: Tool,
     anchors: Vec<Anchor>,
     style: Style,
     color: PaletteIndex,
@@ -1098,35 +1323,20 @@ pub fn add_shape(
             return;
         }
     };
-    if let Err(why) = drawable(editor.project(), r, selection) {
-        *message = Some(why);
-        return;
-    }
-    let layers = editor.project().variant(r).layers();
-    let layer = if layers.is_empty() {
-        0
-    } else {
-        selection.layer
-    };
-    let result = editor.edit(|p| {
-        p.edit_variant(r, |v| {
-            if v.layers().is_empty() {
-                v.insert_layer(0, Layer::new("Layer 1"));
-            }
-            let l = &mut v.layers_mut()[layer];
-            l.insert_shape(l.shapes().len(), shape);
-            l.shapes().len() - 1
-        })
-    });
-    match result {
-        Ok(index) => {
-            *selection = Selection {
-                layer,
-                shapes: vec![index],
-                anchor: None,
-            };
+    let added = edit_picked_layer(editor, selection, r, tool, None, |l| {
+        if let Some(raster) = l.raster_pixels_mut() {
+            raster.paint_shape(&shape);
+            return None;
         }
-        Err(e) => *message = Some(e.to_string()),
+        l.insert_shape(l.shapes().len(), shape);
+        Some(l.shapes().len() - 1)
+    });
+    match added {
+        Ok(index) => {
+            selection.shapes = index.into_iter().collect();
+            selection.anchor = None;
+        }
+        Err(why) => *message = Some(why),
     }
 }
 
@@ -1241,4 +1451,106 @@ fn insert_anchor(
 fn cubic([p0, p1, p2, p3]: [Vec2; 4], t: f32) -> Vec2 {
     let u = 1.0 - t;
     u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::UVec2;
+    use mint_core::{ExportTarget, Model, Palette, Pose, Rgba8, Slot, Texture, Transform, Variant};
+
+    use super::*;
+
+    /// An editor on a project with one 4x4 texture whose one variant has
+    /// no layers.
+    fn layerless() -> (Editor, VariantRef) {
+        let size = UVec2::new(4, 4);
+        let texture =
+            Texture::painted("t", Slot("body".into()), size, [Variant::new("1", size)]).unwrap();
+        let project = Project::new(
+            ExportTarget::new("test"),
+            Palette::from_colors([Rgba8::new(0, 0, 0, 255)]).unwrap(),
+            Model::new("root", Transform::default()),
+            vec![texture],
+            Vec::new(),
+            Pose::default(),
+        )
+        .unwrap();
+        let r = VariantRef {
+            texture: TextureId(0),
+            variant: 0,
+        };
+        (Editor::new(project, None), r)
+    }
+
+    #[test]
+    fn clicks_off_the_texture_add_no_layer() {
+        let (mut editor, r) = layerless();
+        let (mut selection, mut message) = (Selection::default(), None);
+        let paint = Paint {
+            color: PaletteIndex(0),
+            fill: true,
+            width: 1.0,
+        };
+        let margin = Vec2::new(-0.5, 1.5);
+        for tool in [Tool::Pencil, Tool::Eraser, Tool::Fill] {
+            let pressed = press_pixels(
+                &mut editor,
+                &mut selection,
+                r,
+                tool,
+                paint,
+                margin,
+                None,
+                &mut message,
+            );
+            assert_eq!(pressed, None, "{tool:?}");
+        }
+        assert!(editor.project().variant(r).layers().is_empty());
+        assert!(!editor.can_undo());
+
+        // A wide tip hanging over the edge reaches the texture.
+        let wide = Paint {
+            width: 3.0,
+            ..paint
+        };
+        let pressed = press_pixels(
+            &mut editor,
+            &mut selection,
+            r,
+            Tool::Pencil,
+            wide,
+            margin,
+            None,
+            &mut message,
+        );
+        assert_eq!(pressed, Some(0));
+        let layers = editor.project().variant(r).layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].kind(), LayerKind::Raster);
+    }
+
+    #[test]
+    fn tools_follow_the_picked_layer_kind() {
+        use LayerKind::{Raster, Vector};
+        // Brush and Pencil trade places; tools with no counterpart fall
+        // back to Select; tools that draw on both kinds stay.
+        let cases = [
+            (Tool::Brush, Raster, Tool::Pencil),
+            (Tool::Pencil, Vector, Tool::Brush),
+            (Tool::Eraser, Vector, Tool::Select),
+            (Tool::Fill, Vector, Tool::Select),
+            (Tool::Pen, Raster, Tool::Pen),
+            (Tool::Ellipse, Raster, Tool::Ellipse),
+            (Tool::Rectangle, Vector, Tool::Rectangle),
+            (Tool::Select, Raster, Tool::Select),
+        ];
+        for (tool, kind, expected) in cases {
+            assert_eq!(tool.on(kind), expected, "{tool:?} on {kind:?}");
+        }
+        for tool in Tool::ALL {
+            for kind in [Vector, Raster] {
+                assert!(tool.on(kind).works_on(kind), "{tool:?} on {kind:?}");
+            }
+        }
+    }
 }

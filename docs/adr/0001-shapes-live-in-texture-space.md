@@ -1,11 +1,9 @@
-# Shapes live in texture space over an immutable underlay
+# Shapes live in texture space
 
 Shapes are stored in the texture space of the texture they belong to (its UV
 coordinates scaled by its pixel size, so one unit is one texel), not anchored
 to the mesh surface. Painting in the Model View raycasts to a UV coordinate,
 so both views edit the same data and export is plain rasterization.
-The imported underlay is never edited; every change is a vector shape on top of
-it, which keeps a single editing model and a single undo history.
 
 ## Consequences
 
@@ -22,4 +20,5 @@ it, which keeps a single editing model and a single undo history.
 
 Accepted for v1. Revisit if seam-crossing shapes become a real pain point; a
 surface-anchored representation projected into UV space is the main
-alternative.
+alternative. The imported image was first an immutable underlay beneath the
+shapes; ADR 0004 replaced it with raster layers.

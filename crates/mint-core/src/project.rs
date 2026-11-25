@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use glam::UVec2;
+
 use crate::{
-    Layer, Material, MaterialId, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Shape,
-    Texture, TextureId, Variant,
+    Material, MaterialId, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Texture,
+    TextureId, Variant,
 };
 
 /// The export target a project is built for: its id, such as `ac-villager`,
@@ -34,8 +36,10 @@ pub struct VariantRef {
 
 /// The editable document for one model.
 ///
-/// Every palette index in it, in underlays and shapes, refers to an entry of
-/// its palette; the editing methods keep it so.
+/// Every palette index in it, in raster layers and shapes, refers to an entry
+/// of its palette, and a project with painted textures has at least one
+/// entry, which pixels no visible layer covers take; the editing methods keep
+/// it so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     target: ExportTarget,
@@ -55,14 +59,18 @@ pub enum PaletteError {
     Full(#[from] PaletteFull),
     #[error("palette entry {0} cannot merge into itself")]
     SameEntry(u8),
+    #[error(
+        "palette entry 0 colors the pixels no visible layer covers in texture {texture:?} variant {variant:?}; cover them first, or merge another entry into entry 0"
+    )]
+    UncoveredPixels { texture: String, variant: String },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EditError {
     #[error("palette entry {index} does not exist; the palette has {len}")]
     MissingColor { index: u8, len: usize },
-    #[error("a variant's underlay is never edited")]
-    UnderlayChanged,
+    #[error("an image of {actual} can't go in a texture of {expected}")]
+    SizeMismatch { expected: UVec2, actual: UVec2 },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -75,6 +83,8 @@ pub enum ProjectError {
     MissingVertex { node: String, vertex: u32 },
     #[error("node {node:?} has a vertex following missing node {follows}")]
     MissingFollowedNode { node: String, follows: u32 },
+    #[error("the palette is empty, but painted textures need at least one entry")]
+    EmptyPalette,
     #[error(
         "texture {texture:?} variant {variant:?} uses palette entry {index}, but the palette has {len}"
     )]
@@ -84,10 +94,6 @@ pub enum ProjectError {
         index: u8,
         len: usize,
     },
-}
-
-fn shape_colors(v: &Variant) -> impl Iterator<Item = PaletteIndex> + '_ {
-    v.layers().iter().flat_map(Layer::shapes).map(Shape::color)
 }
 
 /// The first of `colors` that `palette` has no entry for.
@@ -109,12 +115,12 @@ impl Project {
         materials: Vec<Material>,
         pose: Pose,
     ) -> Result<Self, ProjectError> {
+        if palette.is_empty() && textures.iter().any(|t| !t.variants().is_empty()) {
+            return Err(ProjectError::EmptyPalette);
+        }
         for t in &textures {
             for v in t.variants() {
-                let pixels = v.underlay().pixels().iter().copied();
-                if let Some(PaletteIndex(index)) =
-                    missing_color(&palette, pixels.chain(shape_colors(v)))
-                {
+                if let Some(PaletteIndex(index)) = missing_color(&palette, v.colors()) {
                     return Err(ProjectError::MissingPaletteEntry {
                         texture: t.name.clone(),
                         variant: v.name.clone(),
@@ -219,10 +225,10 @@ impl Project {
         &self.textures[r.texture.index()].variants()[r.variant]
     }
 
-    /// Edits a variant's name, layers, and shapes with `f`. If the edit
-    /// changes the underlay, which is never edited, or leaves a shape using a
-    /// color the palette lacks, it is discarded and reported. Panics if `r` is
-    /// not a painted variant of this project.
+    /// Edits a variant's name, layers, shapes, and pixels with `f`. If the
+    /// edit leaves a raster layer of another size than the texture's, or a
+    /// shape or pixel using a color the palette lacks, it is discarded and
+    /// reported. Panics if `r` is not a painted variant of this project.
     pub fn edit_variant<T>(
         &mut self,
         r: VariantRef,
@@ -233,10 +239,11 @@ impl Project {
         // project as it was.
         let mut draft = variant.clone();
         let out = f(&mut draft);
-        if draft.underlay() != variant.underlay() {
-            return Err(EditError::UnderlayChanged);
+        let expected = variant.size();
+        if let Some(actual) = draft.size_mismatch(expected) {
+            return Err(EditError::SizeMismatch { expected, actual });
         }
-        if let Some(PaletteIndex(index)) = missing_color(&self.palette, shape_colors(&draft)) {
+        if let Some(PaletteIndex(index)) = missing_color(&self.palette, draft.colors()) {
             return Err(EditError::MissingColor {
                 index,
                 len: self.palette.len(),
@@ -273,7 +280,9 @@ impl Project {
     }
 
     /// Removes palette entry `from`, recoloring every pixel and shape that
-    /// used it with `into`. Later entries move down by one.
+    /// used it with `into`. Later entries move down by one. Entry 0 can't be
+    /// removed while it colors pixels that no visible layer covers, which
+    /// would take the next entry's color instead of `into`'s.
     pub fn merge_palette_color(
         &mut self,
         from: PaletteIndex,
@@ -284,17 +293,24 @@ impl Project {
         if from == into {
             return Err(PaletteError::SameEntry(from.0));
         }
+        if from == PaletteIndex(0) {
+            for t in &self.textures {
+                if let Some(v) = t.variants().iter().find(|v| v.has_uncovered()) {
+                    return Err(PaletteError::UncoveredPixels {
+                        texture: t.name.clone(),
+                        variant: v.name.clone(),
+                    });
+                }
+            }
+        }
         let remap = |i: PaletteIndex| {
             let i = if i == from { into } else { i };
             if i > from { PaletteIndex(i.0 - 1) } else { i }
         };
         for t in &mut self.textures {
             for v in t.variants_mut() {
-                v.underlay_mut().remap(remap);
                 for l in v.layers_mut() {
-                    for s in l.shapes_mut() {
-                        s.set_color(remap(s.color()));
-                    }
+                    l.remap(remap);
                 }
             }
         }
@@ -308,7 +324,7 @@ mod tests {
     use glam::{UVec2, Vec2};
 
     use super::*;
-    use crate::{IndexedImage, Slot, Style, Transform, shape};
+    use crate::{IndexedImage, Layer, Raster, Shape, Slot, Style, Transform, shape};
 
     const V: VariantRef = VariantRef {
         texture: TextureId(0),
@@ -323,9 +339,10 @@ mod tests {
             "body",
             Slot("body".into()),
             UVec2::new(2, 2),
-            [("1".to_owned(), img)],
+            [Variant::imported("1", img)],
         )
         .unwrap();
+        // Under the base layer, which is at 1.
         t.variants_mut()[0].insert_layer(0, Layer::new("paint"));
         Project::new(
             ExportTarget::new("test"),
@@ -379,12 +396,32 @@ mod tests {
         assert!(panicked.is_err());
         assert_eq!(p, before);
 
+        // Pixels are checked like shapes.
+        assert_eq!(
+            p.edit_variant(V, |v| {
+                let base = v.layers_mut()[1].raster_pixels_mut().unwrap();
+                base.fill(Vec2::splat(0.5), Some(PaletteIndex(2)));
+            }),
+            missing
+        );
+        // So are raster layer sizes.
+        assert_eq!(
+            p.edit_variant(V, |v| {
+                v.insert_layer(0, Layer::raster("small", Raster::clear(UVec2::ONE)));
+            }),
+            Err(EditError::SizeMismatch {
+                expected: UVec2::new(2, 2),
+                actual: UVec2::ONE,
+            })
+        );
+        assert_eq!(p, before);
+
         // Replacing the whole variant is checked too.
         let other = project(4, [3, 0, 0, 0]);
         let foreign = other.variant(V).clone();
         assert_eq!(
             p.edit_variant(V, |v| *v = foreign),
-            Err(EditError::UnderlayChanged)
+            Err(EditError::MissingColor { index: 3, len: 2 })
         );
         assert_eq!(p, before);
         let copy = project(2, [0; 4]).variant(V).clone();
@@ -412,6 +449,24 @@ mod tests {
     }
 
     #[test]
+    fn painted_textures_need_a_palette_entry() {
+        let p = project(1, [0; 4]);
+        let mut v = Variant::new("1", UVec2::new(2, 2));
+        v.insert_layer(0, Layer::new("empty"));
+        let t = Texture::painted("t", Slot("body".into()), UVec2::new(2, 2), [v]).unwrap();
+        let err = Project::new(
+            p.target().clone(),
+            Palette::default(),
+            p.model().clone(),
+            vec![t],
+            Vec::new(),
+            Pose::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ProjectError::EmptyPalette);
+    }
+
+    #[test]
     fn merge_recolors_and_renumbers() {
         let mut p = project(4, [0, 1, 2, 3]);
         p.edit_variant(V, |v| {
@@ -423,12 +478,12 @@ mod tests {
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(3))
             .unwrap();
         // 1 becomes 3; entries above 1 move down.
-        let px: Vec<u8> = p
-            .variant(V)
-            .underlay()
+        let px: Vec<u8> = p.variant(V).layers()[1]
+            .raster_pixels()
+            .unwrap()
             .pixels()
             .iter()
-            .map(|i| i.0)
+            .map(|i| i.unwrap().0)
             .collect();
         assert_eq!(px, [0, 2, 1, 2]);
         assert_eq!(shape_colors(&p), [1, 2, 2]);
@@ -443,6 +498,32 @@ mod tests {
         assert_eq!(
             p.merge_palette_color(PaletteIndex(3), PaletteIndex(0)),
             Err(PaletteError::Missing { index: 3, len: 3 })
+        );
+    }
+
+    #[test]
+    fn entry_0_stays_while_it_colors_uncovered_pixels() {
+        let mut p = project(3, [1, 1, 1, 1]);
+        // Hiding the base layer leaves every pixel to entry 0.
+        p.edit_variant(V, |v| v.layers_mut()[1].visible = false)
+            .unwrap();
+        let before = p.clone();
+        assert!(matches!(
+            p.merge_palette_color(PaletteIndex(0), PaletteIndex(2)),
+            Err(PaletteError::UncoveredPixels { .. })
+        ));
+        assert_eq!(p, before);
+        // Merging into entry 0 keeps it, so it is allowed.
+        assert_eq!(
+            p.merge_palette_color(PaletteIndex(2), PaletteIndex(0)),
+            Ok(())
+        );
+        // Once every pixel is covered, entry 0 can go.
+        p.edit_variant(V, |v| v.layers_mut()[1].visible = true)
+            .unwrap();
+        assert_eq!(
+            p.merge_palette_color(PaletteIndex(0), PaletteIndex(1)),
+            Ok(())
         );
     }
 

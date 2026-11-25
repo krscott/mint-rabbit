@@ -301,7 +301,7 @@ fn synthetic_villager_round_trips() {
     assert_eq!(canonical(&original), canonical(&again));
 }
 
-/// Export writes what the layers paint over the underlays, and hidden layers
+/// Export writes what the layers paint over the base layer, and hidden layers
 /// are left out.
 #[test]
 fn export_rasterizes_painted_layers() {
@@ -331,22 +331,25 @@ fn export_rasterizes_painted_layers() {
             PaletteIndex(5),
         ),
     ];
+    let base = p.variant(r).rasterize();
     p.edit_variant(r, |v| {
         for (i, s) in shapes.into_iter().enumerate() {
             let mut layer = Layer::new(format!("layer {i}"));
             layer.insert_shape(0, s.unwrap());
-            v.insert_layer(i, layer);
+            v.insert_layer(v.layers().len(), layer);
+            v.layers_mut().last_mut().unwrap().visible = i == 0;
         }
-        v.layers_mut()[1].visible = false;
     })
     .unwrap();
     let painted = p.variant(r).rasterize();
     let center = painted.pixel(size.x as u32 / 2, size.y as u32 / 2);
     assert_eq!(center, PaletteIndex(3));
-    assert_ne!(&painted, p.variant(r).underlay());
+    assert_ne!(painted, base);
 
+    // It comes back as the base layer alone.
     let again = reimport(&p, &pose);
-    assert_eq!(again.variant(r).underlay(), &painted);
+    assert_eq!(again.variant(r).layers().len(), 1);
+    assert_eq!(again.variant(r).rasterize(), painted);
     assert_eq!(canonical(&p), canonical(&again));
 }
 
@@ -385,7 +388,7 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
     p.edit_variant(r, |v| {
         let mut layer = Layer::new("paint");
         layer.insert_shape(0, dot.unwrap());
-        v.insert_layer(0, layer);
+        v.insert_layer(v.layers().len(), layer);
     })
     .unwrap();
     let painted = export_textures(&p, "t_1").unwrap();
@@ -395,7 +398,7 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
 
     let v = decomp.villagers().unwrap().remove(0);
     let again = decomp.import(&v).unwrap();
-    assert_eq!(again.variant(r).underlay(), &p.variant(r).rasterize());
+    assert_eq!(again.variant(r).rasterize(), p.variant(r).rasterize());
 
     // A folder export for a new texture set is checked against the base
     // villager's model too.
@@ -580,7 +583,7 @@ fn export_refuses_what_ac_villagers_cannot_hold() {
         "narrow",
         mint_core::Slot(crate::SLOT_BODY.into()),
         glam::UVec2::new(24, 8),
-        [("1".to_owned(), narrow)],
+        [mint_core::Variant::imported("1", narrow)],
     )
     .unwrap();
     let mut materials = p.materials().to_vec();

@@ -1,11 +1,11 @@
 # Palette-indexed color in the core
 
-Shapes and underlay pixels refer to entries in the project's palette instead of
-holding RGB values, even though the core is target-agnostic. The first target
-(Animal Crossing villagers) gives each villager one 16-color palette shared by
-every body, eye, and mouth texture, so colors must be chosen deliberately;
-quantizing free RGB at export would reorder and merge colors unpredictably.
-Indexed color also makes recolor variants a palette edit.
+Shapes and raster layer pixels refer to entries in the project's palette
+instead of holding RGB values, even though the core is target-agnostic. The
+first target (Animal Crossing villagers) gives each villager one 16-color
+palette shared by every body, eye, and mouth texture, so colors must be chosen
+deliberately; quantizing free RGB at export would reorder and merge colors
+unpredictably. Indexed color also makes recolor variants a palette edit.
 
 ## Consequences
 
