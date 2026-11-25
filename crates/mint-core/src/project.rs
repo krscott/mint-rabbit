@@ -59,6 +59,10 @@ pub enum PaletteError {
     Full(#[from] PaletteFull),
     #[error("palette entry {0} cannot merge into itself")]
     SameEntry(u8),
+    #[error(
+        "palette entry 0 colors the pixels no visible layer covers in texture {texture:?} variant {variant:?}; cover them first, or merge another entry into entry 0"
+    )]
+    UncoveredPixels { texture: String, variant: String },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -276,7 +280,9 @@ impl Project {
     }
 
     /// Removes palette entry `from`, recoloring every pixel and shape that
-    /// used it with `into`. Later entries move down by one.
+    /// used it with `into`. Later entries move down by one. Entry 0 can't be
+    /// removed while it colors pixels that no visible layer covers, which
+    /// would take the next entry's color instead of `into`'s.
     pub fn merge_palette_color(
         &mut self,
         from: PaletteIndex,
@@ -286,6 +292,16 @@ impl Project {
         self.check_color(into)?;
         if from == into {
             return Err(PaletteError::SameEntry(from.0));
+        }
+        if from == PaletteIndex(0) {
+            for t in &self.textures {
+                if let Some(v) = t.variants().iter().find(|v| v.has_uncovered()) {
+                    return Err(PaletteError::UncoveredPixels {
+                        texture: t.name.clone(),
+                        variant: v.name.clone(),
+                    });
+                }
+            }
         }
         let remap = |i: PaletteIndex| {
             let i = if i == from { into } else { i };
@@ -482,6 +498,32 @@ mod tests {
         assert_eq!(
             p.merge_palette_color(PaletteIndex(3), PaletteIndex(0)),
             Err(PaletteError::Missing { index: 3, len: 3 })
+        );
+    }
+
+    #[test]
+    fn entry_0_stays_while_it_colors_uncovered_pixels() {
+        let mut p = project(3, [1, 1, 1, 1]);
+        // Hiding the base layer leaves every pixel to entry 0.
+        p.edit_variant(V, |v| v.layers_mut()[1].visible = false)
+            .unwrap();
+        let before = p.clone();
+        assert!(matches!(
+            p.merge_palette_color(PaletteIndex(0), PaletteIndex(2)),
+            Err(PaletteError::UncoveredPixels { .. })
+        ));
+        assert_eq!(p, before);
+        // Merging into entry 0 keeps it, so it is allowed.
+        assert_eq!(
+            p.merge_palette_color(PaletteIndex(2), PaletteIndex(0)),
+            Ok(())
+        );
+        // Once every pixel is covered, entry 0 can go.
+        p.edit_variant(V, |v| v.layers_mut()[1].visible = true)
+            .unwrap();
+        assert_eq!(
+            p.merge_palette_color(PaletteIndex(0), PaletteIndex(1)),
+            Ok(())
         );
     }
 

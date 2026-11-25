@@ -624,22 +624,37 @@ impl Variant {
         self.layers.iter().flat_map(Layer::colors)
     }
 
-    /// The image the variant exports: each pixel takes the topmost visible
-    /// layer that covers it, or palette entry 0 where none does.
-    #[must_use]
-    pub fn rasterize(&self) -> IndexedImage {
-        let mut pixels =
-            vec![PaletteIndex(0); (u64::from(self.size.x) * u64::from(self.size.y)) as usize];
+    /// The palette entry of each pixel from the topmost visible layer that
+    /// covers it, or `None` where none does.
+    fn stacked(&self) -> Vec<Option<PaletteIndex>> {
+        let mut out = vec![None; (u64::from(self.size.x) * u64::from(self.size.y)) as usize];
         for layer in self.layers.iter().filter(|l| l.visible) {
-            for (px, c) in pixels.iter_mut().zip(layer.coverage(self.size)) {
-                if let Some(c) = c {
+            for (px, c) in out.iter_mut().zip(layer.coverage(self.size)) {
+                if c.is_some() {
                     *px = c;
                 }
             }
         }
+        out
+    }
+
+    /// Whether some pixel has no visible layer covering it, so that it takes
+    /// palette entry 0.
+    pub(crate) fn has_uncovered(&self) -> bool {
+        self.stacked().contains(&None)
+    }
+
+    /// The image the variant exports: each pixel takes the topmost visible
+    /// layer that covers it, or palette entry 0 where none does.
+    #[must_use]
+    pub fn rasterize(&self) -> IndexedImage {
+        let pixels = self
+            .stacked()
+            .into_iter()
+            .map(|c| c.unwrap_or(PaletteIndex(0)));
         IndexedImage {
             size: self.size,
-            pixels,
+            pixels: pixels.collect(),
         }
     }
 }

@@ -498,14 +498,7 @@ impl TextureView {
                     }
                 }
                 Tool::Pencil | Tool::Eraser | Tool::Fill => {
-                    let (tool, value) = (tool, pixel_value(tool, paint));
-                    let _ = paint_pixels(editor, selection, r, tool, None, message, |raster| {
-                        if tool == Tool::Fill {
-                            raster.fill(p, value);
-                        } else {
-                            raster.draw_line(p, p, paint.width, value);
-                        }
-                    });
+                    press_pixels(editor, selection, r, tool, paint, p, None, message);
                 }
                 Tool::Ellipse | Tool::Rectangle => {}
             }
@@ -617,24 +610,19 @@ impl TextureView {
         match tool {
             Tool::Brush => Some(Drag::Brush(vec![p])),
             Tool::Pencil | Tool::Eraser => {
-                let (value, width) = (pixel_value(tool, paint), paint.width);
                 let edit = Some(CANVAS_DRAG);
-                paint_pixels(editor, selection, r, tool, edit, message, |raster| {
-                    raster.draw_line(p, p, width, value);
-                })
-                .map(|layer| Drag::Pixels {
-                    layer,
-                    last: p,
-                    value,
-                    width,
+                press_pixels(editor, selection, r, tool, paint, p, edit, message).map(|layer| {
+                    Drag::Pixels {
+                        layer,
+                        last: p,
+                        value: pixel_value(tool, paint),
+                        width: paint.width,
+                    }
                 })
             }
             // A fill acts at once, where the press began.
             Tool::Fill => {
-                let value = pixel_value(tool, paint);
-                let _ = paint_pixels(editor, selection, r, tool, None, message, |raster| {
-                    raster.fill(p, value);
-                });
+                press_pixels(editor, selection, r, tool, paint, p, None, message);
                 None
             }
             Tool::Ellipse | Tool::Rectangle => Some(Drag::Box {
@@ -1262,22 +1250,29 @@ fn edit_picked_layer<T>(
     Ok(out)
 }
 
-/// Paints with `f` on the picked raster layer for `tool`, as
-/// [`edit_picked_layer`] does. Returns the layer painted, or reports why it
-/// couldn't be.
+/// A pencil or eraser dot, or a fill, at `p` on the picked raster layer, as
+/// [`edit_picked_layer`] makes it. Returns the layer painted, or reports why
+/// it couldn't be.
 #[allow(clippy::too_many_arguments)]
-fn paint_pixels(
+fn press_pixels(
     editor: &mut Editor,
     selection: &mut Selection,
     r: VariantRef,
     tool: Tool,
+    paint: Paint,
+    p: Vec2,
     continuous: Option<&str>,
     message: &mut Option<String>,
-    f: impl FnOnce(&mut Raster),
 ) -> Option<usize> {
+    let value = pixel_value(tool, paint);
     let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {
-        if let Some(raster) = l.raster_pixels_mut() {
-            f(raster);
+        let Some(raster) = l.raster_pixels_mut() else {
+            return;
+        };
+        if tool == Tool::Fill {
+            raster.fill(p, value);
+        } else {
+            raster.draw_line(p, p, paint.width, value);
         }
     });
     match painted {

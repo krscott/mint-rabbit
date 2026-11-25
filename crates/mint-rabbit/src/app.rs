@@ -922,13 +922,14 @@ impl App {
     /// The Texture View under its texture strip and style bar, with the
     /// tools at its left. `idle` is whether the controls take input.
     fn texture_pane(&mut self, ui: &mut egui::Ui, idle: bool) {
+        // After the dock, where the picked layer may have changed, and
+        // before the style bar, which shows the tool's settings.
+        self.fit_tool();
         ui.add_enabled_ui(idle, |ui| {
             self.texture_strip(ui);
             self.style_bar(ui);
         });
         ui.separator();
-        // After the dock, where the picked layer may have changed.
-        self.fit_tool();
         let painted = self.doc.as_ref().is_some_and(|d| d.variant().is_some());
         let rest = ui.available_rect_before_wrap();
         let (tools, view) = rest.split_left_right_at_x(rest.left() + TOOLS_WIDTH);
