@@ -570,8 +570,8 @@ impl Layer {
             pixels: shown.clone(),
         };
         let out = f(&mut edited);
-        if edited.written.len() != shown.len() {
-            edited.written.clear();
+        // A raster put in place of the given one tracks no writes.
+        if edited.written.is_empty() {
             *r = edited;
             return Some(out);
         }

@@ -1045,23 +1045,26 @@ fn pick(
     at: Placement,
     add: bool,
 ) {
-    let layers = project.variant(r).layers();
+    let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
+    let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
+    // A shape is under `p` near its outline, or covering the center of the
+    // pixel under `p`, as it covers pixels.
+    let center = p.floor() + Vec2::splat(0.5);
+    let under = |s: &Shape| hits(s, p, at.hit()) || (pixel.is_some() && s.outline().covers(center));
     let mut hit = None;
     for (li, l) in layers.iter().enumerate().rev() {
         if !l.visible {
             continue;
         }
         if !l.locked
-            && let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit()))
+            && let Some(si) = l.shapes().iter().rposition(under)
         {
             hit = Some((li, si));
             break;
         }
         // What the layer shows hides the layers under it, pixels and copies
         // alike, unless it shows at no opacity.
-        let size = project.variant(r).size();
-        let i = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
-        if l.opacity > 0.0 && i.is_some_and(|i| l.coverage(size)[i].is_some()) {
+        if l.opacity > 0.0 && pixel.is_some_and(|i| l.coverage(size)[i].is_some()) {
             break;
         }
     }
@@ -1769,6 +1772,63 @@ mod tests {
             .edit_variant(r, |v| v.layers_mut()[0].locked = true)
             .unwrap();
         assert!(guide_hit(editor.project(), r, 0, at, above).is_none());
+    }
+
+    #[test]
+    fn what_a_layer_shows_hides_the_shapes_beneath() {
+        use mint_core::{Axes, Mirror, Modifier};
+        let (mut editor, r) = layerless();
+        let square = |min: Vec2, max: Vec2| {
+            Shape::new(shape::rectangle(min, max), Style::Fill, PaletteIndex(0)).unwrap()
+        };
+        // Bottom: a shape over the whole texture. Top: a shape covering pixel
+        // (3, 0)'s center but not its left part, mirrored onto (0, 0).
+        editor
+            .edit_variant(r, |v| {
+                let mut bottom = Layer::new("bottom");
+                bottom.insert_shape(0, square(Vec2::ZERO, Vec2::splat(4.0)));
+                let mut top = Layer::new("top");
+                top.insert_shape(0, square(Vec2::new(3.4, 0.0), Vec2::new(4.0, 1.0)));
+                top.modifiers
+                    .push(Modifier::new(ModifierKind::Mirror(Mirror {
+                        axes: Axes::X,
+                        at: mint_core::HalfPoint { x: 4, y: 0 },
+                    })));
+                v.insert_layer(0, bottom);
+                v.insert_layer(1, top);
+            })
+            .unwrap();
+        let at = Placement {
+            view: Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0)),
+            image: Rect::from_min_size(pos2(20.0, 20.0), vec2(160.0, 160.0)),
+            scale: 40.0,
+        };
+        let picked = |e: &Editor, x: f32, y: f32| {
+            let mut s = Selection::default();
+            pick(e.project(), r, &mut s, Vec2::new(x, y), at, false);
+            s.single().map(|shape| (s.layer, shape))
+        };
+        let set = |e: &mut Editor, f: fn(&mut Layer)| {
+            e.edit_variant(r, |v| f(&mut v.layers_mut()[1])).unwrap();
+        };
+        // The top shape picks, and its copy hides the bottom shape.
+        assert_eq!(picked(&editor, 3.5, 0.5), Some((1, 0)));
+        assert_eq!(picked(&editor, 0.5, 0.5), None);
+        assert_eq!(picked(&editor, 2.5, 2.5), Some((0, 0)));
+        // A click off a shape's outline, on a pixel it covers, picks it.
+        assert_eq!(picked(&editor, 3.05, 0.5), Some((1, 0)));
+        // A locked layer still hides what is under it.
+        set(&mut editor, |l| l.locked = true);
+        assert_eq!(picked(&editor, 3.5, 0.5), None);
+        assert_eq!(picked(&editor, 0.5, 0.5), None);
+        // One at no opacity, or hidden, doesn't.
+        set(&mut editor, |l| l.opacity = 0.0);
+        assert_eq!(picked(&editor, 0.5, 0.5), Some((0, 0)));
+        set(&mut editor, |l| {
+            l.opacity = 1.0;
+            l.visible = false;
+        });
+        assert_eq!(picked(&editor, 0.5, 0.5), Some((0, 0)));
     }
 
     #[test]
