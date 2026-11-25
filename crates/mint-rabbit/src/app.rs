@@ -1021,9 +1021,14 @@ impl App {
         }
         let kind = self.picked_kind();
         for tool in Tool::ALL {
+            // The modifiers held with the key press itself, which a quick
+            // Shift+E can release before the frame's end.
             let keys = tool.shortcut();
             let pressed = ctx.input(|i| {
-                i.modifiers.matches_exact(keys.modifiers) && i.key_pressed(keys.logical_key)
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. }
+                        if *key == keys.logical_key && modifiers.matches_exact(keys.modifiers))
+                })
             });
             if pressed && kind.is_none_or(|k| tool.works_on(k)) {
                 self.set_tool(tool);
