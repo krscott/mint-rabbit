@@ -5,7 +5,7 @@ use eframe::egui::{
     self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke,
     pos2, vec2,
 };
-use glam::{Affine2, Vec2};
+use glam::{Affine2, UVec2, Vec2};
 use mint_core::{
     Anchor, Layer, LayerKind, ModifierKind, PaletteIndex, Project, Raster, Shape, Style, TextureId,
     VariantRef, shape,
@@ -1028,6 +1028,14 @@ fn box_anchors(tool: Tool, a: Vec2, b: Vec2) -> Vec<Anchor> {
 }
 
 /// Whether point `p` hits shape `s`, within `slack` texels of its path.
+/// Whether shape `s` is under texture point `p`: near its outline, or
+/// covering the center of the pixel of a texture of `size` under `p`, as it
+/// covers pixels.
+fn under(s: &Shape, p: Vec2, at: Placement, size: UVec2) -> bool {
+    let on_image = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64).is_some();
+    hits(s, p, at.hit()) || (on_image && s.outline().covers(p.floor() + Vec2::splat(0.5)))
+}
+
 fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     let o = s.outline();
     o.covers(p) || o.distance(p) <= slack
@@ -1047,17 +1055,14 @@ fn pick(
 ) {
     let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
     let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
-    // A shape is under `p` near its outline, or covering the center of the
-    // pixel under `p`, as it covers pixels.
-    let center = p.floor() + Vec2::splat(0.5);
-    let under = |s: &Shape| hits(s, p, at.hit()) || (pixel.is_some() && s.outline().covers(center));
+    let is_under = |s: &Shape| under(s, p, at, size);
     let mut hit = None;
     for (li, l) in layers.iter().enumerate().rev() {
         if !l.visible {
             continue;
         }
         if !l.locked
-            && let Some(si) = l.shapes().iter().rposition(under)
+            && let Some(si) = l.shapes().iter().rposition(is_under)
         {
             hit = Some((li, si));
             break;
@@ -1154,7 +1159,10 @@ fn start_select(
                 original: picked,
             });
         }
-        if picked.iter().any(|s| hits(s, p, at.hit())) {
+        if picked
+            .iter()
+            .any(|s| under(s, p, at, project.variant(r).size()))
+        {
             return Some(Drag::Move {
                 start: p,
                 original: picked,
