@@ -537,6 +537,7 @@ impl TextureView {
         if response.double_clicked()
             && tool == Tool::Select
             && let (Some(p), Some(s)) = (pointer, selection.single())
+            && guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)).is_none()
             && let Some(k) = insert_anchor(editor, r, selection.layer, s, p, at)
         {
             selection.anchor = Some(k);
@@ -1032,10 +1033,10 @@ fn hits(s: &Shape, p: Vec2, slack: f32) -> bool {
     o.covers(p) || o.distance(p) <= slack
 }
 
-/// Picks the topmost shape under `p` in a visible, unlocked layer, unless
-/// such a layer above it, at some opacity, shows a pixel there (painted, or
-/// a copy), or with `add`, adds or removes it from a selection in the same
-/// layer.
+/// Picks the topmost shape under `p` in a visible, unlocked layer, unless a
+/// visible layer above it, locked or not, shows a pixel there (painted, or a
+/// copy) at some opacity, or with `add`, adds or removes it from a selection
+/// in the same layer.
 fn pick(
     project: &Project,
     r: VariantRef,
@@ -1047,10 +1048,12 @@ fn pick(
     let layers = project.variant(r).layers();
     let mut hit = None;
     for (li, l) in layers.iter().enumerate().rev() {
-        if !l.visible || l.locked {
+        if !l.visible {
             continue;
         }
-        if let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit())) {
+        if !l.locked
+            && let Some(si) = l.shapes().iter().rposition(|s| hits(s, p, at.hit()))
+        {
             hit = Some((li, si));
             break;
         }
