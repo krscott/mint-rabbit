@@ -767,9 +767,7 @@ impl TextureView {
         {
             let shade = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
             let size = project.variant(r).size();
-            let inside = |&(x, y): &(i64, i64)| {
-                (0..i64::from(size.x)).contains(&x) && (0..i64::from(size.y)).contains(&y)
-            };
+            let inside = |&(x, y): &(i64, i64)| mint_core::texel_index(size, x, y).is_some();
             for (x, y) in mint_core::pencil_tip(p, paint.width)
                 .into_iter()
                 .filter(inside)
@@ -1260,7 +1258,8 @@ fn edit_picked_layer<T>(
 
 /// A pencil or eraser dot, or a fill, at `p` on the picked raster layer, as
 /// [`edit_picked_layer`] makes it. Returns the layer painted, or reports why
-/// it couldn't be.
+/// it couldn't be. A click (with no `continuous` edit) that touches no pixel
+/// of the texture does nothing.
 #[allow(clippy::too_many_arguments)]
 fn press_pixels(
     editor: &mut Editor,
@@ -1273,9 +1272,18 @@ fn press_pixels(
     message: &mut Option<String>,
 ) -> Option<usize> {
     let value = pixel_value(tool, paint);
-    // A fill off the texture has nothing to fill, and adds no first layer.
-    let size = editor.project().variant(r).size().as_vec2();
-    if tool == Tool::Fill && !(p.cmpge(Vec2::ZERO).all() && p.cmplt(size).all()) {
+    // A click off the texture paints nothing, so it adds no first layer
+    // either. A drag that starts off it still paints where it enters.
+    let size = editor.project().variant(r).size();
+    let touches = if tool == Tool::Fill {
+        let pixel = p.floor();
+        mint_core::texel_index(size, pixel.x as i64, pixel.y as i64).is_some()
+    } else {
+        let tip = mint_core::pencil_tip(p, paint.width);
+        tip.iter()
+            .any(|&(x, y)| mint_core::texel_index(size, x, y).is_some())
+    };
+    if continuous.is_none() && !touches {
         return None;
     }
     let painted = edit_picked_layer(editor, selection, r, tool, continuous, |l| {

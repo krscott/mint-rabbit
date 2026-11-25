@@ -247,9 +247,7 @@ impl Raster {
     }
 
     fn index(&self, x: i64, y: i64) -> Option<usize> {
-        let inside =
-            (0..i64::from(self.size.x)).contains(&x) && (0..i64::from(self.size.y)).contains(&y);
-        inside.then(|| (y * i64::from(self.size.x) + x) as usize)
+        texel_index(self.size, x, y)
     }
 
     /// Sets each pixel whose center `shape` covers to its color.
@@ -302,34 +300,19 @@ impl Raster {
         if old == value {
             return;
         }
-        let matches = |r: &Self, x: i64, y: i64| r.index(x, y).is_some_and(|i| r.pixels[i] == old);
-        // Scanline fill: each popped seed fills its whole run of the row,
-        // then queues one seed per run of matching pixels just above and
-        // below it, which keeps the queue small on any texture.
-        let mut seeds = vec![(x, y)];
-        while let Some((x, y)) = seeds.pop() {
-            if !matches(self, x, y) {
-                continue;
-            }
-            let (mut left, mut right) = (x, x);
-            while matches(self, left - 1, y) {
-                left -= 1;
-            }
-            while matches(self, right + 1, y) {
-                right += 1;
-            }
-            for fx in left..=right {
-                let i = self.index(fx, y).expect("the run is inside the raster");
-                self.pixels[i] = value;
-            }
+        // Scanline fill: each run of a row is filled as it is queued, so it
+        // is queued once, and runs are taken in the order queued, which
+        // keeps the queue to about a row's width of runs.
+        let mut runs = std::collections::VecDeque::new();
+        runs.push_back(self.fill_run(x, y, old, value));
+        while let Some((left, right, y)) = runs.pop_front() {
             for ny in [y - 1, y + 1] {
                 let mut fx = left;
                 while fx <= right {
-                    if matches(self, fx, ny) {
-                        seeds.push((fx, ny));
-                        while fx <= right && matches(self, fx, ny) {
-                            fx += 1;
-                        }
+                    if self.index(fx, ny).is_some_and(|i| self.pixels[i] == old) {
+                        let run = self.fill_run(fx, ny, old, value);
+                        fx = run.1 + 1;
+                        runs.push_back(run);
                     } else {
                         fx += 1;
                     }
@@ -338,11 +321,41 @@ impl Raster {
         }
     }
 
+    /// Sets the run of `old` pixels through `(x, y)` in its row to `value`,
+    /// returning its left and right ends and its row.
+    fn fill_run(
+        &mut self,
+        x: i64,
+        y: i64,
+        old: Option<PaletteIndex>,
+        value: Option<PaletteIndex>,
+    ) -> (i64, i64, i64) {
+        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.pixels[i] == old);
+        let (mut left, mut right) = (x, x);
+        while matches(self, left - 1) {
+            left -= 1;
+        }
+        while matches(self, right + 1) {
+            right += 1;
+        }
+        let start = self.index(left, y).expect("the run is inside the raster");
+        self.pixels[start..=start + (right - left) as usize].fill(value);
+        (left, right, y)
+    }
+
     pub(crate) fn remap(&mut self, f: impl Fn(PaletteIndex) -> PaletteIndex) {
         for p in self.pixels.iter_mut().flatten() {
             *p = f(*p);
         }
     }
+}
+
+/// The row-major index of pixel `(x, y)` of an image of `size`, or `None`
+/// outside it.
+#[must_use]
+pub fn texel_index(size: UVec2, x: i64, y: i64) -> Option<usize> {
+    let inside = (0..i64::from(size.x)).contains(&x) && (0..i64::from(size.y)).contains(&y);
+    inside.then(|| (y * i64::from(size.x) + x) as usize)
 }
 
 /// The whole pixels a pencil tip `width` texels wide (rounded, at least 1)
@@ -982,14 +995,14 @@ mod tests {
         for (x, y) in [(1, 1), (2, 1), (3, 1), (1, 2), (3, 2), (1, 3), (3, 3)] {
             r.pixels[y * 5 + x] = one;
         }
-        r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
+        // From the far corner, so runs extend left as well as right.
+        r.fill(Vec2::new(4.5, 3.5), Some(PaletteIndex(2)));
         let filled = px(&r).iter().filter(|&&p| p == Some(2)).count();
         // All 20 pixels but the 7 of the wall and the 2 it encloses.
         assert_eq!(filled, 11);
         assert_eq!(px(&r)[2 * 5 + 2], None);
         let before = r.clone();
         r.fill(Vec2::new(-1.0, 0.5), None);
-
         r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
         assert_eq!(r, before);
     }

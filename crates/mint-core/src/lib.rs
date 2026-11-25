@@ -15,5 +15,5 @@ pub use shape::{Anchor, Outline, Shape, ShapeError, Style};
 pub use texture::{
     AlphaMode, IndexedImage, Layer, LayerKind, Material, MaterialId, Palette, PaletteFull,
     PaletteIndex, PixelCountMismatch, Raster, Rgba8, RgbaImage, Slot, Texture, TextureContent,
-    TextureError, TextureId, Variant, Wrap, pencil_tip,
+    TextureError, TextureId, Variant, Wrap, pencil_tip, texel_index,
 };
