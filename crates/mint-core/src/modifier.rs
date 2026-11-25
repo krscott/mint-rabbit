@@ -350,9 +350,9 @@ pub(crate) fn stack(modifiers: &[Modifier]) -> Vec<Vec<Motion>> {
 }
 
 /// The pixels of an image of `size` that `stack` shows as the same as
-/// pixels in `from` (sorted): those it shows copies of there, and every
-/// pixel showing a copy of one of those, through copies on the image only,
-/// as the stack draws them. Leaves out `from`.
+/// pixels in `from`: those it shows copies of there, and every pixel showing
+/// a copy of one of those, through copies on the image only, as the stack
+/// draws them. Holds `from` too.
 pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, from: &[usize]) -> Vec<usize> {
     let inverses = stack
         .iter()
@@ -361,9 +361,7 @@ pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, from: &[usize]) -> Ve
     let sources = reach(inverses, size, from);
     let sources: Vec<usize> = (0..sources.len()).filter(|&j| sources[j]).collect();
     let shown = reach(stack.iter().cloned(), size, &sources);
-    (0..shown.len())
-        .filter(|&j| shown[j] && from.binary_search(&j).is_err())
-        .collect()
+    (0..shown.len()).filter(|&j| shown[j]).collect()
 }
 
 /// Which pixels of an image of `size` the pixels in `from` reach
@@ -613,29 +611,26 @@ mod tests {
     fn matching_pixels_follow_the_stack() {
         let size = UVec2::new(4, 4);
         let ms = [mirror(Axes::X, 4, 0), mirror(Axes::Y, 0, 4)];
-        assert_eq!(matches(&ms, size, 0), [3, 12, 15]);
+        assert_eq!(matches(&ms, size, 0), [0, 3, 12, 15]);
         let mut off = ms;
         off[1].enabled = false;
-        assert_eq!(matches(&off, size, 0), [3]);
+        assert_eq!(matches(&off, size, 0), [0, 3]);
         // Copies off the image don't count.
-        assert_eq!(
-            matches(&[mirror(Axes::X, 2, 0)], size, 2),
-            Vec::<usize>::new()
-        );
+        assert_eq!(matches(&[mirror(Axes::X, 2, 0)], size, 2), [2]);
         // Mirrors on different lines reach only what one pass through the
         // stack shows, and the way back.
         let size = UVec2::new(8, 1);
         let ms = [mirror(Axes::X, 4, 0), mirror(Axes::X, 6, 0)];
-        assert_eq!(matches(&ms, size, 0), [2, 3, 5]);
+        assert_eq!(matches(&ms, size, 0), [0, 2, 3, 5]);
         // Pixels showing copies of the same pixel match each other too.
-        assert_eq!(matches(&ms, size, 5), [0, 2, 3]);
+        assert_eq!(matches(&ms, size, 5), [0, 2, 3, 5]);
         // Several pixels match what each matches.
-        assert_eq!(matching(&stack(&ms), size, &[0, 7]), [2, 3, 5]);
+        assert_eq!(matching(&stack(&ms), size, &[0, 7]), [0, 2, 3, 5, 7]);
         // A copy cut off at the edge carries nothing on to later modifiers.
         let ms = [mirror(Axes::X, 2, 0), mirror(Axes::X, 6, 0)];
-        assert_eq!(matches(&ms, size, 2), [3]);
+        assert_eq!(matches(&ms, size, 2), [2, 3]);
         // Repeated modifiers add nothing new.
         let ms = [mirror(Axes::Both, 4, 4); 13];
-        assert_eq!(matches(&ms, UVec2::new(4, 4), 0), [3, 12, 15]);
+        assert_eq!(matches(&ms, UVec2::new(4, 4), 0), [0, 3, 12, 15]);
     }
 }

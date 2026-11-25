@@ -488,15 +488,18 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
                             } else {
                                 None
                             };
-                            let what = match kind {
-                                LayerKind::Vector => "shapes",
-                                LayerKind::Raster => "pixels",
+                            let hover = match kind {
+                                LayerKind::Vector => {
+                                    "Write its copies into the layer as shapes and remove \
+                                     it; whole shapes can show parts the copies cut off"
+                                }
+                                LayerKind::Raster => {
+                                    "Write its copies into the layer and remove it"
+                                }
                             };
                             let apply = ui
                                 .add_enabled(refusal.is_none(), egui::Button::new("Apply"))
-                                .on_hover_text(format!(
-                                    "Write its copies into the layer as {what} and remove it"
-                                ))
+                                .on_hover_text(hover)
                                 .on_disabled_hover_text(refusal.unwrap_or_default());
                             if apply.clicked() {
                                 apply_first_modifier(t);

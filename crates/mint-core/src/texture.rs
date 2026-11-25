@@ -216,6 +216,10 @@ pub enum TextureContent {
 pub struct Raster {
     size: UVec2,
     pixels: Vec<Option<PaletteIndex>>,
+    /// While [`Layer::edit_raster`] edits a copy of the raster, which pixels
+    /// its tools have written, whether or not that changed them; otherwise
+    /// empty.
+    written: Vec<bool>,
 }
 
 impl Raster {
@@ -227,16 +231,21 @@ impl Raster {
                 len: pixels.len(),
             });
         }
-        Ok(Self { size, pixels })
+        Ok(Self {
+            size,
+            pixels,
+            written: Vec::new(),
+        })
     }
 
     /// A raster of `size` with no pixels set.
     #[must_use]
     pub fn clear(size: UVec2) -> Self {
-        Self {
+        Self::new(
             size,
-            pixels: vec![None; (u64::from(size.x) * u64::from(size.y)) as usize],
-        }
+            vec![None; (u64::from(size.x) * u64::from(size.y)) as usize],
+        )
+        .expect("the pixel count fits the size")
     }
 
     #[must_use]
@@ -261,9 +270,18 @@ impl Raster {
         texel_index(self.size, x, y)
     }
 
+    /// Writes `value` to pixel `i`.
+    fn write(&mut self, i: usize, value: Option<PaletteIndex>) {
+        self.pixels[i] = value;
+        if let Some(w) = self.written.get_mut(i) {
+            *w = true;
+        }
+    }
+
     /// Sets each pixel whose center `shape` covers to its color.
     pub fn paint_shape(&mut self, shape: &Shape) {
-        covered_pixels(shape, self.size, |i| self.pixels[i] = Some(shape.color()));
+        let size = self.size;
+        covered_pixels(shape, size, |i| self.write(i, Some(shape.color())));
     }
 
     /// Sets the pixels a pencil `width` texels wide covers from `from` to
@@ -281,7 +299,7 @@ impl Raster {
         loop {
             for &(ox, oy) in &tip {
                 if let Some(i) = self.index(x + ox, y + oy) {
-                    self.pixels[i] = value;
+                    self.write(i, value);
                 }
             }
             if (x, y) == (x1, y1) {
@@ -353,7 +371,9 @@ impl Raster {
             right += 1;
         }
         let start = self.index(left, y).expect("the run is inside the raster");
-        self.pixels[start..=start + (right - left) as usize].fill(value);
+        for i in start..=start + (right - left) as usize {
+            self.write(i, value);
+        }
         (left, right, y)
     }
 
@@ -422,6 +442,7 @@ impl From<IndexedImage> for Raster {
         Self {
             size: image.size,
             pixels: image.pixels.into_iter().map(Some).collect(),
+            written: Vec::new(),
         }
     }
 }
@@ -517,7 +538,8 @@ impl Layer {
 
     /// Edits a raster layer with `f`, returning its result, or `None` for a
     /// vector layer. With modifiers on, `f` edits the pixels the layer shows,
-    /// copies included, and each pixel it changes is stored at that pixel.
+    /// copies included, and each pixel it writes is stored at that pixel,
+    /// even with the value it showed.
     /// The change also reaches every pixel the modifiers show as the same
     /// one: a cleared pixel clears them all, so no copy of it is left, and a
     /// set pixel recolors those the layer holds, while those it doesn't
@@ -535,13 +557,14 @@ impl Layer {
         };
         let mut edited = Raster {
             size,
-            pixels: shown.clone(),
+            written: vec![false; shown.len()],
+            pixels: shown,
         };
         let out = f(&mut edited);
-        // Changed pixels by their new value, which the tools make one.
+        // Written pixels by their value, which the tools make one.
         let mut changes: Vec<(Option<PaletteIndex>, Vec<usize>)> = Vec::new();
-        for (i, (&was, &now)) in shown.iter().zip(&edited.pixels).enumerate() {
-            if was == now {
+        for (i, &now) in edited.pixels.iter().enumerate() {
+            if !edited.written[i] {
                 continue;
             }
             r.pixels[i] = now;
@@ -613,7 +636,11 @@ impl Layer {
     fn rasterize(&mut self, size: UVec2) {
         if let LayerContent::Vector(shapes) = &self.content {
             let pixels = shape_coverage(shapes, size);
-            self.content = LayerContent::Raster(Raster { size, pixels });
+            self.content = LayerContent::Raster(Raster {
+                size,
+                pixels,
+                written: Vec::new(),
+            });
         }
     }
 
@@ -1099,6 +1126,12 @@ mod tests {
         assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("52.4", "5224"));
         dot(&mut l, 3.5, Some(7));
         assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("72.7", "7227"));
+
+        // Painting a pixel the color it has still reaches matching pixels.
+        let mut l = raster_layer(&["1..2"]);
+        l.modifiers.push(mirror_x(4));
+        dot(&mut l, 0.5, Some(1));
+        assert_eq!(stored(&l), "1..1");
 
         // Fill stops at copies.
         let mut l = raster_layer(&["1.1...."]);

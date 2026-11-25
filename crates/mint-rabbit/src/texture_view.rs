@@ -219,11 +219,13 @@ enum Drag {
         end: Vec2,
         tool: Tool,
     },
-    /// A modifier guide of layer `layer` being moved.
+    /// A modifier guide of layer `layer` being moved, `offset` texels from
+    /// the pointer along its axis, as where it was grabbed.
     Guide {
         layer: usize,
         modifier: usize,
         part: GuidePart,
+        offset: f32,
     },
 }
 
@@ -647,10 +649,14 @@ impl TextureView {
     ) -> Option<Drag> {
         // Any tool moves the picked layer's modifier guides.
         if let Some(h) = guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)) {
+            let axis = h.part as usize;
+            let kind =
+                editor.project().variant(r).layers()[selection.layer].modifiers[h.modifier].kind;
             return Some(Drag::Guide {
                 layer: selection.layer,
                 modifier: h.modifier,
                 part: h.part,
+                offset: kind.guides().0.to_vec2()[axis] - p[axis],
             });
         }
         if matches!(tool, Tool::Brush | Tool::Ellipse | Tool::Rectangle)
@@ -1286,17 +1292,17 @@ fn continue_drag(
             layer,
             modifier,
             part,
+            offset,
         } => {
             let size = editor.project().variant(r).size();
-            let (layer, modifier, part) = (*layer, *modifier, *part);
+            let (layer, modifier, axis, offset) = (*layer, *modifier, *part as usize, *offset);
             let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
                 if let Some(m) = v
                     .layers_mut()
                     .get_mut(layer)
                     .and_then(|l| l.modifiers.get_mut(modifier))
                 {
-                    let axis = part as usize;
-                    m.kind = m.kind.with_coordinate(axis, p[axis], size);
+                    m.kind = m.kind.with_coordinate(axis, p[axis] + offset, size);
                 }
             });
         }
@@ -1699,6 +1705,7 @@ mod tests {
                 layer: 0,
                 modifier,
                 part,
+                offset: 0.0,
             };
             continue_drag(e, &mut d, &(0, Vec::new()), r, p, &mut [], false);
         };
