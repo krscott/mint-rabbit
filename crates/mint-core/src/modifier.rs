@@ -1,14 +1,12 @@
 //! Modifiers: steps of a layer's stack that change what the layer shows and
 //! exports without changing the shapes or pixels it holds.
 //!
-//! Mirror and Radial add copies of the layer's content: of a vector layer's
-//! shapes, or of the pixels a raster layer holds. Copies draw beneath the
-//! content they copy, and a later copy over an earlier one, so a pixel the
-//! content covers keeps its value. Their lines and centers lie on the
-//! half-texel grid within the texture, where reflections and turns carry
-//! each pixel exactly onto another, so copying shapes covers the same pixels
-//! as copying the pixels they cover, except where shapes reach past the
-//! texture's edge or a pixel center lies exactly on a shape's edge.
+//! Mirror and Radial add copies of the pixels a layer covers, whether it
+//! holds shapes or pixels. Copies draw beneath the content they copy, and a
+//! later copy over an earlier one, so a pixel the content covers keeps its
+//! value; a copy that leaves the image is gone, also for later modifiers.
+//! Their lines and centers lie on the half-texel grid within the texture,
+//! where reflections and turns carry each pixel exactly onto another.
 
 use glam::{Affine2, Mat2, UVec2, Vec2};
 
@@ -319,7 +317,11 @@ impl Modifier {
         out
     }
 
-    /// `shapes` with the modifier's copies beneath them, as shapes.
+    /// `shapes` with the modifier's copies beneath them, as shapes. Unlike
+    /// [`Self::apply_pixels`] on the pixels they cover, these copy whole
+    /// shapes, so they can bring parts from past the texture's edge into
+    /// view, and a pixel center lying exactly on a copied shape's edge can
+    /// fall the other way.
     pub(crate) fn apply_shapes(self, shapes: &[Shape]) -> Vec<Shape> {
         let mut out = Vec::new();
         for c in self.copies() {
@@ -344,36 +346,48 @@ pub(crate) fn stack(modifiers: &[Modifier]) -> Vec<Vec<Motion>> {
         .collect()
 }
 
-/// The pixels of an image of `size` where `stack` shows a copy of pixel `i`
-/// and those it shows copies of at `i`, through copies on the image only, as
-/// the stack draws them. Leaves out `i`.
-pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, i: usize) -> Vec<usize> {
-    let walk = |steps: &mut dyn Iterator<Item = Vec<Motion>>| {
-        let mut reached = vec![i];
-        for copies in steps {
-            for k in 0..reached.len() {
-                for c in &copies {
-                    if let Some(j) = c.pixel(size, reached[k])
-                        && !reached.contains(&j)
-                    {
-                        reached.push(j);
-                    }
-                }
-            }
-        }
-        reached
-    };
-    let mut out = walk(&mut stack.iter().cloned());
-    out.extend(walk(
-        &mut stack
+/// The pixels of an image of `size` where `stack` shows copies of pixels
+/// in `from` (sorted), and those it shows copies of at pixels in `from`,
+/// through copies on the image only, as the stack draws them. Leaves out
+/// `from`.
+pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, from: &[usize]) -> Vec<usize> {
+    let forward = reach(stack.iter().cloned(), size, from);
+    let backward = reach(
+        stack
             .iter()
             .rev()
             .map(|copies| copies.iter().map(|c| c.inverse()).collect()),
-    ));
-    out.sort_unstable();
-    out.dedup();
-    out.retain(|&j| j != i);
+        size,
+        from,
+    );
+    let mut out: Vec<usize> = (0..forward.len())
+        .filter(|&j| forward[j] || backward[j])
+        .collect();
+    out.retain(|j| from.binary_search(j).is_err());
     out
+}
+
+/// Which pixels of an image of `size` the pixels in `from` (sorted) reach
+/// when each step of `steps` adds its motions' images of the pixels reached
+/// so far that land on the image.
+fn reach(steps: impl Iterator<Item = Vec<Motion>>, size: UVec2, from: &[usize]) -> Vec<bool> {
+    let mut seen = vec![false; (u64::from(size.x) * u64::from(size.y)) as usize];
+    for &i in from {
+        seen[i] = true;
+    }
+    let mut reached = from.to_vec();
+    for motions in steps {
+        for k in 0..reached.len() {
+            for m in &motions {
+                if let Some(j) = m.pixel(size, reached[k])
+                    && !std::mem::replace(&mut seen[j], true)
+                {
+                    reached.push(j);
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// A rigid motion of texture space that carries pixels onto pixels: a point
@@ -593,7 +607,7 @@ mod tests {
     }
 
     fn matches(ms: &[Modifier], size: UVec2, i: usize) -> Vec<usize> {
-        matching(&stack(ms), size, i)
+        matching(&stack(ms), size, &[i])
     }
 
     #[test]

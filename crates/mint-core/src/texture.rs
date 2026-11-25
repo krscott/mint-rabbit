@@ -538,12 +538,20 @@ impl Layer {
             pixels: shown.clone(),
         };
         let out = f(&mut edited);
+        // Changed pixels by their new value, which the tools make one.
+        let mut changes: Vec<(Option<PaletteIndex>, Vec<usize>)> = Vec::new();
         for (i, (&was, &now)) in shown.iter().zip(&edited.pixels).enumerate() {
             if was == now {
                 continue;
             }
             r.pixels[i] = now;
-            for j in modifier::matching(&stack, size, i) {
+            match changes.iter_mut().find(|(v, _)| *v == now) {
+                Some((_, pixels)) => pixels.push(i),
+                None => changes.push((now, vec![i])),
+            }
+        }
+        for (now, pixels) in changes {
+            for j in modifier::matching(&stack, size, &pixels) {
                 if now.is_none() || r.pixels[j].is_some() {
                     r.pixels[j] = now;
                 }
@@ -581,30 +589,27 @@ impl Layer {
 
     /// The palette entry each pixel of an image of `size` takes from this
     /// layer, row-major, after its enabled modifiers: for a vector layer,
-    /// from the topmost shape or copied shape covering its center, or `None`
-    /// where nothing does. Visibility and opacity are not applied. A raster
-    /// layer must be of `size`.
+    /// from the topmost shape covering its center or a copy of such a pixel,
+    /// or `None` where nothing does. Visibility and opacity are not applied.
+    /// A raster layer must be of `size`.
     #[must_use]
     pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
-        let on = || self.modifiers.iter().filter(|m| m.enabled);
-        match &self.content {
-            LayerContent::Vector(shapes) if on().next().is_some() => {
-                let copied = on().fold(shapes.clone(), |s, m| m.apply_shapes(&s));
-                shape_coverage(&copied, size)
-            }
+        let held = match &self.content {
             LayerContent::Vector(shapes) => shape_coverage(shapes, size),
             LayerContent::Raster(r) => {
                 debug_assert_eq!(r.size, size);
-                on().fold(r.pixels.clone(), |px, m| m.apply_pixels(size, &px))
+                r.pixels.clone()
             }
-        }
+        };
+        self.modifiers
+            .iter()
+            .filter(|m| m.enabled)
+            .fold(held, |px, m| m.apply_pixels(size, &px))
     }
 
     /// Turns a vector layer into a raster layer of `size` holding the
-    /// pixels its shapes cover, keeping its modifiers, which then copy those
-    /// pixels: what shows can change where shapes reach past the texture's
-    /// edge or a pixel center lies exactly on a copied shape's edge. A raster
-    /// layer stays as it is.
+    /// pixels its shapes cover, keeping its modifiers. A raster layer stays
+    /// as it is.
     fn rasterize(&mut self, size: UVec2) {
         if let LayerContent::Vector(shapes) = &self.content {
             let pixels = shape_coverage(shapes, size);
@@ -614,8 +619,10 @@ impl Layer {
 
     /// Writes the first modifier's copies into the layer, as shapes or
     /// pixels, and removes the modifier, whether or not it is enabled.
-    /// Copied shapes go beneath the shapes they copy. Does nothing without
-    /// modifiers.
+    /// Copied shapes go beneath the shapes they copy; being whole shapes,
+    /// they can show more than the copied pixels did, from parts past the
+    /// texture's edge or pixel centers lying exactly on their edges. Does
+    /// nothing without modifiers.
     pub fn apply_first_modifier(&mut self) {
         if self.modifiers.is_empty() {
             return;
@@ -1023,15 +1030,16 @@ mod tests {
             assert_eq!(l.modifiers, [mirror_x(2)]);
             assert_eq!(l.coverage(size), shown);
         }
-        // Copied shapes reach in from past the texture's edge, before and
-        // after Apply.
+        // Copies are of the pixels a shape covers; Apply copies the whole
+        // shape, which can bring its part past the edge into view.
         let mut l = Layer::new("v");
         let wide = shape::rectangle(Vec2::new(-2.0, 0.0), Vec2::new(1.0, 1.0));
         l.insert_shape(0, Shape::new(wide, Style::Fill, PaletteIndex(7)).unwrap());
         l.modifiers.push(mirror_x(2));
-        assert_eq!(l.coverage(size), [Some(PaletteIndex(7)); 4]);
+        let seven = Some(PaletteIndex(7));
+        assert_eq!(l.coverage(size), [seven, seven, None, None]);
         l.apply_first_modifier();
-        assert_eq!(l.coverage(size), [Some(PaletteIndex(7)); 4]);
+        assert_eq!(l.coverage(size), [seven; 4]);
         // The copy goes beneath the shape it copies.
         let mut l = Layer::new("v");
         let dot = shape::rectangle(Vec2::ZERO, Vec2::ONE);
