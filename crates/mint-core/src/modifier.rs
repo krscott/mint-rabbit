@@ -40,6 +40,15 @@ impl HalfPoint {
         }
     }
 
+    /// The point with its coordinate `axis` (0 across, 1 down) moved to the
+    /// nearest value to `v`, in texels, on a texture of `size`, and of
+    /// `parity` in half texels if given.
+    fn with_coordinate(self, axis: usize, v: f32, size: UVec2, parity: Option<i32>) -> Self {
+        let mut c = [self.x, self.y];
+        c[axis] = snap(v * 2.0, 2 * size[axis] as i32, parity);
+        Self { x: c[0], y: c[1] }
+    }
+
     /// The point in texels.
     #[must_use]
     pub fn to_vec2(self) -> Vec2 {
@@ -169,12 +178,11 @@ impl Radial {
     /// whole texel at a time.
     #[must_use]
     pub fn with_coordinate(self, axis: usize, v: f32, size: UVec2) -> Self {
-        let mut c = [self.center.x, self.center.y];
-        let parity = (self.turns == Turns::Quarter).then_some(c[1 - axis]);
-        c[axis] = snap(v * 2.0, 2 * size[axis] as i32, parity);
+        let other = [self.center.x, self.center.y][1 - axis];
+        let parity = (self.turns == Turns::Quarter).then_some(other);
         Self {
             turns: self.turns,
-            center: HalfPoint { x: c[0], y: c[1] },
+            center: self.center.with_coordinate(axis, v, size, parity),
         }
     }
 
@@ -213,15 +221,10 @@ impl ModifierKind {
     #[must_use]
     pub fn with_coordinate(self, axis: usize, v: f32, size: UVec2) -> Self {
         match self {
-            Self::Mirror(mut m) => {
-                let max = 2 * size[axis] as i32;
-                if axis == 0 {
-                    m.at.x = snap(v * 2.0, max, None);
-                } else {
-                    m.at.y = snap(v * 2.0, max, None);
-                }
-                Self::Mirror(m)
-            }
+            Self::Mirror(m) => Self::Mirror(Mirror {
+                at: m.at.with_coordinate(axis, v, size, None),
+                ..m
+            }),
             Self::Radial(r) => Self::Radial(r.with_coordinate(axis, v, size)),
         }
     }
@@ -346,28 +349,24 @@ pub(crate) fn stack(modifiers: &[Modifier]) -> Vec<Vec<Motion>> {
         .collect()
 }
 
-/// The pixels of an image of `size` where `stack` shows copies of pixels
-/// in `from` (sorted), and those it shows copies of at pixels in `from`,
-/// through copies on the image only, as the stack draws them. Leaves out
-/// `from`.
+/// The pixels of an image of `size` that `stack` shows as the same as
+/// pixels in `from` (sorted): those it shows copies of there, and every
+/// pixel showing a copy of one of those, through copies on the image only,
+/// as the stack draws them. Leaves out `from`.
 pub(crate) fn matching(stack: &[Vec<Motion>], size: UVec2, from: &[usize]) -> Vec<usize> {
-    let forward = reach(stack.iter().cloned(), size, from);
-    let backward = reach(
-        stack
-            .iter()
-            .rev()
-            .map(|copies| copies.iter().map(|c| c.inverse()).collect()),
-        size,
-        from,
-    );
-    let mut out: Vec<usize> = (0..forward.len())
-        .filter(|&j| forward[j] || backward[j])
-        .collect();
-    out.retain(|j| from.binary_search(j).is_err());
-    out
+    let inverses = stack
+        .iter()
+        .rev()
+        .map(|copies| copies.iter().map(|c| c.inverse()).collect());
+    let sources = reach(inverses, size, from);
+    let sources: Vec<usize> = (0..sources.len()).filter(|&j| sources[j]).collect();
+    let shown = reach(stack.iter().cloned(), size, &sources);
+    (0..shown.len())
+        .filter(|&j| shown[j] && from.binary_search(&j).is_err())
+        .collect()
 }
 
-/// Which pixels of an image of `size` the pixels in `from` (sorted) reach
+/// Which pixels of an image of `size` the pixels in `from` reach
 /// when each step of `steps` adds its motions' images of the pixels reached
 /// so far that land on the image.
 fn reach(steps: impl Iterator<Item = Vec<Motion>>, size: UVec2, from: &[usize]) -> Vec<bool> {
@@ -628,6 +627,10 @@ mod tests {
         let size = UVec2::new(8, 1);
         let ms = [mirror(Axes::X, 4, 0), mirror(Axes::X, 6, 0)];
         assert_eq!(matches(&ms, size, 0), [2, 3, 5]);
+        // Pixels showing copies of the same pixel match each other too.
+        assert_eq!(matches(&ms, size, 5), [0, 2, 3]);
+        // Several pixels match what each matches.
+        assert_eq!(matching(&stack(&ms), size, &[0, 7]), [2, 3, 5]);
         // A copy cut off at the edge carries nothing on to later modifiers.
         let ms = [mirror(Axes::X, 2, 0), mirror(Axes::X, 6, 0)];
         assert_eq!(matches(&ms, size, 2), [3]);
