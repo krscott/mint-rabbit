@@ -128,13 +128,6 @@ impl IndexedImage {
     pub fn pixel(&self, x: u32, y: u32) -> PaletteIndex {
         self.pixels[(y * self.size.x + x) as usize]
     }
-
-    /// Replaces every pixel's index with `f` of it.
-    pub(crate) fn remap(&mut self, f: impl Fn(PaletteIndex) -> PaletteIndex) {
-        for p in &mut self.pixels {
-            *p = f(*p);
-        }
-    }
 }
 
 /// Calls `f` with the row-major index of each pixel of an image of `size`
@@ -206,8 +199,169 @@ pub enum TextureContent {
     External { preview: RgbaImage },
 }
 
-/// An ordered list of shapes in one variant; later shapes draw over
-/// earlier ones.
+/// The pixels of a raster layer: a palette entry or nothing for each,
+/// row-major from the top left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Raster {
+    size: UVec2,
+    pixels: Vec<Option<PaletteIndex>>,
+}
+
+impl Raster {
+    pub fn new(size: UVec2, pixels: Vec<Option<PaletteIndex>>) -> Result<Self, PixelCountMismatch> {
+        if pixels.len() as u64 != u64::from(size.x) * u64::from(size.y) {
+            return Err(PixelCountMismatch {
+                width: size.x,
+                height: size.y,
+                len: pixels.len(),
+            });
+        }
+        Ok(Self { size, pixels })
+    }
+
+    /// A raster of `size` with no pixels set.
+    #[must_use]
+    pub fn clear(size: UVec2) -> Self {
+        Self {
+            size,
+            pixels: vec![None; (u64::from(size.x) * u64::from(size.y)) as usize],
+        }
+    }
+
+    #[must_use]
+    pub fn size(&self) -> UVec2 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn pixels(&self) -> &[Option<PaletteIndex>] {
+        &self.pixels
+    }
+
+    /// The pixel at `(x, y)`, or `None` outside the raster.
+    #[must_use]
+    pub fn pixel(&self, x: i64, y: i64) -> Option<Option<PaletteIndex>> {
+        self.index(x, y).map(|i| self.pixels[i])
+    }
+
+    fn index(&self, x: i64, y: i64) -> Option<usize> {
+        let inside =
+            (0..i64::from(self.size.x)).contains(&x) && (0..i64::from(self.size.y)).contains(&y);
+        inside.then(|| (y * i64::from(self.size.x) + x) as usize)
+    }
+
+    /// Sets each pixel whose center `shape` covers to its color.
+    pub fn paint_shape(&mut self, shape: &Shape) {
+        covered_pixels(shape, self.size, |i| self.pixels[i] = Some(shape.color()));
+    }
+
+    /// Sets the pixels a pencil `width` texels wide covers from `from` to
+    /// `to` to `value`, as a round tip stepped one pixel at a time so that
+    /// no gap opens. At width 1 the tip is the pixel under the point.
+    pub fn draw_line(&mut self, from: Vec2, to: Vec2, width: f32, value: Option<PaletteIndex>) {
+        let width = width.round().max(1.0) as i64;
+        // An odd tip centers on a pixel, an even one on a pixel corner, so
+        // its tip lands on whole pixels either way.
+        let lattice = |p: Vec2| {
+            if width % 2 == 1 {
+                (p.x.floor() as i64, p.y.floor() as i64)
+            } else {
+                (p.x.round() as i64, p.y.round() as i64)
+            }
+        };
+        let (mut x, mut y) = lattice(from);
+        let (x1, y1) = lattice(to);
+        // Offsets from the tip's lattice point of the pixels it covers:
+        // those whose centers lie within half the width of its center.
+        let half = width as f32 / 2.0;
+        let center = if width % 2 == 1 { 0.5 } else { 0.0 };
+        let reach = width / 2 + 1;
+        let tip: Vec<(i64, i64)> = (-reach..=reach)
+            .flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy)))
+            .filter(|&(dx, dy)| {
+                let d = Vec2::new(dx as f32 + 0.5 - center, dy as f32 + 0.5 - center);
+                d.length_squared() <= half * half
+            })
+            .collect();
+        // Bresenham between the two lattice points.
+        let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
+        let (sx, sy) = ((x1 - x).signum(), (y1 - y).signum());
+        let mut err = dx + dy;
+        loop {
+            for &(ox, oy) in &tip {
+                if let Some(i) = self.index(x + ox, y + oy) {
+                    self.pixels[i] = value;
+                }
+            }
+            if (x, y) == (x1, y1) {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    /// Sets the pixel under `at` and every pixel joined to it through
+    /// edge-neighbors of the same value to `value`. Nothing happens outside
+    /// the raster.
+    pub fn fill(&mut self, at: Vec2, value: Option<PaletteIndex>) {
+        let (x, y) = (at.x.floor() as i64, at.y.floor() as i64);
+        let Some(start) = self.index(x, y) else {
+            return;
+        };
+        let old = self.pixels[start];
+        if old == value {
+            return;
+        }
+        let mut stack = vec![(x, y)];
+        while let Some((x, y)) = stack.pop() {
+            let Some(i) = self.index(x, y).filter(|&i| self.pixels[i] == old) else {
+                continue;
+            };
+            self.pixels[i] = value;
+            stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]);
+        }
+    }
+
+    pub(crate) fn remap(&mut self, f: impl Fn(PaletteIndex) -> PaletteIndex) {
+        for p in self.pixels.iter_mut().flatten() {
+            *p = f(*p);
+        }
+    }
+}
+
+impl From<IndexedImage> for Raster {
+    fn from(image: IndexedImage) -> Self {
+        Self {
+            size: image.size,
+            pixels: image.pixels.into_iter().map(Some).collect(),
+        }
+    }
+}
+
+/// Which kind of layer a layer is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LayerKind {
+    Vector,
+    Raster,
+}
+
+/// What a layer holds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerContent {
+    /// Shapes, later ones drawing over earlier ones.
+    Vector(Vec<Shape>),
+    Raster(Raster),
+}
+
+/// One level of a variant's stack: shapes, or pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     pub name: String,
@@ -217,74 +371,196 @@ pub struct Layer {
     pub locked: bool,
     /// Opacity in the views only, from 0 to 1; export ignores it.
     pub opacity: f32,
-    shapes: Vec<Shape>,
+    pub content: LayerContent,
 }
 
 impl Layer {
-    /// An empty, visible, unlocked, opaque layer.
+    /// An empty, visible, unlocked, opaque vector layer.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
+        Self::with_content(name, LayerContent::Vector(Vec::new()))
+    }
+
+    /// A visible, unlocked, opaque raster layer of `raster`.
+    #[must_use]
+    pub fn raster(name: impl Into<String>, raster: Raster) -> Self {
+        Self::with_content(name, LayerContent::Raster(raster))
+    }
+
+    fn with_content(name: impl Into<String>, content: LayerContent) -> Self {
         Self {
             name: name.into(),
             visible: true,
             locked: false,
             opacity: 1.0,
-            shapes: Vec::new(),
+            content,
         }
     }
 
     #[must_use]
+    pub fn kind(&self) -> LayerKind {
+        match self.content {
+            LayerContent::Vector(_) => LayerKind::Vector,
+            LayerContent::Raster(_) => LayerKind::Raster,
+        }
+    }
+
+    /// The shapes of a vector layer; a raster layer has none.
+    #[must_use]
     pub fn shapes(&self) -> &[Shape] {
-        &self.shapes
+        match &self.content {
+            LayerContent::Vector(shapes) => shapes,
+            LayerContent::Raster(_) => &[],
+        }
     }
 
+    /// The shapes of a vector layer; a raster layer has none.
     pub fn shapes_mut(&mut self) -> &mut [Shape] {
-        &mut self.shapes
+        match &mut self.content {
+            LayerContent::Vector(shapes) => shapes,
+            LayerContent::Raster(_) => &mut [],
+        }
     }
 
+    /// The pixels of a raster layer.
+    #[must_use]
+    pub fn raster_pixels(&self) -> Option<&Raster> {
+        match &self.content {
+            LayerContent::Raster(r) => Some(r),
+            LayerContent::Vector(_) => None,
+        }
+    }
+
+    /// The pixels of a raster layer.
+    pub fn raster_pixels_mut(&mut self) -> Option<&mut Raster> {
+        match &mut self.content {
+            LayerContent::Raster(r) => Some(r),
+            LayerContent::Vector(_) => None,
+        }
+    }
+
+    /// The shape list of a vector layer. Panics on a raster layer, which
+    /// has no shapes to change.
+    fn vector_mut(&mut self) -> &mut Vec<Shape> {
+        match &mut self.content {
+            LayerContent::Vector(shapes) => shapes,
+            LayerContent::Raster(_) => panic!("layer {:?} is a raster layer", self.name),
+        }
+    }
+
+    /// Panics on a raster layer.
     pub fn remove_shape(&mut self, index: usize) -> Shape {
-        self.shapes.remove(index)
+        self.vector_mut().remove(index)
     }
 
-    /// Moves the shape at `from` so that it ends up at `to`.
+    /// Moves the shape at `from` so that it ends up at `to`. Panics on a
+    /// raster layer.
     pub fn move_shape(&mut self, from: usize, to: usize) {
-        let shape = self.shapes.remove(from);
-        self.shapes.insert(to, shape);
+        let shapes = self.vector_mut();
+        let shape = shapes.remove(from);
+        shapes.insert(to, shape);
+    }
+
+    /// Panics on a raster layer.
+    pub fn insert_shape(&mut self, index: usize, shape: Shape) {
+        self.vector_mut().insert(index, shape);
     }
 
     /// The palette entry each pixel of an image of `size` takes from this
-    /// layer's shapes, row-major: the topmost shape covering its center, or
-    /// `None` where none does. Visibility and opacity are not applied.
+    /// layer, row-major: for a vector layer, the topmost shape covering its
+    /// center, or `None` where none does. Visibility and opacity are not
+    /// applied. A raster layer must be of `size`.
     #[must_use]
     pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
-        let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
-        for shape in &self.shapes {
-            covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
+        match &self.content {
+            LayerContent::Vector(shapes) => {
+                let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
+                for shape in shapes {
+                    covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
+                }
+                out
+            }
+            LayerContent::Raster(r) => {
+                debug_assert_eq!(r.size, size);
+                r.pixels.clone()
+            }
         }
-        out
     }
 
-    pub fn insert_shape(&mut self, index: usize, shape: Shape) {
-        self.shapes.insert(index, shape);
+    /// Turns a vector layer into a raster layer of `size` holding the
+    /// pixels its shapes cover. A raster layer stays as it is.
+    pub fn rasterize(&mut self, size: UVec2) {
+        if self.kind() == LayerKind::Vector {
+            let pixels = self.coverage(size);
+            self.content = LayerContent::Raster(Raster { size, pixels });
+        }
+    }
+
+    /// The palette entries the layer uses.
+    pub(crate) fn colors(&self) -> Box<dyn Iterator<Item = PaletteIndex> + '_> {
+        match &self.content {
+            LayerContent::Vector(shapes) => Box::new(shapes.iter().map(Shape::color)),
+            LayerContent::Raster(r) => Box::new(r.pixels.iter().flatten().copied()),
+        }
+    }
+
+    pub(crate) fn remap(&mut self, f: impl Fn(PaletteIndex) -> PaletteIndex) {
+        match &mut self.content {
+            LayerContent::Vector(shapes) => {
+                for s in shapes {
+                    s.set_color(f(s.color()));
+                }
+            }
+            LayerContent::Raster(r) => r.remap(f),
+        }
     }
 }
+
+/// The name of the raster layer an imported image arrives in.
+pub const BASE_LAYER: &str = "Base";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Variant {
     pub name: String,
-    underlay: IndexedImage,
+    /// The texture's size, which every raster layer has.
+    size: UVec2,
     /// Bottom to top.
     layers: Vec<Layer>,
 }
 
 impl Variant {
+    /// A variant of a texture of `size` with no layers.
     #[must_use]
-    pub fn underlay(&self) -> &IndexedImage {
-        &self.underlay
+    pub fn new(name: impl Into<String>, size: UVec2) -> Self {
+        Self {
+            name: name.into(),
+            size,
+            layers: Vec::new(),
+        }
     }
 
-    pub(crate) fn underlay_mut(&mut self) -> &mut IndexedImage {
-        &mut self.underlay
+    /// A variant holding `image` as a locked raster layer, as imported.
+    #[must_use]
+    pub fn imported(name: impl Into<String>, image: IndexedImage) -> Self {
+        let mut v = Self::new(name, image.size);
+        let mut base = Layer::raster(BASE_LAYER, image.into());
+        base.locked = true;
+        v.layers.push(base);
+        v
+    }
+
+    #[must_use]
+    pub fn size(&self) -> UVec2 {
+        self.size
+    }
+
+    /// The size of a raster layer that doesn't match the variant's.
+    pub(crate) fn mismatched_raster(&self) -> Option<UVec2> {
+        self.layers
+            .iter()
+            .filter_map(Layer::raster_pixels)
+            .map(Raster::size)
+            .find(|&s| s != self.size)
     }
 
     /// The layers, bottom to top.
@@ -311,19 +587,28 @@ impl Variant {
         self.layers.insert(to, layer);
     }
 
-    /// The image the variant exports: the underlay with the shapes of every
-    /// visible layer on top, each pixel taking the topmost shape that covers
-    /// its center.
+    /// The palette entries the variant's layers use.
+    pub(crate) fn colors(&self) -> impl Iterator<Item = PaletteIndex> + '_ {
+        self.layers.iter().flat_map(Layer::colors)
+    }
+
+    /// The image the variant exports: each pixel takes the topmost visible
+    /// layer that covers it, or palette entry 0 where none does.
     #[must_use]
     pub fn rasterize(&self) -> IndexedImage {
-        let mut image = self.underlay.clone();
-        let size = image.size;
+        let mut pixels =
+            vec![PaletteIndex(0); (u64::from(self.size.x) * u64::from(self.size.y)) as usize];
         for layer in self.layers.iter().filter(|l| l.visible) {
-            for shape in &layer.shapes {
-                covered_pixels(shape, size, |i| image.pixels[i] = shape.color());
+            for (px, c) in pixels.iter_mut().zip(layer.coverage(self.size)) {
+                if let Some(c) = c {
+                    *px = c;
+                }
             }
         }
-        image
+        IndexedImage {
+            size: self.size,
+            pixels,
+        }
     }
 }
 
@@ -331,7 +616,9 @@ impl Variant {
 pub enum TextureError {
     #[error("texture {texture:?} needs at least one variant")]
     NoVariants { texture: String },
-    #[error("variant {variant:?} of texture {texture:?} is {actual} but the texture is {expected}")]
+    #[error(
+        "variant {variant:?} of texture {texture:?} has a layer of {actual} but the texture is {expected}"
+    )]
     SizeMismatch {
         texture: String,
         variant: String,
@@ -341,33 +628,31 @@ pub enum TextureError {
 }
 
 impl Texture {
-    /// A painted texture whose variants each carry an underlay of `size`.
+    /// A painted texture of `size`, whose variants and their raster layers
+    /// must all be of that size.
     pub fn painted(
         name: impl Into<String>,
         slot: Slot,
         size: UVec2,
-        variants: impl IntoIterator<Item = (String, IndexedImage)>,
+        variants: impl IntoIterator<Item = Variant>,
     ) -> Result<Self, TextureError> {
         let name = name.into();
-        let variants: Vec<Variant> = variants
-            .into_iter()
-            .map(|(variant, underlay)| {
-                if underlay.size() == size {
-                    Ok(Variant {
-                        name: variant,
-                        underlay,
-                        layers: Vec::new(),
-                    })
-                } else {
-                    Err(TextureError::SizeMismatch {
-                        texture: name.clone(),
-                        variant,
-                        expected: size,
-                        actual: underlay.size(),
-                    })
-                }
-            })
-            .collect::<Result<_, _>>()?;
+        let variants: Vec<Variant> = variants.into_iter().collect();
+        for v in &variants {
+            let actual = if v.size == size {
+                v.mismatched_raster()
+            } else {
+                Some(v.size)
+            };
+            if let Some(actual) = actual {
+                return Err(TextureError::SizeMismatch {
+                    texture: name,
+                    variant: v.name.clone(),
+                    expected: size,
+                    actual,
+                });
+            }
+        }
         if variants.is_empty() {
             return Err(TextureError::NoVariants { texture: name });
         }
@@ -460,44 +745,158 @@ pub struct Material {
 mod tests {
     use super::*;
 
+    fn image(size: UVec2, pixels: &[u8]) -> IndexedImage {
+        IndexedImage::new(size, pixels.iter().map(|&i| PaletteIndex(i)).collect()).unwrap()
+    }
+
+    fn px(r: &Raster) -> Vec<Option<u8>> {
+        r.pixels().iter().map(|p| p.map(|i| i.0)).collect()
+    }
+
     #[test]
-    fn painted_texture_rejects_mismatched_underlay() {
-        let img = IndexedImage::new(UVec2::new(2, 1), vec![PaletteIndex(0); 2]).unwrap();
-        let err = Texture::painted(
-            "eye",
-            Slot("eyes".into()),
-            UVec2::new(4, 4),
-            [("1".to_owned(), img)],
-        )
-        .unwrap_err();
+    fn painted_texture_rejects_mismatched_sizes() {
+        let small = Variant::imported("1", image(UVec2::new(2, 1), &[0, 0]));
+        let err =
+            Texture::painted("eye", Slot("eyes".into()), UVec2::new(4, 4), [small]).unwrap_err();
         assert!(matches!(err, TextureError::SizeMismatch { .. }));
+
+        // A raster layer of another size in a variant of the right size.
+        let mut v = Variant::new("1", UVec2::new(4, 4));
+        v.insert_layer(0, Layer::raster("l", Raster::clear(UVec2::new(2, 2))));
+        let err = Texture::painted("eye", Slot("eyes".into()), UVec2::new(4, 4), [v]).unwrap_err();
+        assert!(
+            matches!(err, TextureError::SizeMismatch { actual, .. } if actual == UVec2::new(2, 2))
+        );
+    }
+
+    #[test]
+    fn imported_variants_start_with_a_locked_base_layer() {
+        let v = Variant::imported("1", image(UVec2::new(2, 1), &[3, 4]));
+        let [base] = v.layers() else {
+            panic!("one layer");
+        };
+        assert_eq!(base.name, BASE_LAYER);
+        assert!(base.locked && base.visible);
+        assert_eq!(px(base.raster_pixels().unwrap()), [Some(3), Some(4)]);
     }
 
     #[test]
     fn rasterize_paints_visible_layers_in_order() {
         use crate::{Style, shape};
-        let underlay = IndexedImage::new(UVec2::new(4, 2), vec![PaletteIndex(0); 8]).unwrap();
-        let mut t = Texture::painted(
-            "body",
-            Slot("body".into()),
-            UVec2::new(4, 2),
-            [("1".to_owned(), underlay)],
-        )
-        .unwrap();
-        let v = &mut t.variants_mut()[0];
+        let mut v = Variant::imported("1", image(UVec2::new(4, 2), &[5; 8]));
         let rect = |a: Vec2, b: Vec2, c: u8| {
             Shape::new(shape::rectangle(a, b), Style::Fill, PaletteIndex(c)).unwrap()
         };
-        v.insert_layer(0, Layer::new("low"));
-        v.insert_layer(1, Layer::new("high"));
-        v.layers_mut()[0].insert_shape(0, rect(Vec2::ZERO, Vec2::new(3.0, 2.0), 1));
+        v.insert_layer(1, Layer::new("low"));
+        v.insert_layer(2, Layer::new("high"));
+        v.layers_mut()[1].insert_shape(0, rect(Vec2::ZERO, Vec2::new(3.0, 2.0), 1));
         // Covers the centers of pixels 2 and 3 on the top row only.
-        v.layers_mut()[1].insert_shape(0, rect(Vec2::new(1.6, -1.0), Vec2::new(9.0, 0.9), 2));
+        v.layers_mut()[2].insert_shape(0, rect(Vec2::new(1.6, -1.0), Vec2::new(9.0, 0.9), 2));
         let px = |v: &Variant| -> Vec<u8> { v.rasterize().pixels().iter().map(|i| i.0).collect() };
-        assert_eq!(px(v), [1, 1, 2, 2, 1, 1, 1, 0]);
-        v.layers_mut()[1].visible = false;
-        assert_eq!(px(v), [1, 1, 1, 0, 1, 1, 1, 0]);
-        assert_eq!(v.underlay().pixels(), &[PaletteIndex(0); 8]);
+        assert_eq!(px(&v), [1, 1, 2, 2, 1, 1, 1, 5]);
+        v.layers_mut()[2].visible = false;
+        assert_eq!(px(&v), [1, 1, 1, 5, 1, 1, 1, 5]);
+        // Where no visible layer covers a pixel, it takes entry 0.
+        v.layers_mut()[0].visible = false;
+        assert_eq!(px(&v), [1, 1, 1, 0, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn rasterizing_a_layer_keeps_what_it_covers() {
+        use crate::{Style, shape};
+        let mut l = Layer::new("l");
+        l.locked = true;
+        l.opacity = 0.5;
+        let square = shape::rectangle(Vec2::ZERO, Vec2::new(1.0, 2.0));
+        l.insert_shape(0, Shape::new(square, Style::Fill, PaletteIndex(7)).unwrap());
+        let before = l.coverage(UVec2::new(2, 2));
+        l.rasterize(UVec2::new(2, 2));
+        assert_eq!(l.kind(), LayerKind::Raster);
+        assert!(l.locked && (l.opacity - 0.5).abs() < f32::EPSILON);
+        assert_eq!(l.coverage(UVec2::new(2, 2)), before);
+        assert_eq!(
+            px(l.raster_pixels().unwrap()),
+            [Some(7), None, Some(7), None]
+        );
+    }
+
+    #[test]
+    fn a_thin_line_leaves_no_gaps() {
+        let mut r = Raster::clear(UVec2::new(5, 3));
+        r.draw_line(
+            Vec2::new(0.5, 0.5),
+            Vec2::new(4.9, 2.1),
+            1.0,
+            Some(PaletteIndex(1)),
+        );
+        let on = |x: u32| {
+            (0..3)
+                .filter(|&y| r.pixel(i64::from(x), y) == Some(Some(PaletteIndex(1))))
+                .count()
+        };
+        // One pixel per column from the first to the last.
+        assert!((0..5).all(|x| on(x) == 1), "{:?}", px(&r));
+        assert_eq!(r.pixel(0, 0), Some(Some(PaletteIndex(1))));
+        assert_eq!(r.pixel(4, 2), Some(Some(PaletteIndex(1))));
+
+        // A dot of width 1 is the pixel under the point; erasing clears it.
+        let mut r = Raster::clear(UVec2::new(3, 3));
+        r.draw_line(
+            Vec2::new(1.9, 1.1),
+            Vec2::new(1.9, 1.1),
+            1.0,
+            Some(PaletteIndex(2)),
+        );
+        assert_eq!(px(&r).iter().flatten().count(), 1);
+        assert_eq!(r.pixel(1, 1), Some(Some(PaletteIndex(2))));
+        r.draw_line(Vec2::new(1.5, 1.5), Vec2::new(1.5, 1.5), 1.0, None);
+        assert_eq!(r, Raster::clear(UVec2::new(3, 3)));
+    }
+
+    #[test]
+    fn wide_tips_are_round_and_whole() {
+        let count = |width: f32, at: Vec2| {
+            let mut r = Raster::clear(UVec2::new(9, 9));
+            r.draw_line(at, at, width, Some(PaletteIndex(0)));
+            px(&r).iter().flatten().count()
+        };
+        // Even tips sit on the nearest pixel corner, odd ones on a pixel.
+        assert_eq!(count(2.0, Vec2::new(4.2, 3.9)), 4);
+        assert_eq!(count(3.0, Vec2::new(4.2, 3.9)), 9);
+        // Four by four, without its corners.
+        assert_eq!(count(4.0, Vec2::new(4.2, 3.9)), 12);
+        // Tips are clipped at the edge.
+        assert_eq!(count(3.0, Vec2::new(0.1, 0.1)), 4);
+    }
+
+    #[test]
+    fn fill_spreads_through_edge_neighbors_of_one_value() {
+        let one = Some(PaletteIndex(1));
+        // A diagonal wall: the fill can't cross it at its corners.
+        let mut r = Raster::new(
+            UVec2::new(3, 3),
+            vec![None, None, one, None, one, None, one, None, None],
+        )
+        .unwrap();
+        r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
+        assert_eq!(
+            px(&r),
+            [
+                Some(2),
+                Some(2),
+                Some(1),
+                Some(2),
+                Some(1),
+                None,
+                Some(1),
+                None,
+                None
+            ]
+        );
+        let before = r.clone();
+        r.fill(Vec2::new(-1.0, 0.5), None);
+        r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(2)));
+        assert_eq!(r, before);
     }
 
     #[test]

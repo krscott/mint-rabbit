@@ -1,9 +1,9 @@
 //! Saving and loading projects as a directory: `project.ron` holds
 //! everything except images, which sit beside it as PNG files.
 //!
-//! Underlays are 8-bit indexed PNGs whose pixel values are palette indices;
-//! their PNG palette is a copy of the project's for viewing and is ignored on
-//! load. External texture previews are RGBA PNGs. Loading goes through the
+//! Raster layers are 8-bit grayscale-and-alpha PNGs: a pixel's gray value is
+//! its palette index, and alpha 0 marks a pixel the layer doesn't set.
+//! External texture previews are RGBA PNGs. Loading goes through the
 //! same constructors as building a project in code, so a file can't produce
 //! a project that breaks their rules.
 
@@ -15,9 +15,9 @@ use glam::{Quat, UVec2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AlphaMode, Anchor, Corner, ExportTarget, IndexedImage, Layer, Material, Mesh, Model, NodeId,
-    Palette, PaletteIndex, Pose, Project, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
-    TextureContent, TextureId, Transform, Triangle, Vertex, Wrap,
+    AlphaMode, Anchor, Corner, ExportTarget, Layer, LayerContent, Material, Mesh, Model, NodeId,
+    Palette, PaletteIndex, Pose, Project, Raster, Rgba8, RgbaImage, Shape, Slot, Style, Texture,
+    TextureContent, TextureId, Transform, Triangle, Variant, Vertex, Wrap,
 };
 
 /// The project file inside a project directory.
@@ -174,8 +174,7 @@ enum ContentFile {
 #[derive(Serialize, Deserialize)]
 struct VariantFile {
     name: String,
-    /// An 8-bit indexed PNG.
-    underlay: String,
+    /// Bottom to top.
     layers: Vec<LayerFile>,
 }
 
@@ -185,7 +184,14 @@ struct LayerFile {
     visible: bool,
     locked: bool,
     opacity: f32,
-    shapes: Vec<ShapeFile>,
+    content: LayerContentFile,
+}
+
+#[derive(Serialize, Deserialize)]
+enum LayerContentFile {
+    Vector(Vec<ShapeFile>),
+    /// An 8-bit grayscale-and-alpha PNG.
+    Raster(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,13 +268,29 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
             TextureContent::Painted(variants) => {
                 let mut out = Vec::new();
                 for (v, variant) in variants.iter().enumerate() {
-                    let png = encode_indexed(variant.underlay(), project.palette())
-                        .map_err(|e| SaveError::Png(dir.join(IMAGE_DIR), e))?;
-                    let rel = image(format!("{t}-{v}"), png)?;
+                    let mut layers = Vec::new();
+                    for (l, layer) in variant.layers().iter().enumerate() {
+                        let content = match &layer.content {
+                            LayerContent::Vector(shapes) => {
+                                LayerContentFile::Vector(shapes.iter().map(shape_file).collect())
+                            }
+                            LayerContent::Raster(raster) => {
+                                let png = encode_raster(raster)
+                                    .map_err(|e| SaveError::Png(dir.join(IMAGE_DIR), e))?;
+                                LayerContentFile::Raster(image(format!("{t}-{v}-{l}"), png)?)
+                            }
+                        };
+                        layers.push(LayerFile {
+                            name: layer.name.clone(),
+                            visible: layer.visible,
+                            locked: layer.locked,
+                            opacity: layer.opacity,
+                            content,
+                        });
+                    }
                     out.push(VariantFile {
                         name: variant.name.clone(),
-                        underlay: rel,
-                        layers: variant.layers().iter().map(layer_file).collect(),
+                        layers,
                     });
                 }
                 ContentFile::Painted(out)
@@ -318,19 +340,16 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
 }
 
 /// Whether `name` has the form save gives images, such as
-/// `3-0-0123456789abcdef.png` or `4-preview-0123456789abcdef.png`.
+/// `3-0-2-0123456789abcdef.png` or `4-preview-0123456789abcdef.png`.
 fn is_saved_image_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".png") else {
         return false;
     };
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let hash = |s: &str| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     match stem.split('-').collect::<Vec<_>>()[..] {
-        [t, v, hash] => {
-            digits(t)
-                && (digits(v) || v == "preview")
-                && hash.len() == 16
-                && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
+        [t, "preview", h] => digits(t) && hash(h),
+        [t, v, l, h] => digits(t) && digits(v) && digits(l) && hash(h),
         _ => false,
     }
 }
@@ -348,7 +367,14 @@ fn referenced_images(dir: &Path) -> Vec<String> {
     file.textures
         .iter()
         .flat_map(|t| match &t.content {
-            ContentFile::Painted(variants) => variants.iter().map(|v| v.underlay.clone()).collect(),
+            ContentFile::Painted(variants) => variants
+                .iter()
+                .flat_map(|v| &v.layers)
+                .filter_map(|l| match &l.content {
+                    LayerContentFile::Raster(rel) => Some(rel.clone()),
+                    LayerContentFile::Vector(_) => None,
+                })
+                .collect(),
             ContentFile::External { preview } => vec![preview.clone()],
         })
         // Only images saves write: their names, directly in the image
@@ -438,28 +464,36 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
         }
         let slot = Slot(t.slot);
         let texture = match t.content {
-            ContentFile::Painted(variants) => {
-                let underlays = variants
-                    .iter()
-                    .map(|v| {
-                        Ok((
-                            v.name.clone(),
-                            read_indexed(&image_path(dir, &v.underlay)?, size)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, LoadError>>()?;
-                let mut texture = Texture::painted(t.name.clone(), slot, size, underlays)?;
-                for (variant, file) in texture.variants_mut().iter_mut().zip(variants) {
+            ContentFile::Painted(files) => {
+                let mut variants = Vec::new();
+                for file in files {
+                    let mut variant = Variant::new(file.name.clone(), size);
                     for (i, l) in file.layers.into_iter().enumerate() {
-                        let layer = layer(l).map_err(|source| LoadError::Shape {
-                            texture: t.name.clone(),
-                            variant: file.name.clone(),
-                            source,
-                        })?;
+                        let mut layer = match l.content {
+                            LayerContentFile::Vector(shapes) => {
+                                let mut layer = Layer::new(l.name);
+                                for (k, s) in shapes.into_iter().enumerate() {
+                                    let s = shape(s).map_err(|source| LoadError::Shape {
+                                        texture: t.name.clone(),
+                                        variant: file.name.clone(),
+                                        source,
+                                    })?;
+                                    layer.insert_shape(k, s);
+                                }
+                                layer
+                            }
+                            LayerContentFile::Raster(rel) => {
+                                Layer::raster(l.name, read_raster(&image_path(dir, &rel)?, size)?)
+                            }
+                        };
+                        layer.visible = l.visible;
+                        layer.locked = l.locked;
+                        layer.opacity = l.opacity;
                         variant.insert_layer(i, layer);
                     }
+                    variants.push(variant);
                 }
-                texture
+                Texture::painted(t.name.clone(), slot, size, variants)?
             }
             ContentFile::External { preview } => {
                 let image = read_rgba(&image_path(dir, &preview)?, size)?;
@@ -583,59 +617,42 @@ fn material(m: MaterialFile) -> Material {
     }
 }
 
-fn layer_file(l: &Layer) -> LayerFile {
-    LayerFile {
-        name: l.name.clone(),
-        visible: l.visible,
-        locked: l.locked,
-        opacity: l.opacity,
-        shapes: l
-            .shapes()
+fn shape_file(s: &Shape) -> ShapeFile {
+    ShapeFile {
+        color: s.color().0,
+        style: match s.style() {
+            Style::Fill => StyleFile::Fill,
+            Style::Stroke { width, closed } => StyleFile::Stroke { width, closed },
+        },
+        anchors: s
+            .anchors()
             .iter()
-            .map(|s| ShapeFile {
-                color: s.color().0,
-                style: match s.style() {
-                    Style::Fill => StyleFile::Fill,
-                    Style::Stroke { width, closed } => StyleFile::Stroke { width, closed },
-                },
-                anchors: s
-                    .anchors()
-                    .iter()
-                    .map(|a| {
-                        [
-                            a.point.to_array(),
-                            a.handle_in.to_array(),
-                            a.handle_out.to_array(),
-                        ]
-                    })
-                    .collect(),
+            .map(|a| {
+                [
+                    a.point.to_array(),
+                    a.handle_in.to_array(),
+                    a.handle_out.to_array(),
+                ]
             })
             .collect(),
     }
 }
 
-fn layer(l: LayerFile) -> Result<Layer, crate::ShapeError> {
-    let mut layer = Layer::new(l.name);
-    layer.visible = l.visible;
-    layer.locked = l.locked;
-    layer.opacity = l.opacity;
-    for (i, s) in l.shapes.into_iter().enumerate() {
-        let style = match s.style {
-            StyleFile::Fill => Style::Fill,
-            StyleFile::Stroke { width, closed } => Style::Stroke { width, closed },
-        };
-        let anchors = s
-            .anchors
-            .into_iter()
-            .map(|[p, i, o]| Anchor {
-                point: Vec2::from_array(p),
-                handle_in: Vec2::from_array(i),
-                handle_out: Vec2::from_array(o),
-            })
-            .collect();
-        layer.insert_shape(i, Shape::new(anchors, style, PaletteIndex(s.color))?);
-    }
-    Ok(layer)
+fn shape(s: ShapeFile) -> Result<Shape, crate::ShapeError> {
+    let style = match s.style {
+        StyleFile::Fill => Style::Fill,
+        StyleFile::Stroke { width, closed } => Style::Stroke { width, closed },
+    };
+    let anchors = s
+        .anchors
+        .into_iter()
+        .map(|[p, i, o]| Anchor {
+            point: Vec2::from_array(p),
+            handle_in: Vec2::from_array(i),
+            handle_out: Vec2::from_array(o),
+        })
+        .collect();
+    Shape::new(anchors, style, PaletteIndex(s.color))
 }
 
 /// Whether `rel` is a relative path that names no parent directory.
@@ -692,25 +709,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn encode_indexed(image: &IndexedImage, palette: &Palette) -> Result<Vec<u8>, png::EncodingError> {
+fn encode_raster(raster: &Raster) -> Result<Vec<u8>, png::EncodingError> {
     let mut out = Vec::new();
-    let mut enc = png::Encoder::new(&mut out, image.size().x, image.size().y);
-    enc.set_color(png::ColorType::Indexed);
+    let mut enc = png::Encoder::new(&mut out, raster.size().x, raster.size().y);
+    enc.set_color(png::ColorType::GrayscaleAlpha);
     enc.set_depth(png::BitDepth::Eight);
-    let mut colors = palette.colors().to_vec();
-    if colors.is_empty() {
-        // PNG needs a palette entry; an image over an empty palette has no
-        // pixels to use it.
-        colors.push(Rgba8::new(0, 0, 0, 255));
-    }
-    enc.set_palette(
-        colors
-            .iter()
-            .flat_map(|c| [c.r, c.g, c.b])
-            .collect::<Vec<_>>(),
-    );
-    enc.set_trns(colors.iter().map(|c| c.a).collect::<Vec<_>>());
-    let pixels: Vec<u8> = image.pixels().iter().map(|i| i.0).collect();
+    let pixels: Vec<u8> = raster
+        .pixels()
+        .iter()
+        .flat_map(|p| p.map_or([0, 0], |i| [i.0, 255]))
+        .collect();
     enc.write_header()?.write_image_data(&pixels)?;
     Ok(out)
 }
@@ -758,16 +766,27 @@ fn read_png(
     Ok((info.color_type, info.bit_depth, buf))
 }
 
-fn read_indexed(path: &Path, size: UVec2) -> Result<IndexedImage, LoadError> {
+fn read_raster(path: &Path, size: UVec2) -> Result<Raster, LoadError> {
     let (color, depth, pixels) = read_png(path, size)?;
-    if (color, depth) != (png::ColorType::Indexed, png::BitDepth::Eight) {
+    if (color, depth) != (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) {
         return Err(LoadError::Image(
             path.to_owned(),
-            "must be an 8-bit indexed PNG".into(),
+            "must be an 8-bit grayscale-and-alpha PNG".into(),
         ));
     }
-    IndexedImage::new(size, pixels.into_iter().map(PaletteIndex).collect())
-        .map_err(|e| LoadError::Image(path.to_owned(), e.to_string()))
+    let (pixels, _) = pixels.as_chunks::<2>();
+    let pixels = pixels
+        .iter()
+        .map(|&[index, alpha]| match alpha {
+            0 => Ok(None),
+            255 => Ok(Some(PaletteIndex(index))),
+            _ => Err(LoadError::Image(
+                path.to_owned(),
+                format!("has alpha {alpha}; raster layer pixels are set (255) or not (0)"),
+            )),
+        })
+        .collect::<Result<_, _>>()?;
+    Raster::new(size, pixels).map_err(|e| LoadError::Image(path.to_owned(), e.to_string()))
 }
 
 fn read_rgba(path: &Path, size: UVec2) -> Result<RgbaImage, LoadError> {
@@ -789,7 +808,7 @@ fn read_rgba(path: &Path, size: UVec2) -> Result<RgbaImage, LoadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VariantRef, shape};
+    use crate::{IndexedImage, VariantRef, shape};
 
     fn sample() -> Project {
         let palette =
@@ -832,8 +851,8 @@ mod tests {
             Slot("eyes".into()),
             UVec2::new(4, 2),
             [
-                ("1".to_owned(), underlay.clone()),
-                ("2".to_owned(), underlay),
+                Variant::imported("1", underlay.clone()),
+                Variant::imported("2", underlay),
             ],
         )
         .unwrap();
@@ -884,8 +903,14 @@ mod tests {
             high.opacity = 0.5;
             high.locked = true;
             high.insert_shape(0, ring.unwrap());
-            v.insert_layer(0, low);
-            v.insert_layer(1, high);
+            // Set and unset pixels, over the base layer.
+            let mut dots = Raster::clear(UVec2::new(4, 2));
+            dots.draw_line(Vec2::ZERO, Vec2::new(3.5, 0.5), 1.0, Some(PaletteIndex(1)));
+            let mut dots = Layer::raster("dots", dots);
+            dots.visible = false;
+            v.insert_layer(1, low);
+            v.insert_layer(2, high);
+            v.insert_layer(0, dots);
         })
         .unwrap();
         p
@@ -917,9 +942,9 @@ mod tests {
         let mut p = sample();
         save(&p, dir.path()).unwrap();
         let first = images(dir.path());
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
 
-        // Merging colors changes every underlay. Until the project file is
+        // Merging colors changes every raster layer. Until the project file is
         // replaced, the old one still loads with its own images.
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
             .unwrap();
@@ -951,7 +976,7 @@ mod tests {
         save(&p, dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), p);
         let second = images(dir.path());
-        assert_eq!(second.len(), 3);
+        assert_eq!(second.len(), 4);
         assert!(
             second
                 .iter()
@@ -995,7 +1020,7 @@ mod tests {
         save(&p, dir.path()).unwrap();
         // A link with a saved image's name, pointing at the project file,
         // that the project file names.
-        let name = "0-0-0123456789abcdef.png";
+        let name = "0-0-0-0123456789abcdef.png";
         std::os::unix::fs::symlink("../project.ron", dir.path().join(IMAGE_DIR).join(name))
             .unwrap();
         let manifest = dir.path().join(PROJECT_FILE);
@@ -1003,7 +1028,7 @@ mod tests {
         let first = images(dir.path())
             .into_iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
-            .find(|f| f.starts_with("0-0-") && f != name)
+            .find(|f| f.starts_with("0-0-0-") && f != name)
             .unwrap();
         std::fs::write(&manifest, text.replace(&first, name)).unwrap();
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
@@ -1016,8 +1041,13 @@ mod tests {
     fn save_refuses_textures_load_would_refuse() {
         let size = UVec2::new(MAX_TEXTURE_SIDE + 1, 1);
         let wide = IndexedImage::new(size, vec![PaletteIndex(0); size.x as usize]).unwrap();
-        let texture =
-            Texture::painted("wide", Slot("body".into()), size, [("1".to_owned(), wide)]).unwrap();
+        let texture = Texture::painted(
+            "wide",
+            Slot("body".into()),
+            size,
+            [Variant::imported("1", wide)],
+        )
+        .unwrap();
         let mut textures = sample().textures().to_vec();
         textures.push(texture);
         let p = Project::new(
@@ -1051,14 +1081,15 @@ mod tests {
 
     #[test]
     fn only_saved_image_names_are_cleaned_up() {
-        assert!(is_saved_image_name("3-0-0123456789abcdef.png"));
+        assert!(is_saved_image_name("3-0-2-0123456789abcdef.png"));
         assert!(is_saved_image_name("12-preview-0123456789abcdef.png"));
         for name in [
             "reference.png",
             "3-0.png",
-            "3-0-0123456789ABCDEF.png",
-            "3-x-0123456789abcdef.png",
-            "3-0-0123456789abcdef.ron",
+            "3-0-0123456789abcdef.png",
+            "3-0-2-0123456789ABCDEF.png",
+            "3-x-2-0123456789abcdef.png",
+            "3-0-2-0123456789abcdef.ron",
         ] {
             assert!(!is_saved_image_name(name), "{name}");
         }
@@ -1099,7 +1130,7 @@ mod tests {
             Err(LoadError::TextureTooLarge { .. })
         ));
 
-        // An underlay pixel past the palette's end fails as a project would.
+        // A raster pixel past the palette's end fails as a project would.
         let one_color = text.replace("(200, 100, 0, 128),", "");
         assert_ne!(one_color, text);
         std::fs::write(&path, one_color).unwrap();

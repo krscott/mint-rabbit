@@ -44,8 +44,9 @@ _Avoid_: Stitch vertex, shared vertex
 ### Painting
 
 **Palette**:
-The project's ordered list of colors; every shape and every underlay pixel of
-an exported texture refers to a palette entry rather than holding its own color.
+The project's ordered list of colors; every shape and every raster layer pixel
+refers to a palette entry rather than holding its own color. A pixel that no
+visible layer covers takes the first entry.
 _Avoid_: Color table, TLUT, swatches
 
 **Texture**:
@@ -73,20 +74,27 @@ _Avoid_: Shader, render mode
 
 **Variant**:
 One alternative image of a texture, such as one eye expression, with its own
-underlay and layer stack; the Model View shows one variant per texture at a
-time.
+layer stack; the Model View shows one variant per texture at a time.
 _Avoid_: Expression, frame, version
 
-**Underlay**:
-The imported raster image beneath a variant's layers; it is never edited, only
-shown, hidden, or replaced.
-_Avoid_: Base texture, background
-
 **Layer**:
-An ordered list of shapes in one variant, with its own visibility (hidden
-layers neither show nor export), lock, and display-only opacity that never
-affects export.
+One level of a variant's stack, either a vector layer or a raster layer, with
+its own visibility (hidden layers neither show nor export), lock, and
+display-only opacity that never affects export.
 _Avoid_: Group, folder
+
+**Vector Layer**:
+A layer holding an ordered list of shapes.
+_Avoid_: Shape layer
+
+**Raster Layer**:
+A layer holding one palette entry or nothing for each pixel of its texture,
+such as the image a variant was imported with.
+_Avoid_: Underlay, base texture, bitmap, pixel layer
+
+**Rasterize**:
+To turn a vector layer into a raster layer of the pixels its shapes cover.
+_Avoid_: Flatten, bake
 
 **Shape**:
 A single vector element in texture space: a Bézier path drawn in one style and

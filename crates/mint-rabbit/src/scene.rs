@@ -25,7 +25,9 @@ pub fn texture_pixels(project: &Project, texture: &Texture, variant: usize) -> V
         TextureContent::Painted(variants) => {
             let v = &variants[variant];
             let color = |i| entry_color(project, i);
-            let mut out: Vec<Rgba8> = v.underlay().pixels().iter().map(|&i| color(i)).collect();
+            // Under every layer, the entry that uncovered pixels export as.
+            let size = texture.size();
+            let mut out = vec![color(PaletteIndex(0)); (size.x * size.y) as usize];
             for layer in v.layers().iter().filter(|l| l.visible) {
                 let opacity = if layer.opacity.is_nan() {
                     1.0
@@ -179,7 +181,7 @@ mod tests {
     use glam::{Quat, UVec2};
     use mint_core::{
         AlphaMode, Corner, IndexedImage, Material, Mesh, Model, NodeId, Palette, PaletteIndex,
-        Pose, Shape, Slot, Style, Transform, Triangle, Vertex, Wrap, shape,
+        Pose, Shape, Slot, Style, Transform, Triangle, Variant, Vertex, Wrap, shape,
     };
 
     use super::*;
@@ -219,8 +221,13 @@ mod tests {
         let mut pose = Pose::default();
         pose.set_rotation(child, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
         let img = IndexedImage::new(UVec2::new(1, 1), vec![PaletteIndex(0)]).unwrap();
-        let texture =
-            Texture::painted("t", Slot("body".into()), UVec2::ONE, [("1".into(), img)]).unwrap();
+        let texture = Texture::painted(
+            "t",
+            Slot("body".into()),
+            UVec2::ONE,
+            [Variant::imported("1", img)],
+        )
+        .unwrap();
         Project::new(
             mint_core::ExportTarget::new(mint_ac::TARGET),
             Palette::from_colors([Rgba8::new(255, 1, 2, 255)]).unwrap(),

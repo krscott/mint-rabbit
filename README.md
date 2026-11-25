@@ -24,14 +24,20 @@ decomp… opens another checkout.
 
 The thumbnails above the Texture View choose the texture it shows and, for a
 texture with several, the variant. Paint in it with the tools at its left:
-Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R). Shapes go on
-the picked layer, which must be visible and unlocked, in the picked palette
-color and the style set in the bar above the view. With the Select tool and
-shapes picked, that bar shows and changes their style instead, and can recolor,
-duplicate, reorder, and move them to another layer.
+Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R) for shapes, and
+Pencil (N), Eraser (Shift+E), and Fill (G) for pixels. Painting goes on the
+picked layer, which must be visible and unlocked, in the picked palette color
+and the style set in the bar above the view. A vector layer holds shapes; a
+raster layer holds pixels, and Pen, Ellipse, and Rectangle paint their finished
+shape into it. Tools that don't fit the picked layer are disabled. With the
+Select tool and shapes picked, that bar shows and changes their style instead,
+and can recolor, duplicate, reorder, and move them to another layer.
 
 The panel at the right holds the palette and the layers of the variant shown.
-Double-click a layer's name to rename it.
+An imported image arrives as a locked raster layer named Base. Pixels no
+visible layer covers show and export as the first palette entry. Double-click a
+layer's name to rename it, or right-click it to rename, duplicate, copy to
+other variants, rasterize, or delete it.
 
 - Select: drag a shape to move it, the square handles outside its corners to
   scale (Shift keeps proportions), and the round handle to rotate (Shift snaps

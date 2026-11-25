@@ -13,7 +13,7 @@ pub use pose::Pose;
 pub use project::{EditError, ExportTarget, PaletteError, Project, ProjectError, VariantRef};
 pub use shape::{Anchor, Outline, Shape, ShapeError, Style};
 pub use texture::{
-    AlphaMode, IndexedImage, Layer, Material, MaterialId, Palette, PaletteFull, PaletteIndex,
-    PixelCountMismatch, Rgba8, RgbaImage, Slot, Texture, TextureContent, TextureError, TextureId,
-    Variant, Wrap,
+    AlphaMode, BASE_LAYER, IndexedImage, Layer, LayerContent, LayerKind, Material, MaterialId,
+    Palette, PaletteFull, PaletteIndex, PixelCountMismatch, Raster, Rgba8, RgbaImage, Slot,
+    Texture, TextureContent, TextureError, TextureId, Variant, Wrap,
 };

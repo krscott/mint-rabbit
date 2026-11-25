@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use glam::{EulerRot, Quat, UVec2, Vec2, Vec3};
 use mint_core::{
     Corner, ExportTarget, IndexedImage, Material, MaterialId, Mesh, Model, NodeId, Palette, Pose,
-    Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle, Vertex,
+    Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle, Variant, Vertex,
 };
 
 use crate::TextureExport;
@@ -665,7 +665,7 @@ pub(crate) fn build_project(
                     .enumerate()
                     .map(|(k, name)| {
                         let img = ci4_image(tex_file, name, &bytes(tex_file, name)?, size)?;
-                        Ok((format!("{}", k + 1), img))
+                        Ok(Variant::imported(format!("{}", k + 1), img))
                     })
                     .collect::<Result<Vec<_>, ImportError>>()?;
                 Texture::painted(slot, Slot(slot.into()), size, variants)?
@@ -694,7 +694,12 @@ pub(crate) fn build_project(
                 })?;
                 let name = format!("{SLOT_BODY} {offset:#05x}");
                 let img = ci4_image(tex_file, &name, data, size)?;
-                Texture::painted(name, Slot(SLOT_BODY.into()), size, [("1".to_owned(), img)])?
+                Texture::painted(
+                    name,
+                    Slot(SLOT_BODY.into()),
+                    size,
+                    [Variant::imported("1", img)],
+                )?
             }
         };
         texture_ids.insert(source, TextureId(textures.len() as u32));

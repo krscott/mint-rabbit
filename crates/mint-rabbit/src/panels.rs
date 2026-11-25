@@ -2,7 +2,7 @@
 //! bar for new and picked shapes.
 
 use eframe::egui::{self, Color32, Key, RichText, Sense};
-use mint_core::{Layer, PaletteIndex, Rgba8, Style, Variant, VariantRef};
+use mint_core::{Layer, LayerKind, PaletteIndex, Raster, Rgba8, Style, Variant, VariantRef};
 
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
@@ -217,13 +217,14 @@ fn row_toggle(ui: &mut egui::Ui, icon: Icon, dim: bool) -> egui::Response {
     ui.add(egui::Button::new(text).frame_when_inactive(false))
 }
 
-/// The variant's layers, top layer first, as they stack.
+/// The variant's layers, top layer first, as they stack. Returns what was
+/// chosen from a layer's right-click menu, for [`apply_layer_action`].
 pub fn layer_list(
     ui: &mut egui::Ui,
     t: &mut Target<'_>,
     previews: &mut Previews,
     rename: &mut Option<Rename>,
-) {
+) -> Option<LayerAction> {
     let count = t.layers().len();
     // A rename ends with its layer, as when the variant shown changes.
     if rename
@@ -235,9 +236,10 @@ pub fn layer_list(
     if count == 0 {
         ui.weak("No layers yet; painting adds one.");
     }
+    let mut action = None;
     for i in (0..count).rev() {
         let layer = &t.layers()[i];
-        let (visible, locked) = (layer.visible, layer.locked);
+        let (visible, locked, kind) = (layer.visible, layer.locked, layer.kind());
         let (name, shapes) = (layer.name.clone(), layer.shapes().len());
         let picked = t.selection.layer == i;
         ui.horizontal(|ui| {
@@ -260,7 +262,7 @@ pub fn layer_list(
                 let (project, generation) = (t.editor.project(), t.editor.generation());
                 previews.layer(ctx, project, generation, t.variant, i)
             };
-            let mut pick = thumbnail(ui, LAYER_PREVIEW, picked, preview).clicked();
+            let mut rows = vec![thumbnail(ui, LAYER_PREVIEW, picked, preview)];
             if let Some(n) = rename.as_mut().filter(|n| n.layer == i) {
                 let field =
                     ui.add(egui::TextEdit::singleline(&mut n.typed).desired_width(f32::INFINITY));
@@ -275,14 +277,21 @@ pub fn layer_list(
                     field.request_focus();
                 }
             } else {
+                // A raster layer has pixels rather than a count of shapes.
+                let (marker, what) = match kind {
+                    LayerKind::Vector => (RichText::new(shapes.to_string()).weak(), "Vector layer"),
+                    LayerKind::Raster => (
+                        icons::text(Icon::Grid3x3, icons::SMALL).weak(),
+                        "Raster layer",
+                    ),
+                };
                 let button = egui::Button::selectable(picked, name.as_str())
                     .truncate()
-                    .right_text(RichText::new(shapes.to_string()).weak());
+                    .right_text(marker);
                 let size = [ui.available_width(), LAYER_PREVIEW.y];
                 let row = ui
                     .add_sized(size, button)
-                    .on_hover_text(format!("{name}\nDouble-click to rename"));
-                pick |= row.clicked();
+                    .on_hover_text(format!("{name}\n{what}; double-click to rename"));
                 if row.double_clicked() {
                     *rename = Some(Rename {
                         variant: t.variant,
@@ -290,12 +299,72 @@ pub fn layer_list(
                         typed: name,
                     });
                 }
+                rows.push(row);
             }
+            // A right-click picks the layer, then opens the menu of what
+            // can be done to it.
+            let pick = rows.iter().any(|r| r.clicked() || r.secondary_clicked());
             if pick && !picked {
                 t.pick_layer(i);
             }
+            for row in rows {
+                row.context_menu(|ui| {
+                    if let Some(a) = layer_menu(ui, t, i) {
+                        action = Some(a);
+                        ui.close();
+                    }
+                });
+            }
         });
     }
+    action
+}
+
+/// The options for layer `i`, the picked layer, in its right-click menu.
+fn layer_menu(ui: &mut egui::Ui, t: &Target<'_>, i: usize) -> Option<LayerAction> {
+    let layer = t.layers().get(i)?;
+    let mut action = None;
+    if ui.button("Rename").clicked() {
+        action = Some(LayerAction::Rename);
+    }
+    if ui.button("Duplicate").clicked() {
+        action = Some(LayerAction::Duplicate);
+    }
+    // Other variants of the same texture to copy the layer onto.
+    let texture = t.editor.project().texture(t.variant.texture);
+    let others = || (0..texture.variants().len()).filter(|&k| k != t.variant.variant);
+    if others().next().is_some() {
+        ui.menu_button("Copy to", |ui| {
+            if ui.button("All other variants").clicked() {
+                action = Some(LayerAction::CopyTo(others().collect()));
+            }
+            for k in others() {
+                let name = &texture.variants()[k].name;
+                if ui.button(format!("Variant {name}")).clicked() {
+                    action = Some(LayerAction::CopyTo(vec![k]));
+                }
+            }
+        });
+    }
+    let locked = "The layer is locked";
+    if layer.kind() == LayerKind::Vector
+        && ui
+            .add_enabled(!layer.locked, egui::Button::new("Rasterize"))
+            .on_hover_text("Turn the shapes into pixels; only undo turns them back")
+            .on_disabled_hover_text(locked)
+            .clicked()
+    {
+        action = Some(LayerAction::Rasterize);
+    }
+    ui.separator();
+    if ui
+        .add_enabled(!layer.locked, egui::Button::new("Delete"))
+        .on_disabled_hover_text(locked)
+        .clicked()
+    {
+        action = Some(LayerAction::Delete);
+    }
+    action
 }
 
 /// A button holding only an icon, named by `hover` whether or not it is
@@ -334,9 +403,13 @@ pub fn layer_opacity(ui: &mut egui::Ui, t: &mut Target<'_>) {
     });
 }
 
-/// What a click among the layer actions asks for, done to the picked layer.
+/// What a click among the layer actions or in a layer's menu asks for, done
+/// to the picked layer.
 pub enum LayerAction {
     New,
+    NewRaster,
+    Rename,
+    Rasterize,
     Delete,
     Up,
     Down,
@@ -353,8 +426,11 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &Target<'_>) -> Option<LayerAction> {
     let i = t.selection.layer;
     let mut action = None;
     ui.horizontal(|ui| {
-        if icon_button(ui, Icon::Plus, true, "New layer").clicked() {
+        if icon_button(ui, Icon::Plus, true, "New vector layer").clicked() {
             action = Some(LayerAction::New);
+        }
+        if icon_button(ui, Icon::ImagePlus, true, "New raster layer").clicked() {
+            action = Some(LayerAction::NewRaster);
         }
         let Some(layer) = t.layers().get(i) else {
             return;
@@ -373,53 +449,49 @@ pub fn layer_actions(ui: &mut egui::Ui, t: &Target<'_>) -> Option<LayerAction> {
         if icon_button(ui, Icon::ArrowDown, i > 0, "Move the picked layer down").clicked() {
             action = Some(LayerAction::Down);
         }
-        let more = ui.menu_button(icons::text(Icon::Ellipsis, icons::SMALL), |ui| {
-            if ui.button("Duplicate").clicked() {
-                action = Some(LayerAction::Duplicate);
-                ui.close();
-            }
-            // Other variants of the same texture to copy the layer onto.
-            let texture = t.editor.project().texture(t.variant.texture);
-            let others = || (0..texture.variants().len()).filter(|&k| k != t.variant.variant);
-            if others().next().is_none() {
-                return;
-            }
-            ui.menu_button("Copy to", |ui| {
-                if ui.button("All other variants").clicked() {
-                    action = Some(LayerAction::CopyTo(others().collect()));
-                    ui.close();
-                }
-                for k in others() {
-                    let name = &texture.variants()[k].name;
-                    if ui.button(format!("Variant {name}")).clicked() {
-                        action = Some(LayerAction::CopyTo(vec![k]));
-                        ui.close();
-                    }
-                }
-            });
-        });
-        more.response.on_hover_text("More layer actions");
     });
     action
 }
 
 /// Does `action` to the picked layer, and picks the layer to act on next:
 /// the new, moved, or duplicated layer, or the one under a deleted layer.
-pub fn apply_layer_action(t: &mut Target<'_>, action: LayerAction) {
+pub fn apply_layer_action(t: &mut Target<'_>, rename: &mut Option<Rename>, action: LayerAction) {
     let count = t.layers().len();
     let i = t.selection.layer;
     match action {
-        LayerAction::New => {
+        LayerAction::New | LayerAction::NewRaster => {
             let at = if count == 0 { 0 } else { i + 1 };
             let name = format!("Layer {}", count + 1);
-            if t.edit(|v| v.insert_layer(at, Layer::new(name))).is_some() {
+            let added = t.edit(|v| {
+                let layer = match action {
+                    LayerAction::NewRaster => Layer::raster(name, Raster::clear(v.size())),
+                    _ => Layer::new(name),
+                };
+                v.insert_layer(at, layer);
+            });
+            if added.is_some() {
                 t.pick_layer(at);
             }
         }
         // The rest need a picked layer.
         _ if i >= count => {}
-        // A locked layer stays, whatever was picked when Delete was clicked.
-        LayerAction::Delete if t.layers()[i].locked => {}
+        LayerAction::Rename => {
+            *rename = Some(Rename {
+                variant: t.variant,
+                layer: i,
+                typed: t.layers()[i].name.clone(),
+            });
+        }
+        // A locked layer stays as it is, whatever was picked when the
+        // action was chosen.
+        LayerAction::Rasterize | LayerAction::Delete if t.layers()[i].locked => {}
+        LayerAction::Rasterize => {
+            t.edit(|v| {
+                let size = v.size();
+                v.layers_mut()[i].rasterize(size);
+            });
+            t.pick_layer(i);
+        }
         LayerAction::Delete => {
             let removed = t.edit(|v| {
                 v.remove_layer(i);
@@ -500,6 +572,17 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool:
     } else {
         Vec::new()
     };
+    if matches!(tool, Tool::Pencil | Tool::Eraser) {
+        bar_label(ui, "Tip", "The pencil and eraser tip");
+        ui.add(stroke_width(&mut paint.width))
+            .on_hover_text("Tip width, rounded to whole pixels");
+        return;
+    }
+    if tool == Tool::Fill {
+        bar_label(ui, "Fill", "The fill tool");
+        ui.weak("Fills the joined pixels of one color, on the picked layer only");
+        return;
+    }
     let Some(&first) = picked.first() else {
         bar_label(ui, "New", "The style new shapes are painted in");
         if let Some(fill) = fill_or_stroke(ui, paint.fill) {
@@ -605,13 +688,14 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool:
     // There is nowhere to move them with only their own layer.
     ui.add_enabled_ui(t.layers().len() > 1, |ui| {
         let to_layer = ui.menu_button(icons::text(Icon::Layers, icons::SMALL), |ui| {
+            // Shapes go only onto unlocked vector layers.
             let layers: Vec<(String, bool)> = t
                 .layers()
                 .iter()
-                .map(|l| (l.name.clone(), l.locked))
+                .map(|l| (l.name.clone(), !l.locked && l.kind() == LayerKind::Vector))
                 .collect();
-            for (k, (name, locked)) in layers.iter().enumerate() {
-                if k == layer || !ui.add_enabled(!locked, egui::Button::new(name)).clicked() {
+            for (k, (name, open)) in layers.iter().enumerate() {
+                if k == layer || !ui.add_enabled(*open, egui::Button::new(name)).clicked() {
                     continue;
                 }
                 let moved = t.edit(|v| {

@@ -8,7 +8,9 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
 use glam::Vec3;
 use mint_ac::{Decomp, VillagerRef};
-use mint_core::{PaletteIndex, Project, Texture, TextureContent, TextureId, VariantRef};
+use mint_core::{
+    Layer, LayerKind, PaletteIndex, Project, Texture, TextureContent, TextureId, VariantRef,
+};
 
 use crate::camera::Orbit;
 use crate::editor::Editor;
@@ -191,6 +193,9 @@ fn tool_icon(tool: Tool) -> Icon {
         Tool::Brush => Icon::Brush,
         Tool::Ellipse => Icon::Circle,
         Tool::Rectangle => Icon::Square,
+        Tool::Pencil => Icon::Pencil,
+        Tool::Eraser => Icon::Eraser,
+        Tool::Fill => Icon::PaintBucket,
     }
 }
 
@@ -577,6 +582,24 @@ impl App {
         }
     }
 
+    /// The kind of the picked layer, or `None` with no painted variant
+    /// shown or no layers in it.
+    fn picked_kind(&mut self) -> Option<LayerKind> {
+        let doc = self.doc.as_mut()?;
+        let variant = doc.variant()?;
+        doc.selection.fit(doc.editor.project(), variant);
+        let layers = doc.editor.project().variant(variant).layers();
+        layers.get(doc.selection.layer).map(Layer::kind)
+    }
+
+    /// Switches to a tool that works on the picked layer, if the current one
+    /// doesn't.
+    fn fit_tool(&mut self) {
+        if let Some(kind) = self.picked_kind() {
+            self.set_tool(self.tool.on(kind));
+        }
+    }
+
     /// Shows a variant in the Texture View, and that variant of its texture
     /// in the Model View. Picks don't carry over to another variant.
     fn show_variant(&mut self, r: VariantRef) {
@@ -778,15 +801,16 @@ impl App {
             let action = panels::layer_actions(ui, &target);
             panels::layer_opacity(ui, &mut target);
             ui.separator();
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            let menu = ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        panels::layer_list(ui, &mut target, &mut doc.previews, &mut doc.rename);
-                    });
+                        panels::layer_list(ui, &mut target, &mut doc.previews, &mut doc.rename)
+                    })
+                    .inner
             });
-            if let Some(action) = action {
-                panels::apply_layer_action(&mut target, action);
+            if let Some(action) = action.or(menu.inner) {
+                panels::apply_layer_action(&mut target, &mut doc.rename, action);
             }
         });
     }
@@ -868,13 +892,26 @@ impl App {
             });
     }
 
+    /// The tools, those that don't work on the picked layer disabled.
     fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        let kind = self.picked_kind();
         for tool in Tool::ALL {
             let icon = icons::text(tool_icon(tool), icons::LARGE);
             let button =
                 egui::Button::selectable(self.tool == tool, icon).min_size(egui::vec2(28.0, 28.0));
-            let hover = format!("{} ({})", tool.label(), tool.key().name());
-            if ui.add(button).on_hover_text(hover).clicked() {
+            let keys = ui.ctx().format_shortcut(&tool.shortcut());
+            let hover = format!("{} ({keys})", tool.label());
+            let works = kind.is_none_or(|k| tool.works_on(k));
+            let disabled = match kind {
+                Some(LayerKind::Vector) => format!("{hover}\nPick a raster layer to use it"),
+                _ => format!("{hover}\nPick a vector layer to use it"),
+            };
+            if ui
+                .add_enabled(works, button)
+                .on_hover_text(hover)
+                .on_disabled_hover_text(disabled)
+                .clicked()
+            {
                 self.set_tool(tool);
             }
         }
@@ -888,6 +925,8 @@ impl App {
             self.style_bar(ui);
         });
         ui.separator();
+        // After the dock, where the picked layer may have changed.
+        self.fit_tool();
         let painted = self.doc.as_ref().is_some_and(|d| d.variant().is_some());
         let rest = ui.available_rect_before_wrap();
         let (tools, view) = rest.split_left_right_at_x(rest.left() + TOOLS_WIDTH);
@@ -980,8 +1019,13 @@ impl App {
         {
             panels::duplicate(&mut t);
         }
+        let kind = self.picked_kind();
         for tool in Tool::ALL {
-            if ctx.input(|i| i.key_pressed(tool.key()) && i.modifiers.is_none()) {
+            let keys = tool.shortcut();
+            let pressed = ctx.input(|i| {
+                i.modifiers.matches_exact(keys.modifiers) && i.key_pressed(keys.logical_key)
+            });
+            if pressed && kind.is_none_or(|k| tool.works_on(k)) {
                 self.set_tool(tool);
             }
         }

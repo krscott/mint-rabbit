@@ -13,7 +13,7 @@ use glam::{UVec2, Vec2, Vec3};
 use mint_core::{
     AlphaMode, Corner, IndexedImage, Material, MaterialId, Mesh, Model, NodeId, Palette,
     PaletteIndex, Pose, Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle,
-    Vertex, Wrap,
+    Variant, Vertex, Wrap,
 };
 
 const PALETTE: [[u8; 3]; 16] = [
@@ -99,7 +99,7 @@ fn main() {
                         2
                     }
                 });
-                (format!("{}", k + 1), img)
+                Variant::imported(format!("{}", k + 1), img)
             }),
         )
         .unwrap(),
@@ -116,7 +116,7 @@ fn main() {
                         2
                     }
                 });
-                (format!("{}", k + 1), img)
+                Variant::imported(format!("{}", k + 1), img)
             }),
         )
         .unwrap(),
@@ -129,8 +129,8 @@ fn main() {
             "body",
             Slot(mint_ac::SLOT_BODY.into()),
             body_size,
-            [(
-                "1".to_owned(),
+            [Variant::imported(
+                "1",
                 image(
                     body_size,
                     |x, y| {
@@ -144,8 +144,8 @@ fn main() {
             "head",
             Slot(mint_ac::SLOT_BODY.into()),
             head_size,
-            [(
-                "1".to_owned(),
+            [Variant::imported(
+                "1",
                 image(head_size, |x, y| {
                     if y > 28 {
                         4
