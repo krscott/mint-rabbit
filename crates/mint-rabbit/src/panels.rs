@@ -628,6 +628,8 @@ fn position(value: &mut f32, max: u32, step: f64) -> egui::DragValue<'_> {
         .range(0.0..=max as f32)
         .speed(step)
         .fixed_decimals(1)
+        // A typed value snaps once it is entered, not at each keystroke.
+        .update_while_editing(false)
 }
 
 /// The options for layer `i` in its right-click menu.

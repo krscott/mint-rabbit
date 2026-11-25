@@ -271,9 +271,9 @@ impl Raster {
     }
 
     /// Whether a fill of pixels of value `old` still has pixel `i` to fill:
-    /// it has that value and, while writes are tracked, isn't written yet.
-    fn fillable(&self, i: usize, old: Option<PaletteIndex>) -> bool {
-        self.pixels[i] == old && !self.written.get(i).is_some_and(|&w| w)
+    /// it has that value and isn't marked in `filled`.
+    fn fillable(&self, i: usize, old: Option<PaletteIndex>, filled: &[bool]) -> bool {
+        self.pixels[i] == old && !filled.get(i).is_some_and(|&f| f)
     }
 
     /// Writes `value` to pixel `i`.
@@ -333,10 +333,16 @@ impl Raster {
         };
         let old = self.pixels[start];
         // Filling with the value a region has changes nothing, but while
-        // written pixels are tracked it still writes them, each once.
+        // written pixels are tracked it still writes them, each once, as
+        // marked in `filled`; a fill with a new value needs no marks.
         if old == value && self.written.is_empty() {
             return;
         }
+        let mut filled = if old == value {
+            vec![false; self.pixels.len()]
+        } else {
+            Vec::new()
+        };
         // Scanline fill: each run of a row is filled as it is queued, so it
         // is queued once and the queue never holds more runs than the
         // raster has. Taking runs in the order queued usually keeps it near
@@ -344,13 +350,16 @@ impl Raster {
         // maze whose dead ends all lie equally far from the start can still
         // queue them all at once.
         let mut runs = std::collections::VecDeque::new();
-        runs.push_back(self.fill_run(x, y, old, value));
+        runs.push_back(self.fill_run(x, y, old, value, &mut filled));
         while let Some((left, right, y)) = runs.pop_front() {
             for ny in [y - 1, y + 1] {
                 let mut fx = left;
                 while fx <= right {
-                    if self.index(fx, ny).is_some_and(|i| self.fillable(i, old)) {
-                        let run = self.fill_run(fx, ny, old, value);
+                    if self
+                        .index(fx, ny)
+                        .is_some_and(|i| self.fillable(i, old, &filled))
+                    {
+                        let run = self.fill_run(fx, ny, old, value, &mut filled);
                         fx = run.1 + 1;
                         runs.push_back(run);
                     } else {
@@ -362,15 +371,17 @@ impl Raster {
     }
 
     /// Sets the run of `old` pixels through `(x, y)` in its row to `value`,
-    /// returning its left and right ends and its row.
+    /// marking them in `filled` if it has room, and returns the run's left
+    /// and right ends and its row.
     fn fill_run(
         &mut self,
         x: i64,
         y: i64,
         old: Option<PaletteIndex>,
         value: Option<PaletteIndex>,
+        filled: &mut [bool],
     ) -> (i64, i64, i64) {
-        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.fillable(i, old));
+        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.fillable(i, old, filled));
         let (mut left, mut right) = (x, x);
         while matches(self, left - 1) {
             left -= 1;
@@ -381,6 +392,9 @@ impl Raster {
         let start = self.index(left, y).expect("the run is inside the raster");
         for i in start..=start + (right - left) as usize {
             self.write(i, value);
+            if let Some(f) = filled.get_mut(i) {
+                *f = true;
+            }
         }
         (left, right, y)
     }
@@ -1160,7 +1174,20 @@ mod tests {
         l.modifiers.push(mirror_x(4));
         dot(&mut l, 0.5, Some(1));
         assert_eq!(stored(&l), "1..1");
-        // So does filling, through the region that shows, copies included.
+        // So does filling, through the region that shows, copies included,
+        // also after other writes in the same edit.
+        let mut l = raster_layer(&["111111"]);
+        l.modifiers.push(mirror_x(0));
+        l.edit_raster(|r| {
+            r.draw_line(
+                Vec2::new(3.5, 0.5),
+                Vec2::new(3.5, 0.5),
+                1.0,
+                Some(PaletteIndex(1)),
+            );
+            r.fill(Vec2::new(1.5, 0.5), Some(PaletteIndex(2)));
+        });
+        assert_eq!(stored(&l), "222222");
         let mut l = raster_layer(&["11.2"]);
         l.modifiers.push(mirror_x(4));
         l.edit_raster(|r| r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(1))));
