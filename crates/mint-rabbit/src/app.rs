@@ -151,6 +151,12 @@ fn export_imported(project: &Project) -> Result<mint_ac::TextureExport, String> 
 enum Status {
     Info(String),
     Error(String),
+    /// Why an edit was refused, shown until the project next changes (by
+    /// an edit, undo, or redo) from `generation`, the editor's then.
+    Refused {
+        message: String,
+        generation: u64,
+    },
 }
 
 /// The one dialog open over the window.
@@ -752,6 +758,16 @@ impl App {
     /// The last thing done or what went wrong, and at the right whether the
     /// project can export.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // A refusal lasts until the project changes, as when the user fixes
+        // what caused it.
+        if let Some(Status::Refused { generation, .. }) = self.status
+            && self
+                .doc
+                .as_ref()
+                .is_none_or(|d| d.editor.generation() != generation)
+        {
+            self.status = None;
+        }
         let ready = self.export_ready();
         ui.horizontal(|ui| {
             let half = ui.available_width() * 0.5;
@@ -772,7 +788,9 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let text = match &self.status {
-                        Some(Status::Error(e)) => egui::RichText::new(e).color(ERROR),
+                        Some(Status::Error(e) | Status::Refused { message: e, .. }) => {
+                            egui::RichText::new(e).color(ERROR)
+                        }
                         Some(Status::Info(m)) => egui::RichText::new(m),
                         None => egui::RichText::new(" "),
                     };
@@ -1246,8 +1264,14 @@ impl eframe::App for App {
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
         self.dialogs(&ctx);
-        if let Some(refusal) = self.refusal.take() {
-            self.fail(refusal);
+        if let Some(message) = self.refusal.take()
+            && let Some(d) = &self.doc
+        {
+            let generation = d.editor.generation();
+            self.status = Some(Status::Refused {
+                message,
+                generation,
+            });
         }
         // A continuous edit (a drag, a slider, typing) is one undo step until
         // the pointer is released and no text field has focus.
