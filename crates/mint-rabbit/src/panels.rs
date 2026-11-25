@@ -557,6 +557,9 @@ fn apply_first_modifier(t: &mut Target<'_>) {
 }
 
 /// The settings of modifier `k` of the picked layer, which is of `kind`.
+/// Each control changes the modifier as it is when the change lands, so a
+/// field entering its edit in the frame another control is clicked keeps
+/// both.
 fn modifier_settings(
     ui: &mut egui::Ui,
     t: &mut Target<'_>,
@@ -565,8 +568,13 @@ fn modifier_settings(
     size: glam::UVec2,
 ) {
     let (variant, i) = (t.variant, t.selection.layer);
-    let set = |t: &mut Target<'_>, kind: ModifierKind, continuous: Option<&str>| {
-        let edit = |v: &mut Variant| v.layers_mut()[i].modifiers[k].kind = kind;
+    let set = |t: &mut Target<'_>,
+               change: &dyn Fn(ModifierKind) -> ModifierKind,
+               continuous: Option<&str>| {
+        let edit = |v: &mut Variant| {
+            let m = &mut v.layers_mut()[i].modifiers[k];
+            m.kind = change(m.kind);
+        };
         let result = match continuous {
             Some(what) => {
                 t.editor
@@ -591,15 +599,20 @@ fn modifier_settings(
                     .clicked()
                     && r.turns() != turns
                 {
-                    let r = Radial::nearest(turns, r.center().to_vec2(), size);
-                    set(t, ModifierKind::Radial(r), None);
+                    let turn = |kind| match kind {
+                        ModifierKind::Radial(r) => {
+                            ModifierKind::Radial(Radial::nearest(turns, r.center().to_vec2(), size))
+                        }
+                        other @ ModifierKind::Mirror(_) => other,
+                    };
+                    set(t, &turn, None);
                 }
             }
         }
         let (at, lines) = kind.guides();
         let at = at.to_vec2();
         for (axis, label) in [(0, "X"), (1, "Y")] {
-            if let ModifierKind::Mirror(m) = kind {
+            if let ModifierKind::Mirror(_) = kind {
                 let mut checked = lines[axis];
                 let mut flags = lines;
                 flags[axis] = !checked;
@@ -617,7 +630,11 @@ fn modifier_settings(
                 if box_.changed()
                     && let Some(axes) = other
                 {
-                    set(t, ModifierKind::Mirror(Mirror { axes, ..m }), None);
+                    let flip = |kind| match kind {
+                        ModifierKind::Mirror(m) => ModifierKind::Mirror(Mirror { axes, ..m }),
+                        other @ ModifierKind::Radial(_) => other,
+                    };
+                    set(t, &flip, None);
                 }
             }
             let hover = if axis == 0 {
@@ -632,7 +649,7 @@ fn modifier_settings(
                 .on_hover_text(hover)
                 .changed()
             {
-                set(t, kind.with_coordinate(axis, v, size), Some(label));
+                set(t, &|kind| kind.with_coordinate(axis, v, size), Some(label));
             }
         }
         if ui
@@ -640,7 +657,7 @@ fn modifier_settings(
             .on_hover_text("Move to the texture's center")
             .clicked()
         {
-            set(t, kind.centered(size), None);
+            set(t, &|kind| kind.centered(size), None);
         }
     });
 }
