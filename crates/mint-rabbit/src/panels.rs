@@ -530,12 +530,14 @@ pub fn modifier_stack(ui: &mut egui::Ui, t: &mut Target<'_>) {
     }
 }
 
-/// A change to the order of the picked layer's modifiers.
+/// A change to the picked layer's modifier stack that moves modifiers to
+/// other indices.
 enum Restack {
     /// Apply the first.
     Apply,
     /// Swap modifier `k` with the next.
     Swap(usize),
+    /// Delete modifier `k`.
     Delete(usize),
 }
 
