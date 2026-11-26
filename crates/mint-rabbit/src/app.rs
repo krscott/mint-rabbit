@@ -77,12 +77,15 @@ impl Doc {
             .or_else(|| (!project.textures().is_empty()).then_some(0))
             .map(|i| TextureId(i as u32));
         let scene = Arc::new(SceneData::new(&project, &variants, generation));
+        let selection = selected.map_or_else(Selection::default, |texture| {
+            Selection::top(&project, VariantRef { texture, variant: 0 })
+        });
         Self {
             editor: Editor::new(project, path),
             scene_for: (0, variants.clone()),
             variants,
             selected,
-            selection: Selection::default(),
+            selection,
             previews: Previews::default(),
             rename: None,
             scene,
@@ -616,7 +619,7 @@ impl App {
         if (doc.selected, doc.variants[i]) != (Some(r.texture), r.variant) {
             doc.selected = Some(r.texture);
             doc.variants[i] = r.variant;
-            doc.selection = Selection::default();
+            doc.selection = Selection::top(doc.editor.project(), r);
             self.texture_view.clear_pen();
         }
     }
