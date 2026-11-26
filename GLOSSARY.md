@@ -66,6 +66,12 @@ clothing; it holds only a preview image with its own colors and is never
 exported.
 _Avoid_: Placeholder, runtime texture
 
+**UV Island**:
+A connected part of a mesh drawn with one texture whose UVs run on without
+a cut or fold; a stroke can't continue straight from one UV island to
+another.
+_Avoid_: Island, UV shell, chart, seam (a seam vertex is something else)
+
 **Material**:
 How triangles draw with a texture: the texture, a wrap mode per axis (clamp,
 repeat, or mirror), an alpha mode (opaque or cutout), whether

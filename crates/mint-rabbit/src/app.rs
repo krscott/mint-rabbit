@@ -21,7 +21,7 @@ use crate::picker::{self, Gpu, Picker};
 use crate::previews::{Previews, thumbnail};
 use crate::render::{Ghost, ModelCallback, Renderer, SceneData};
 use crate::surface::Surface;
-use crate::texture_view::{self, Frame, ModelPointer, Paint, Selection, TextureView, Tool};
+use crate::texture_view::{self, Canvas, Frame, ModelPointer, Paint, Selection, TextureView, Tool};
 
 const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
 const REDO: KeyboardShortcut =
@@ -98,7 +98,7 @@ impl Doc {
             selection,
             previews: Previews::default(),
             rename: None,
-            surface: Surface::new(scene.clone()),
+            surface: Surface::new(scene.clone(), true),
             scene,
             check: None,
         }
@@ -1013,20 +1013,9 @@ impl App {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.model.hovered = response.hovered();
         self.model_ghost = None;
-        let Some(doc) = &mut self.doc else {
+        let Some(doc) = &self.doc else {
             return;
         };
-        let key = (doc.editor.generation(), doc.variants.clone());
-        if doc.scene_for != key {
-            self.generation += 1;
-            doc.scene = Arc::new(SceneData::new(
-                doc.editor.project(),
-                &doc.variants,
-                self.generation,
-            ));
-            doc.surface = Surface::new(doc.scene.clone());
-            doc.scene_for = key;
-        }
         let paint = self.model.mode == Mode::Paint && self.dialog.is_none();
         // The middle button turns the camera in either mode.
         let orbit = response.dragged_by(egui::PointerButton::Middle)
@@ -1044,18 +1033,38 @@ impl App {
         let pointer = response
             .interact_pointer_pos()
             .or_else(|| response.hover_pos());
-        let hit = pointer.and_then(|p| self.model.hit(&doc.surface, rect, p));
+        let hit = pointer
+            .filter(|_| paint)
+            .and_then(|p| self.model.hit(&doc.surface, rect, p));
         if paint {
             self.paint_model(ui, &response, rect, pointer, hit);
         }
         let Some(doc) = &mut self.doc else {
             return;
         };
+        // The scene with this frame's edits. The surface follows it between
+        // drags, so a drag meets the surface as it was when it began.
+        let key = (doc.editor.generation(), doc.variants.clone());
+        if doc.scene_for != key {
+            self.generation += 1;
+            doc.scene = Arc::new(SceneData::new(
+                doc.editor.project(),
+                &doc.variants,
+                self.generation,
+            ));
+            doc.scene_for = key;
+        }
+        let smooth = self.view.linear_filter;
+        let stale = !Arc::ptr_eq(doc.surface.scene(), &doc.scene) || doc.surface.smooth() != smooth;
+        if stale && !self.texture_view.dragging() {
+            doc.surface = doc.surface.with_scene(doc.scene.clone(), smooth);
+        }
 
-        // The tool's footprint where the pointer meets the model in Paint
-        // mode, or else the Texture View's Ghost Cursor.
+        // The tool's footprint where the pointer meets a painted texture in
+        // Paint mode, or else the Texture View's Ghost Cursor.
+        let project = doc.editor.project();
         let own = hit
-            .filter(|_| paint && response.hovered())
+            .filter(|h| response.hovered() && !project.texture(h.texture).variants().is_empty())
             .map(|h| (h.texture, h.point));
         if self.view.ghost_cursor {
             self.model_ghost = own;
@@ -1117,56 +1126,54 @@ impl App {
         pointer: Option<egui::Pos2>,
         hit: Option<crate::surface::Hit>,
     ) {
+        // Where the button went down, which may differ from where the
+        // pointer is by the time this frame sees the press.
         if response.hovered()
             && ui.input(|i| i.pointer.primary_pressed())
-            && let Some(h) = hit
+            && let Some(doc) = &self.doc
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+            && let Some(h) = self.model.hit(&doc.surface, rect, origin)
         {
             self.paint_texture(h.texture);
         }
         let Some(doc) = &mut self.doc else { return };
         let Some(r) = doc.variant() else { return };
         let on = |h: Option<crate::surface::Hit>| h.filter(|h| h.texture == r.texture);
-        let mut model_pointer = ModelPointer {
-            here: on(hit).map(|h| h.point),
-            texels_per_point: 1.0,
-            ..ModelPointer::default()
-        };
+        let mut press = None;
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(origin) = ui.input(|i| i.pointer.press_origin())
         {
-            self.model.press(&doc.surface, rect, origin);
-            model_pointer.press = on(self.model.hit(&doc.surface, rect, origin)).map(|h| h.point);
+            press = on(self.model.press(&doc.surface, rect, origin)).map(|h| h.point);
         }
-        if response.dragged_by(egui::PointerButton::Primary)
-            && let Some(p) = pointer
-        {
-            model_pointer.path = self.model.trail(&doc.surface, rect, p, r.texture);
-        }
+        // The release's frame may move the pointer last.
+        let primary = egui::PointerButton::Primary;
+        let path = match pointer {
+            Some(p) if response.dragged_by(primary) || response.drag_stopped_by(primary) => {
+                self.model.trail(&doc.surface, rect, p, r.texture)
+            }
+            _ => Vec::new(),
+        };
         // How near a click or press finds a pen anchor or a shape.
-        if (response.clicked() || response.drag_started())
-            && let (Some(p), Some(h)) = (pointer, on(hit))
-        {
-            model_pointer.texels_per_point = self.model.texels_per_point(&doc.surface, rect, p, &h);
-        }
-        self.texture_view.model_interact(
-            ui,
-            response,
-            Frame {
-                editor: &mut doc.editor,
-                previews: &mut doc.previews,
-                texture: r.texture,
-                variant: r.variant,
-                tool: self.tool,
-                paint: self.paint,
-                selection: &mut doc.selection,
-                show_uv: self.view.show_uv,
-                input: self.dialog.is_none(),
-                message: &mut self.refusal,
-                ghost: None,
-                model_hovered: true,
-            },
-            &model_pointer,
-        );
+        let texels_per_point = match (pointer, on(hit)) {
+            (Some(p), Some(h)) if response.clicked() || response.drag_started() => {
+                self.model.texels_per_point(&doc.surface, rect, p, &h)
+            }
+            _ => 1.0,
+        };
+        let model_pointer = ModelPointer {
+            press,
+            here: on(hit).map(|h| h.point),
+            path,
+            texels_per_point,
+        };
+        let canvas = Canvas {
+            editor: &mut doc.editor,
+            selection: &mut doc.selection,
+            paint: self.paint,
+            message: &mut self.refusal,
+        };
+        self.texture_view
+            .model_interact(ui, response, canvas, r, self.tool, &model_pointer);
     }
 
     /// Shows `texture`, pressed on in the Model View, in the Texture View so
@@ -1174,15 +1181,15 @@ impl App {
     /// texture while a pen path is open on this one.
     fn paint_texture(&mut self, texture: TextureId) {
         let Some(doc) = &self.doc else { return };
-        if doc.selected == Some(texture) {
-            return;
-        }
         let t = doc.editor.project().texture(texture);
         if t.variants().is_empty() {
             self.refusal = Some(format!(
                 "{} is filled in by the game, and isn't painted.",
                 t.name
             ));
+            return;
+        }
+        if doc.selected == Some(texture) {
             return;
         }
         if self.texture_view.drawing_path() {
@@ -1197,9 +1204,11 @@ impl App {
     }
 
     fn texture_view(&mut self, ui: &mut egui::Ui) {
-        self.texture_ghost = None;
         let Some(doc) = &mut self.doc else { return };
-        let Some(t) = doc.selected else { return };
+        let Some(t) = doc.selected else {
+            self.texture_ghost = None;
+            return;
+        };
         self.texture_view.show(
             ui,
             Frame {
@@ -1219,7 +1228,14 @@ impl App {
                 model_hovered: self.model.hovered,
             },
         );
-        self.texture_ghost = self.texture_view.hover().map(|p| (t, p));
+        // The Model View, already drawn this frame, shows the Texture View's
+        // edits and Ghost Cursor in the next.
+        let ghost = self.texture_view.hover().map(|p| (t, p));
+        let edited = doc.scene_for.0 != doc.editor.generation();
+        if edited || ghost != self.texture_ghost {
+            ui.ctx().request_repaint();
+        }
+        self.texture_ghost = ghost;
     }
 
     /// Keyboard shortcuts that work anywhere outside text fields.

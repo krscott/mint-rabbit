@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Vec2, Vec3};
+use glam::{IVec2, Vec2, Vec3};
 use mint_core::{AlphaMode, TextureId, Wrap};
 
 use crate::render::SceneData;
@@ -21,33 +21,31 @@ pub struct Hit {
     pub texture: TextureId,
     /// Where on the texture, in texels, after the material's wrap.
     pub point: Vec2,
-    /// The UV coordinate before wrapping, in texels.
-    unwrapped: Vec2,
-    /// The UV island the point is on: triangles of one texture joined by
-    /// edges whose ends share a position and a UV coordinate.
+    /// Which repeat of the texture the UV coordinate is in, before wrapping.
+    cell: IVec2,
+    /// The UV island the point is on.
     island: usize,
 }
 
 impl Hit {
     /// Whether a stroke can run straight in texture space from `self` to
-    /// `other`: both are on one island, and no wrap of the texture lies
-    /// between them.
+    /// `other`: both are on one UV island, in one repeat of the texture.
     pub fn joins(&self, other: &Self) -> bool {
-        self.texture == other.texture
-            && self.island == other.island
-            && self.point.distance(other.point) <= self.unwrapped.distance(other.unwrapped) + 0.5
+        (self.texture, self.island, self.cell) == (other.texture, other.island, other.cell)
     }
 }
 
 /// The posed triangles of a scene, ready for rays.
 pub struct Surface {
     scene: Arc<SceneData>,
-    /// Per triangle, its material and island.
-    triangles: Vec<(usize, usize)>,
+    /// Whether the view samples textures smoothly, which moves cutout edges.
+    smooth: bool,
+    /// Per triangle, its material and UV island.
+    triangles: Arc<[(usize, usize)]>,
 }
 
 impl Surface {
-    pub fn new(scene: Arc<SceneData>) -> Self {
+    pub fn new(scene: Arc<SceneData>, smooth: bool) -> Self {
         let materials: Vec<usize> = scene
             .mesh
             .batches
@@ -58,7 +56,28 @@ impl Surface {
         Self {
             triangles: materials.into_iter().zip(islands).collect(),
             scene,
+            smooth,
         }
+    }
+
+    /// The surface of `scene`, which poses the same triangles as this one's
+    /// with other texture pixels, keeping its islands.
+    pub fn with_scene(&self, scene: Arc<SceneData>, smooth: bool) -> Self {
+        Self {
+            scene,
+            smooth,
+            triangles: self.triangles.clone(),
+        }
+    }
+
+    /// The scene this is the surface of.
+    pub fn scene(&self) -> &Arc<SceneData> {
+        &self.scene
+    }
+
+    /// Whether cutout edges are where smooth sampling puts them.
+    pub fn smooth(&self) -> bool {
+        self.smooth
     }
 
     /// Where the ray from `origin` along `dir` first meets a face that
@@ -79,19 +98,17 @@ impl Surface {
             }
             let [ua, ub, uc] = std::array::from_fn(|k| Vec2::from(corners[k].uv));
             let uv = ua * (1.0 - u - v) + ub * u + uc * v;
-            let size = Vec2::new(m.size[0] as f32, m.size[1] as f32);
             let center = (ua + ub + uc) / 3.0;
-            let point = Vec2::new(
-                wrap(uv.x, center.x, m.wrap[0]),
-                wrap(uv.y, center.y, m.wrap[1]),
-            ) * size;
-            if m.alpha == AlphaMode::Cutout && alpha(&m.pixels, m.size, point) < 128 {
+            let [(x, cx), (y, cy)] =
+                [0, 1].map(|k| texel(uv[k], center[k], m.wrap[k], m.size[k] as f32));
+            let point = Vec2::new(x, y);
+            if m.alpha == AlphaMode::Cutout && alpha(m, point, self.smooth) < 0.5 {
                 continue;
             }
             let hit = Hit {
                 texture: m.texture,
                 point,
-                unwrapped: uv * size,
+                cell: IVec2::new(cx, cy),
                 island,
             };
             best = Some((t, hit));
@@ -120,13 +137,21 @@ fn intersect(origin: Vec3, dir: Vec3, [a, b, c]: [Vec3; 3], cull: bool) -> Optio
     (inside && t > 0.0).then_some((t, u, v))
 }
 
-/// A UV coordinate on one axis as a fraction of the texture, for a point of
-/// a triangle whose corners average `center`. A point within rounding of
-/// the edge between two repeats of the texture belongs to the one its
-/// triangle is in, so a triangle ending on the texture's edge stays on it.
-fn wrap(uv: f32, center: f32, mode: Wrap) -> f32 {
+/// A UV coordinate on one axis as a texel coordinate on a texture `size`
+/// texels across, and the repeat of the texture it is in, for a point of a
+/// triangle whose corners average `center`. A point within rounding of the
+/// edge between two repeats belongs to the one its triangle is in, so a
+/// triangle ending on the texture's edge stays on it. Clamped coordinates
+/// past the texture land on its edge texel, which the view shows there.
+fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     if mode == Wrap::Clamp {
-        return uv.clamp(0.0, 1.0);
+        let half = 0.5 / size;
+        let t = if (0.0..=1.0).contains(&uv) {
+            uv
+        } else {
+            uv.clamp(half, 1.0 - half)
+        };
+        return (t * size, 0);
     }
     let mut cell = uv.floor();
     if uv - cell < EDGE && center < cell {
@@ -135,26 +160,52 @@ fn wrap(uv: f32, center: f32, mode: Wrap) -> f32 {
         cell += 1.0;
     }
     let f = uv - cell;
-    if mode == Wrap::Mirror && cell.rem_euclid(2.0) >= 1.0 {
-        1.0 - f
-    } else {
-        f
+    let mirrored = mode == Wrap::Mirror && cell.rem_euclid(2.0) >= 1.0;
+    ((if mirrored { 1.0 - f } else { f }) * size, cell as i32)
+}
+
+/// The alpha, from 0 to 1, that material `m` shows at texel point `point`:
+/// of the texel under it, or with `smooth`, blended from the four nearest
+/// as the view's sampler does.
+fn alpha(m: &crate::render::MaterialData, point: Vec2, smooth: bool) -> f32 {
+    let [w, h] = m.size.map(i64::from);
+    let at = |x: i64, y: i64| {
+        let x = wrap_index(x, w, m.wrap[0]);
+        let y = wrap_index(y, h, m.wrap[1]);
+        f32::from(m.pixels[((y * w + x) * 4 + 3) as usize]) / 255.0
+    };
+    if !smooth {
+        return at(point.x.floor() as i64, point.y.floor() as i64);
+    }
+    let p = point - Vec2::splat(0.5);
+    let (x, y) = (p.x.floor(), p.y.floor());
+    let (fx, fy) = (p.x - x, p.y - y);
+    let (x, y) = (x as i64, y as i64);
+    let top = at(x, y) * (1.0 - fx) + at(x + 1, y) * fx;
+    let bottom = at(x, y + 1) * (1.0 - fx) + at(x + 1, y + 1) * fx;
+    top * (1.0 - fy) + bottom * fy
+}
+
+/// Texel `i` of a row or column `n` long, wrapped as the sampler wraps it.
+fn wrap_index(i: i64, n: i64, mode: Wrap) -> i64 {
+    match mode {
+        Wrap::Clamp => i.clamp(0, n - 1),
+        Wrap::Repeat => i.rem_euclid(n),
+        Wrap::Mirror => {
+            let m = i.rem_euclid(2 * n);
+            if m < n { m } else { 2 * n - 1 - m }
+        }
     }
 }
 
-/// The alpha of the texel under `point`.
-fn alpha(pixels: &[u8], [w, h]: [u32; 2], point: Vec2) -> u8 {
-    let x = (point.x.floor().max(0.0) as u32).min(w.saturating_sub(1));
-    let y = (point.y.floor().max(0.0) as u32).min(h.saturating_sub(1));
-    pixels[((y * w + x) * 4 + 3) as usize]
-}
-
-/// The island of each triangle: triangles of one texture sharing an edge
-/// whose ends have the same position and UV coordinate are on one island.
+/// The UV island of each triangle: triangles of one texture whose UVs run
+/// the same way around (so not folded over each other), sharing an edge
+/// whose ends have the same position and UV coordinate, are on one island.
 fn islands(scene: &SceneData, materials: &[usize]) -> Vec<usize> {
     let vertices = &scene.mesh.vertices;
-    // Positions match to a millionth of the model's size, which posing
-    // two meshes' copies of a seam vertex may disturb.
+    // Positions are matched on a grid a millionth of the model's size
+    // across, so copies of a vertex posed with tiny differences usually
+    // match, though two on either side of a grid line don't.
     let span = (scene.mesh.bounds_max - scene.mesh.bounds_min).max_element();
     let step = (span * 1e-6).max(f32::MIN_POSITIVE);
     let corner = |i: usize| {
@@ -162,12 +213,16 @@ fn islands(scene: &SceneData, materials: &[usize]) -> Vec<usize> {
         let p = v.position.map(|c| (c / step).round() as i64);
         (p, v.uv.map(f32::to_bits))
     };
+    let winding = |t: usize| {
+        let [a, b, c] = [0, 1, 2].map(|k| Vec2::from(vertices[t * 3 + k].uv));
+        (b - a).perp_dot(c - a) >= 0.0
+    };
     let mut parent: Vec<usize> = (0..materials.len()).collect();
     let mut edges = HashMap::new();
     for (t, &m) in materials.iter().enumerate() {
         for k in 0..3 {
             let (a, b) = (corner(t * 3 + k), corner(t * 3 + (k + 1) % 3));
-            let key = (scene.materials[m].texture, a.min(b), a.max(b));
+            let key = (scene.materials[m].texture, winding(t), a.min(b), a.max(b));
             match edges.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     union(&mut parent, *e.get(), t);
@@ -269,7 +324,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let scene = Arc::new(SceneData::new(&project, &[0], 0));
-        Surface::new(scene)
+        Surface::new(scene, false)
     }
 
     pub(crate) const OPAQUE: (Wrap, AlphaMode, bool) = (Wrap::Clamp, AlphaMode::Opaque, false);
@@ -324,10 +379,11 @@ pub(crate) mod tests {
         assert!(near(h.point, Vec2::new(8.0, 2.0)), "{h:?}");
         let h = down(&s, 1e-6, 0.5).unwrap();
         assert!(near(h.point, Vec2::new(0.0, 2.0)), "{h:?}");
-        // Clamped UVs past the edge land on it.
+        // Clamped UVs past the edge land on the edge texel, which shows
+        // there.
         let s = surface(&[OPAQUE], &square(0, 0.0, 0.0, [0.5, 0.0], [1.5, 1.0]));
         let h = down(&s, 0.9, 0.5).unwrap();
-        assert!(near(h.point, Vec2::new(8.0, 2.0)), "{h:?}");
+        assert!(near(h.point, Vec2::new(7.5, 2.0)), "{h:?}");
     }
 
     #[test]
@@ -387,5 +443,41 @@ pub(crate) mod tests {
         let [a, b, c] = [0.1, 0.4, 0.6].map(|x| down(&s, x, 0.5).unwrap());
         assert!(a.joins(&b));
         assert!(!b.joins(&c));
+        // So does a mirror wrap's fold, though the texel is the same on
+        // either side of it.
+        let mirror = (Wrap::Mirror, AlphaMode::Opaque, false);
+        let s = surface(&[mirror], &square(0, 0.0, 0.0, [0.5, 0.0], [1.5, 1.0]));
+        let [b, c] = [0.45, 0.55].map(|x| down(&s, x, 0.5).unwrap());
+        assert!(near(b.point, c.point));
+        assert!(!b.joins(&c));
+        // And a fold in the UVs themselves: halves sharing their middle
+        // edge's UVs, but running opposite ways, are separate islands.
+        let mut tris = square(0, 0.0, 0.0, [0.0, 0.0], [0.5, 1.0]).to_vec();
+        tris.extend(square(0, 1.0, 0.0, [0.5, 0.0], [0.0, 1.0]));
+        let s = surface(&[OPAQUE], &tris);
+        let [b, c] = [0.9, 1.1].map(|x| down(&s, x, 0.5).unwrap());
+        assert!(!b.joins(&c));
+    }
+
+    #[test]
+    fn smooth_cutouts_match_the_sampler() {
+        // One opaque texel in a clear 4x4 texture: sampled smoothly, its
+        // corners are clear, as the view shows them.
+        let mut pixels = vec![0; 4 * 4 * 4];
+        pixels[(5 * 4) + 3] = 255;
+        let m = crate::render::MaterialData {
+            texture: TextureId(0),
+            pixels,
+            size: [4, 4],
+            wrap: [Wrap::Clamp; 2],
+            alpha: AlphaMode::Cutout,
+            double_sided: false,
+            tint: [1.0; 4],
+        };
+        let corner = Vec2::new(1.05, 1.05);
+        assert!(alpha(&m, corner, false) > 0.5);
+        assert!(alpha(&m, corner, true) < 0.5);
+        let center = Vec2::new(1.5, 1.5);
+        assert!(alpha(&m, center, true) > 0.5);
     }
 }

@@ -11,6 +11,9 @@ use crate::texture_view::Sample;
 /// Halvings of the pointer's path that find where it leaves or enters a UV
 /// island.
 const STEPS: u32 = 12;
+/// The longest step, in screen points, the pointer's path is followed in,
+/// so that it doesn't skip an island it crosses within a frame.
+const STEP: f32 = 4.0;
 
 /// What dragging with the primary button does in the Model View.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,8 +45,12 @@ impl ModelView {
         }
     }
 
-    /// What the pointer at `pos` meets on the model shown in `rect`.
+    /// What the pointer at `pos` meets on the model shown in `rect`;
+    /// nothing outside it, where the model isn't shown.
     pub fn hit(&self, surface: &Surface, rect: Rect, pos: Pos2) -> Option<Hit> {
+        if !rect.contains(pos) {
+            return None;
+        }
         let ndc = Vec2::new(
             (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
             1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
@@ -53,8 +60,8 @@ impl ModelView {
     }
 
     /// Texels per screen point where the pointer at `pos` meets the model at
-    /// `hit`, measured to a neighboring point on the same island; 1 if
-    /// there is none.
+    /// `hit`, measured to a neighboring point that joins it; 1 if none does
+    /// at a distance.
     pub fn texels_per_point(&self, surface: &Surface, rect: Rect, pos: Pos2, hit: &Hit) -> f32 {
         [
             vec2(1.0, 0.0),
@@ -64,19 +71,24 @@ impl ModelView {
         ]
         .into_iter()
         .filter_map(|d| self.hit(surface, rect, pos + d))
-        .find(|h| h.joins(hit))
-        .map_or(1.0, |h| h.point.distance(hit.point))
+        .filter(|h| h.joins(hit))
+        .map(|h| h.point.distance(hit.point))
+        .find(|&d| d > 0.0)
+        .unwrap_or(1.0)
     }
 
-    /// Starts following a drag pressed at `pos`.
-    pub fn press(&mut self, surface: &Surface, rect: Rect, pos: Pos2) {
-        self.last = Some((pos, self.hit(surface, rect, pos)));
+    /// Starts following a drag pressed at `pos`, and returns what the press
+    /// hit.
+    pub fn press(&mut self, surface: &Surface, rect: Rect, pos: Pos2) -> Option<Hit> {
+        let hit = self.hit(surface, rect, pos);
+        self.last = Some((pos, hit));
+        hit
     }
 
     /// The pointer's path across `texture` from where it was at the last
-    /// frame of the drag to `pos`. Where the path leaves an island, it
-    /// reaches the island's edge; where it enters one, it jumps to the
-    /// edge it enters by.
+    /// frame of the drag to `pos`. Where the path leaves a UV island, it
+    /// reaches the island's edge; where it enters one, it jumps to the edge
+    /// it enters by.
     pub fn trail(
         &mut self,
         surface: &Surface,
@@ -84,13 +96,31 @@ impl ModelView {
         pos: Pos2,
         texture: TextureId,
     ) -> Vec<Sample> {
-        let hit = self.hit(surface, rect, pos);
-        let Some((from, was)) = self.last.replace((pos, hit)) else {
+        let Some((from, _)) = self.last else {
             return Vec::new();
         };
-        if from == pos {
-            return Vec::new();
+        let steps = (from.distance(pos) / STEP).ceil() as usize;
+        let mut path = Vec::new();
+        for i in 1..=steps {
+            let to = from.lerp(pos, i as f32 / steps as f32);
+            self.step(surface, rect, to, texture, &mut path);
         }
+        path
+    }
+
+    /// One step of [`Self::trail`], to `pos`, added to `path`.
+    fn step(
+        &mut self,
+        surface: &Surface,
+        rect: Rect,
+        pos: Pos2,
+        texture: TextureId,
+        path: &mut Vec<Sample>,
+    ) {
+        let hit = self.hit(surface, rect, pos);
+        let Some((from, was)) = self.last.replace((pos, hit)) else {
+            return;
+        };
         let on = |h: Option<Hit>| h.filter(|h| h.texture == texture);
         let (a, b) = (on(was), on(hit));
         let sample = |h: Hit, jump| Sample {
@@ -100,9 +130,9 @@ impl ModelView {
         if let (Some(a), Some(b)) = (a, b)
             && a.joins(&b)
         {
-            return vec![sample(b, false)];
+            path.push(sample(b, false));
+            return;
         }
-        let mut path = Vec::new();
         if let Some(a) = a {
             path.push(sample(self.edge(surface, rect, pos, from, &a), false));
         }
@@ -110,7 +140,6 @@ impl ModelView {
             path.push(sample(self.edge(surface, rect, from, pos, &b), true));
             path.push(sample(b, false));
         }
-        path
     }
 
     /// Of the points from `outside` to `inside`, whose hit `to` is, the
@@ -165,26 +194,20 @@ mod tests {
         let (from, to) = (screen(0.5), screen(1.5));
         view.press(&s, rect, from);
         let path = view.trail(&s, rect, to, TextureId(0));
-        let points: Vec<(Vec2, bool)> = path.iter().map(|s| (s.point, s.jump)).collect();
-        let expected = [
-            (Vec2::new(2.0, 2.0), false),
-            (Vec2::new(4.0, 2.0), true),
-            (Vec2::new(5.0, 2.0), false),
-        ];
-        assert_eq!(points.len(), 3, "{points:?}");
-        for ((p, jump), (q, expected_jump)) in points.iter().zip(expected) {
-            assert!(p.distance(q) < 0.05 && *jump == expected_jump, "{points:?}");
-        }
+        let near = |s: &Sample, x: f32| s.point.distance(Vec2::new(x, 2.0)) < 0.05;
+        // One jump, from the left square's edge to the right one's.
+        let jumps: Vec<usize> = (0..path.len()).filter(|&i| path[i].jump).collect();
+        assert_eq!(jumps.len(), 1, "{path:?}");
+        let j = jumps[0];
+        assert!(near(&path[j - 1], 2.0) && near(&path[j], 4.0), "{path:?}");
+        assert!(near(path.last().unwrap(), 5.0), "{path:?}");
         // Within one island, the path is just where the pointer went.
         let path = view.trail(&s, rect, screen(1.75), TextureId(0));
-        assert_eq!(path.len(), 1);
-        assert!(!path[0].jump);
+        assert!(path.iter().all(|s| !s.jump), "{path:?}");
+        assert!(near(path.last().unwrap(), 5.5), "{path:?}");
         // Off the model, it ends at the island's edge.
         let path = view.trail(&s, rect, screen(2.5), TextureId(0));
-        assert_eq!(path.len(), 1);
-        assert!(
-            path[0].point.distance(Vec2::new(6.0, 2.0)) < 0.05,
-            "{path:?}"
-        );
+        assert!(path.iter().all(|s| !s.jump), "{path:?}");
+        assert!(near(path.last().unwrap(), 6.0), "{path:?}");
     }
 }

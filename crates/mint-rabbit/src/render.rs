@@ -68,8 +68,9 @@ fn wrap_axis(x: f32, mode: f32) -> f32 {
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // Distance from the Ghost Cursor's center in texels, and texels per
-    // screen pixel, measured before anything is discarded and on the
-    // unwrapped UVs, which don't jump where the texture repeats.
+    // screen pixel, measured before anything is discarded. The latter is
+    // measured on the unwrapped UVs, which don't jump where the texture
+    // repeats.
     let p = vec2<f32>(wrap_axis(in.uv.x, material.wrap.x), wrap_axis(in.uv.y, material.wrap.y))
         * material.texture.yz;
     let d = distance(p, globals.ghost.xy);

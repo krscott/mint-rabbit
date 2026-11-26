@@ -294,9 +294,8 @@ pub struct Frame<'a> {
 }
 
 /// A view the tools take pointer input from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
-    #[default]
     Texture,
     Model,
 }
@@ -312,7 +311,7 @@ pub struct Sample {
 
 /// The pointer over the Model View, where it meets the texture the Texture
 /// View shows.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ModelPointer {
     /// Where the press that started a drag landed, if on the texture.
     pub press: Option<Vec2>,
@@ -330,15 +329,15 @@ pub struct TextureView {
     zoom: f32,
     /// Offset of the image from the view's center, in screen points.
     pan: egui::Vec2,
-    drag: Option<Drag>,
+    /// The drag in progress, with the view it started in, which moves and
+    /// ends it.
+    drag: Option<(View, Drag)>,
     /// The layer and shapes a transform drag edits, fixed when it starts.
     targets: (usize, Vec<usize>),
     /// Anchors of the pen path being drawn.
     pen: Vec<Anchor>,
     /// Whether a text field had the keyboard when the view was last shown.
     typing: bool,
-    /// The view the drag in progress started in, which moves and ends it.
-    drag_view: View,
     /// The texture point under the pointer, while it is over the view.
     hover: Option<Vec2>,
 }
@@ -397,7 +396,7 @@ impl TextureView {
     /// with it, and a transform's edits are rolled back.
     fn cancel_drag(&mut self, editor: &mut Editor) {
         match self.drag.take() {
-            Some(Drag::PenHandle) => self.pen.clear(),
+            Some((_, Drag::PenHandle)) => self.pen.clear(),
             Some(_) => {}
             None => return,
         }
@@ -547,6 +546,12 @@ impl TextureView {
         // A click ending a drag (egui can report both in one frame) is part
         // of the drag, not a click.
         let was_dragging = self.drag.is_some();
+        let mut canvas = Canvas {
+            editor,
+            selection,
+            paint,
+            message,
+        };
         // A drag, by the primary button only, starts where the button went
         // down.
         if response.drag_started_by(PointerButton::Primary)
@@ -554,45 +559,43 @@ impl TextureView {
                 .input(|i| i.pointer.press_origin())
                 .map(|p| at.to_texture(p))
         {
-            take_keyboard(ui, editor);
+            take_keyboard(ui, canvas.editor);
             // Any tool moves the picked layer's modifier guides.
-            let project = editor.project();
-            self.drag = if let Some(guide) = guide_drag(project, r, selection.layer, origin, at) {
+            let (project, layer) = (canvas.editor.project(), canvas.selection.layer);
+            let drag = if let Some(guide) = guide_drag(project, r, layer, origin, at) {
                 Some(guide)
             } else if tool == Tool::Select {
-                start_select(project, r, selection, origin, at)
+                start_select(project, r, canvas.selection, origin, at)
             } else {
-                let canvas = Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                };
-                self.start(canvas, tool, r, origin, at.hit())
+                self.start(canvas.reborrow(), tool, r, origin, at.hit())
             };
-            self.drag_view = View::Texture;
-            self.targets = (selection.layer, selection.shapes.clone());
+            self.drag = drag.map(|d| (View::Texture, d));
+            self.targets = (canvas.selection.layer, canvas.selection.shapes.clone());
         } else if response.clicked()
             && !was_dragging
             && let Some(p) = pointer
-            && guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)).is_none()
+            && guide_hit(
+                canvas.editor.project(),
+                r,
+                canvas.selection.layer,
+                at,
+                at.to_screen(p),
+            )
+            .is_none()
         {
             // A click on the picked shape's anchor picks the nearest.
             let anchor = (tool == Tool::Select && !shift)
-                .then(|| anchor_under(editor.project(), r, selection, p, at.hit()))
+                .then(|| anchor_under(canvas.editor.project(), r, canvas.selection, p, at.hit()))
                 .flatten();
             if let Some(k) = anchor {
-                selection.anchor = Some(k);
+                canvas.selection.anchor = Some(k);
             } else {
-                let canvas = Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                };
-                self.click(canvas, tool, r, p, at.hit(), shift);
+                self.click(canvas.reborrow(), tool, r, p, at.hit(), shift);
             }
         }
+        let Canvas {
+            editor, selection, ..
+        } = canvas.reborrow();
         if response.double_clicked()
             && tool == Tool::Select
             && let (Some(p), Some(s)) = (pointer, selection.single())
@@ -602,24 +605,25 @@ impl TextureView {
             selection.anchor = Some(k);
         }
 
-        if self.drag_view == View::Texture
-            && let (Some(drag), Some(p)) = (&mut self.drag, pointer)
-        {
-            let canvas = Canvas {
-                editor,
-                selection,
-                paint,
-                message,
-            };
+        if let (Some((View::Texture, drag)), Some(p)) = (&mut self.drag, pointer) {
             let path = [Sample {
                 point: p,
                 jump: false,
             }];
-            continue_drag(canvas, drag, &self.targets, r, &path, &mut self.pen, shift);
+            continue_drag(
+                canvas.reborrow(),
+                drag,
+                &self.targets,
+                r,
+                &path,
+                &mut self.pen,
+                shift,
+            );
         }
         // The pointer shows which way a guide under it moves.
+        let (editor, selection) = (&mut *canvas.editor, &mut *canvas.selection);
         let part = match &self.drag {
-            Some(Drag::Guide { part, .. }) => Some(*part),
+            Some((_, Drag::Guide { part, .. })) => Some(*part),
             Some(_) => None,
             None => response
                 .hover_pos()
@@ -632,50 +636,31 @@ impl TextureView {
                 GuidePart::Y => egui::CursorIcon::ResizeVertical,
             });
         }
-        if self.drag_view == View::Texture {
-            self.release(ui, response, editor, selection, r);
-        }
-        let keys = response.hovered() || model_hovered;
-        let canvas = Canvas {
-            editor,
-            selection,
-            paint,
-            message,
-        };
-        self.keys(ui, canvas, r, tool, keys && !typing);
+        self.release(ui, response, View::Texture, editor, selection, r);
+        let hovered = response.hovered() || model_hovered;
+        self.keys(ui, canvas.reborrow(), r, tool, hovered, typing);
 
         let cursor = pointer.or(ghost);
-        self.overlay(ui, editor.project(), r, selection, at, cursor, tool, paint);
+        let project = canvas.editor.project();
+        self.overlay(ui, project, r, canvas.selection, at, cursor, tool, paint);
     }
 
-    /// Input from the Model View, already in this texture's space: the
-    /// drawing tools draw where the pointer meets the texture on the model,
-    /// and Select picks there. Keys are left to [`Self::show`].
+    /// Input from the Model View, already in the space of `r`, the variant
+    /// the Texture View shows: the drawing tools draw where the pointer
+    /// meets it on the model, and Select picks there. Keys are left to
+    /// [`Self::show`].
     pub fn model_interact(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
-        f: Frame<'_>,
+        mut canvas: Canvas<'_>,
+        r: VariantRef,
+        tool: Tool,
         pointer: &ModelPointer,
     ) {
-        let Frame {
-            editor,
-            texture,
-            variant,
-            tool,
-            paint,
-            selection,
-            input,
-            message,
-            ..
-        } = f;
-        let r = VariantRef { texture, variant };
-        if !input || editor.project().texture(texture).variants().is_empty() {
-            return;
-        }
         // The Texture View fits the picks later in the frame; tools here
         // need them fitted now.
-        selection.fit(editor.project(), r);
+        canvas.selection.fit(canvas.editor.project(), r);
         if tool != Tool::Pen && !self.pen.is_empty() {
             self.pen.clear();
         }
@@ -686,63 +671,56 @@ impl TextureView {
             && tool != Tool::Select
             && let Some(p) = pointer.press
         {
-            take_keyboard(ui, editor);
-            let canvas = Canvas {
-                editor,
-                selection,
-                paint,
-                message,
-            };
-            self.drag = self.start(canvas, tool, r, p, reach);
-            self.drag_view = View::Model;
-            self.targets = (selection.layer, selection.shapes.clone());
+            take_keyboard(ui, canvas.editor);
+            let drag = self.start(canvas.reborrow(), tool, r, p, reach);
+            self.drag = drag.map(|d| (View::Model, d));
+            self.targets = (canvas.selection.layer, canvas.selection.shapes.clone());
         } else if response.clicked()
             && !was_dragging
             && let Some(p) = pointer.here
         {
-            let canvas = Canvas {
-                editor,
-                selection,
-                paint,
-                message,
-            };
-            self.click(canvas, tool, r, p, reach, shift);
+            self.click(canvas.reborrow(), tool, r, p, reach, shift);
         }
-        if self.drag_view == View::Model
-            && let Some(drag) = &mut self.drag
-        {
-            let canvas = Canvas {
-                editor,
-                selection,
-                paint,
-                message,
-            };
+        if let Some((View::Model, drag)) = &mut self.drag {
+            let path = &pointer.path;
             continue_drag(
-                canvas,
+                canvas.reborrow(),
                 drag,
                 &self.targets,
                 r,
-                &pointer.path,
+                path,
                 &mut self.pen,
                 shift,
             );
-            self.release(ui, response, editor, selection, r);
         }
+        self.release(
+            ui,
+            response,
+            View::Model,
+            canvas.editor,
+            canvas.selection,
+            r,
+        );
     }
 
-    /// Ends this view's drag when the pointer lets go of it: the primary
-    /// button's release finishes it, and any other end cancels it, decided
-    /// by the frame's first release. Escape cancels it first, even with a
-    /// release in the same frame, and is used up doing so.
+    /// Ends a drag that started in `view`, whose `response` this is, when
+    /// the pointer lets go of it: the primary button's release finishes it,
+    /// and any other end cancels it, decided by the frame's first release.
+    /// Escape cancels it first, even with a release in the same frame, and
+    /// is used up doing so.
     fn release(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
+        view: View,
         editor: &mut Editor,
         selection: &mut Selection,
         r: VariantRef,
     ) {
-        if self.drag.is_some() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        if !matches!(self.drag, Some((v, _)) if v == view) {
+            return;
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.cancel_drag(editor);
             return;
         }
@@ -760,7 +738,7 @@ impl TextureView {
             })
         });
         if first_release == Some(PointerButton::Primary) {
-            if let Some(drag) = self.drag.take() {
+            if let Some((_, drag)) = self.drag.take() {
                 finish_drag(editor, drag, selection, r);
             }
             editor.end_gesture();
@@ -769,19 +747,21 @@ impl TextureView {
         }
     }
 
-    /// The tools' keys, while no drag is in progress and, with `keys`, the
-    /// pointer is over either view and no text field has the keyboard, or
-    /// while a pen path is open: Enter finishes the path, Escape drops it or
-    /// else the picks, and Delete removes the path's last anchor or, with
-    /// Select, the picked artwork.
-    fn keys(&mut self, ui: &egui::Ui, canvas: Canvas<'_>, r: VariantRef, tool: Tool, keys: bool) {
-        let Canvas {
-            editor,
-            selection,
-            paint,
-            message,
-        } = canvas;
-        if self.drag.is_some() || (!keys && self.pen.is_empty()) {
+    /// The tools' keys, while no drag is in progress, no text field has
+    /// the keyboard, and the pointer is over either view (`hovered`) or a
+    /// pen path is open: Enter finishes the path, Escape drops it or else
+    /// the picks, and Delete removes the path's last anchor or, with Select,
+    /// the picked artwork.
+    fn keys(
+        &mut self,
+        ui: &egui::Ui,
+        mut canvas: Canvas<'_>,
+        r: VariantRef,
+        tool: Tool,
+        hovered: bool,
+        typing: bool,
+    ) {
+        if self.drag.is_some() || typing || (!hovered && self.pen.is_empty()) {
             return;
         }
         let escape = ui.input(|i| i.key_pressed(Key::Escape));
@@ -795,17 +775,9 @@ impl TextureView {
             // Enter finishes an open path; clicking the first anchor closes
             // one.
             let anchors = std::mem::take(&mut self.pen);
-            add_shape(
-                editor,
-                selection,
-                r,
-                Tool::Pen,
-                anchors,
-                paint.style(false),
-                paint.color,
-                message,
-            );
+            add_shape(canvas.reborrow(), r, Tool::Pen, anchors, false);
         }
+        let selection = &mut *canvas.selection;
         if escape {
             if self.pen.is_empty() {
                 selection.shapes.clear();
@@ -821,7 +793,7 @@ impl TextureView {
                 Tool::Pen => {
                     self.pen.pop();
                 }
-                Tool::Select => delete_selected(editor, r, selection),
+                Tool::Select => delete_selected(canvas.editor, r, selection),
                 _ => {}
             }
         }
@@ -840,34 +812,10 @@ impl TextureView {
     ) {
         match tool {
             Tool::Pen => self.pen_click(canvas, r, p, reach),
-            Tool::Brush => {
-                let Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                } = canvas;
-                let dot = vec![Anchor::corner(p)];
-                add_shape(
-                    editor,
-                    selection,
-                    r,
-                    tool,
-                    dot,
-                    paint.style(false),
-                    paint.color,
-                    message,
-                );
-            }
+            Tool::Brush => add_shape(canvas, r, tool, vec![Anchor::corner(p)], false),
             Tool::Select => pick(canvas.editor.project(), r, canvas.selection, p, reach, add),
             Tool::Pencil | Tool::Eraser | Tool::Fill => {
-                let Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                } = canvas;
-                press_pixels(editor, selection, r, tool, paint, p, None, message);
+                press_pixels(canvas, r, tool, p, None);
             }
             Tool::Ellipse | Tool::Rectangle => {}
         }
@@ -898,31 +846,17 @@ impl TextureView {
                 Some(drag)
             }
             Tool::Pencil | Tool::Eraser => {
-                let Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                } = canvas;
-                let edit = Some(CANVAS_DRAG);
-                press_pixels(editor, selection, r, tool, paint, p, edit, message).map(|layer| {
-                    Drag::Pixels {
-                        layer,
-                        last: p,
-                        value: pixel_value(tool, paint),
-                        width: paint.width,
-                    }
+                let paint = canvas.paint;
+                press_pixels(canvas, r, tool, p, Some(CANVAS_DRAG)).map(|layer| Drag::Pixels {
+                    layer,
+                    last: p,
+                    value: pixel_value(tool, paint),
+                    width: paint.width,
                 })
             }
             // A fill acts at once, where the press began.
             Tool::Fill => {
-                let Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
-                } = canvas;
-                press_pixels(editor, selection, r, tool, paint, p, None, message);
+                press_pixels(canvas, r, tool, p, None);
                 None
             }
             Tool::Ellipse | Tool::Rectangle => Some(Drag::Box {
@@ -941,29 +875,14 @@ impl TextureView {
 
     /// A pen click: closes the path on its first anchor, or adds an anchor.
     fn pen_click(&mut self, canvas: Canvas<'_>, r: VariantRef, p: Vec2, reach: f32) {
-        let Canvas {
-            editor,
-            selection,
-            paint,
-            message,
-        } = canvas;
-        if let Err(why) = drawable(editor.project(), r, selection) {
-            *message = Some(why);
+        if let Err(why) = drawable(canvas.editor.project(), r, canvas.selection) {
+            *canvas.message = Some(why);
             self.pen.clear();
             return;
         }
         if self.pen.len() >= 2 && self.pen[0].point.distance(p) <= reach {
             let anchors = std::mem::take(&mut self.pen);
-            add_shape(
-                editor,
-                selection,
-                r,
-                Tool::Pen,
-                anchors,
-                paint.style(true),
-                paint.color,
-                message,
-            );
+            add_shape(canvas, r, Tool::Pen, anchors, true);
         } else if self.pen.last().is_none_or(|a| a.point.distance(p) > reach) {
             self.pen.push(Anchor::corner(p));
         }
@@ -1089,7 +1008,7 @@ impl TextureView {
         if !self.pen.is_empty() {
             let mut anchors = self.pen.clone();
             if let Some(p) = cursor
-                && !matches!(self.drag, Some(Drag::PenHandle))
+                && !matches!(self.drag, Some((_, Drag::PenHandle)))
             {
                 anchors.push(Anchor::corner(p));
             }
@@ -1510,13 +1429,24 @@ fn transformed(original: &[Shape], t: Affine2) -> Vec<Shape> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-/// What a drag edits, and where it reports a refused edit.
-struct Canvas<'a> {
-    editor: &'a mut Editor,
-    selection: &'a mut Selection,
-    paint: Paint,
-    message: &'a mut Option<String>,
+/// What the tools edit and paint with, and where they report a refused
+/// edit.
+pub struct Canvas<'a> {
+    pub editor: &'a mut Editor,
+    pub selection: &'a mut Selection,
+    pub paint: Paint,
+    pub message: &'a mut Option<String>,
+}
+
+impl Canvas<'_> {
+    fn reborrow(&mut self) -> Canvas<'_> {
+        Canvas {
+            editor: self.editor,
+            selection: self.selection,
+            paint: self.paint,
+            message: self.message,
+        }
+    }
 }
 
 /// Moves a drag along the pointer's `path` since the last frame. A brush
@@ -1860,17 +1790,19 @@ fn edit_picked_layer<T>(
 /// [`edit_picked_layer`] makes it. Returns the layer painted, or reports why
 /// it couldn't be. A click (with no `continuous` edit) that touches no pixel
 /// of the texture does nothing.
-#[allow(clippy::too_many_arguments)]
 fn press_pixels(
-    editor: &mut Editor,
-    selection: &mut Selection,
+    canvas: Canvas<'_>,
     r: VariantRef,
     tool: Tool,
-    paint: Paint,
     p: Vec2,
     continuous: Option<&str>,
-    message: &mut Option<String>,
 ) -> Option<usize> {
+    let Canvas {
+        editor,
+        selection,
+        paint,
+        message,
+    } = canvas;
     let value = pixel_value(tool, paint);
     // A click off the texture paints nothing, so it adds no first layer
     // either. A drag that starts off it still paints where it enters.
@@ -1901,21 +1833,18 @@ fn press_pixels(
     }
 }
 
-/// Adds a shape drawn with `tool` on top of the picked layer, creating a
-/// first layer if the variant has none, and picks it. On a raster layer, the
-/// shape is painted into its pixels instead.
-#[allow(clippy::too_many_arguments)]
-pub fn add_shape(
-    editor: &mut Editor,
-    selection: &mut Selection,
-    r: VariantRef,
-    tool: Tool,
-    anchors: Vec<Anchor>,
-    style: Style,
-    color: PaletteIndex,
-    message: &mut Option<String>,
-) {
-    let shape = match Shape::new(anchors, style, color) {
+/// Adds a shape drawn with `tool` through `anchors`, `closed` or open, on
+/// top of the picked layer, creating a first layer if the variant has none,
+/// and picks it. On a raster layer, the shape is painted into its pixels
+/// instead.
+fn add_shape(canvas: Canvas<'_>, r: VariantRef, tool: Tool, anchors: Vec<Anchor>, closed: bool) {
+    let Canvas {
+        editor,
+        selection,
+        paint,
+        message,
+    } = canvas;
+    let shape = match Shape::new(anchors, paint.style(closed), paint.color) {
         Ok(s) => s,
         Err(e) => {
             *message = Some(e.to_string());
@@ -2440,16 +2369,13 @@ mod tests {
         };
         let margin = Vec2::new(-0.5, 1.5);
         for tool in [Tool::Pencil, Tool::Eraser, Tool::Fill] {
-            let pressed = press_pixels(
-                &mut editor,
-                &mut selection,
-                r,
-                tool,
+            let canvas = Canvas {
+                editor: &mut editor,
+                selection: &mut selection,
                 paint,
-                margin,
-                None,
-                &mut message,
-            );
+                message: &mut message,
+            };
+            let pressed = press_pixels(canvas, r, tool, margin, None);
             assert_eq!(pressed, None, "{tool:?}");
         }
         assert!(editor.project().variant(r).layers().is_empty());
@@ -2460,16 +2386,13 @@ mod tests {
             width: 3.0,
             ..paint
         };
-        let pressed = press_pixels(
-            &mut editor,
-            &mut selection,
-            r,
-            Tool::Pencil,
-            wide,
-            margin,
-            None,
-            &mut message,
-        );
+        let canvas = Canvas {
+            editor: &mut editor,
+            selection: &mut selection,
+            paint: wide,
+            message: &mut message,
+        };
+        let pressed = press_pixels(canvas, r, Tool::Pencil, margin, None);
         assert_eq!(pressed, Some(0));
         let layers = editor.project().variant(r).layers();
         assert_eq!(layers.len(), 1);
