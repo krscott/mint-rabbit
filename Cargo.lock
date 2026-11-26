@@ -1270,6 +1270,7 @@ dependencies = [
  "png",
  "pollster",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

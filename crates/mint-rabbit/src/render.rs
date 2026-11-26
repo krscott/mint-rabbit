@@ -23,8 +23,10 @@ const SHADER: &str = r"
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec4<f32>,
-    // The Ghost Cursor: center (texels), radius (texels), texture (or -1).
+    // The Ghost Cursor: center (texels), radius (texels), texture (or -1);
+    // then half the size of the box the radius is around (texels).
     ghost: vec4<f32>,
+    ghost_box: vec4<f32>,
 };
 struct MaterialU {
     tint: vec4<f32>,
@@ -67,13 +69,14 @@ fn wrap_axis(x: f32, mode: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    // Distance from the Ghost Cursor's center in texels, and texels per
+    // Distance from the Ghost Cursor's box in texels, and texels per
     // screen pixel, measured before anything is discarded. The latter is
     // measured on the unwrapped UVs, which don't jump where the texture
     // repeats.
     let p = vec2<f32>(wrap_axis(in.uv.x, material.wrap.x), wrap_axis(in.uv.y, material.wrap.y))
         * material.texture.yz;
-    let d = distance(p, globals.ghost.xy);
+    let q = abs(p - globals.ghost.xy) - globals.ghost_box.xy;
+    let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
     let per_pixel = fwidth(in.uv * material.texture.yz);
     let w = max(max(per_pixel.x, per_pixel.y), 1e-4);
     // The game's combiner tints color only; alpha comes from the texture.
@@ -87,9 +90,14 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     }
     let light = 0.45 + 0.55 * max(dot(n, globals.light_dir.xyz), 0.0);
     var color = texel.rgb * material.tint.rgb * light;
-    // The ghost ring: a light line about a pixel wide in a darker one.
+    // The ghost outline: a light line about a pixel wide in a darker one.
     if globals.ghost.w >= 0.0 && abs(material.texture.x - globals.ghost.w) < 0.5 {
-        let off = abs(d - globals.ghost.z) / w;
+        var off = abs(d - globals.ghost.z) / w;
+        // A box also rings its center, the only part shown when the box is
+        // larger than the texture.
+        if globals.ghost_box.x + globals.ghost_box.y > 0.0 {
+            off = min(off, abs(distance(p, globals.ghost.xy) - 1.0) / w);
+        }
         color = mix(color, vec3<f32>(0.0), 0.6 * clamp(2.5 - off, 0.0, 1.0));
         color = mix(color, vec3<f32>(1.0), clamp(1.25 - off, 0.0, 1.0));
     }
@@ -160,12 +168,15 @@ impl SceneData {
     }
 }
 
-/// The Ghost Cursor on the model: a ring `radius` texels around `center` on
-/// `texture`, wherever the model shows that texture point.
+/// The Ghost Cursor on the model: an outline `radius` texels around a box
+/// `half` texels either way from `center` on `texture`, wherever the model
+/// shows that texture point, and a small ring at a box's center. With no
+/// box, it is a ring.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ghost {
     pub texture: TextureId,
     pub center: Vec2,
+    pub half: Vec2,
     pub radius: f32,
 }
 
@@ -183,6 +194,7 @@ struct Globals {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 4],
     ghost: [f32; 4],
+    ghost_box: [f32; 4],
 }
 
 #[repr(C)]
@@ -378,13 +390,17 @@ impl Renderer {
             self.upload(device, queue, &frame.scene, frame.linear_filter);
         }
         let light = glam::Vec3::new(0.4, 0.8, 0.6).normalize();
-        let ghost = frame.ghost.map_or([0.0, 0.0, 0.0, -1.0], |g| {
-            [g.center.x, g.center.y, g.radius, g.texture.0 as f32]
+        let (ghost, ghost_box) = frame.ghost.map_or(([0.0, 0.0, 0.0, -1.0], [0.0; 4]), |g| {
+            (
+                [g.center.x, g.center.y, g.radius, g.texture.0 as f32],
+                [g.half.x, g.half.y, 0.0, 0.0],
+            )
         });
         let globals = Globals {
             view_proj: frame.view_proj.to_cols_array_2d(),
             light_dir: light.extend(0.0).to_array(),
             ghost,
+            ghost_box,
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
     }

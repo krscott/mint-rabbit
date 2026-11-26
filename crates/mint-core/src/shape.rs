@@ -90,6 +90,8 @@ pub enum ShapeError {
     NoAnchors,
     #[error("stroke width must be a positive number of texels")]
     BadWidth,
+    #[error("a shape's points and handles must be finite numbers")]
+    NotFinite,
 }
 
 /// A single vector element of a layer: a path of cubic Bézier segments
@@ -110,6 +112,11 @@ impl Shape {
     ) -> Result<Self, ShapeError> {
         if anchors.is_empty() {
             return Err(ShapeError::NoAnchors);
+        }
+        let finite =
+            |a: &Anchor| a.point.is_finite() && a.handle_in.is_finite() && a.handle_out.is_finite();
+        if !anchors.iter().all(finite) {
+            return Err(ShapeError::NotFinite);
         }
         if !style.is_valid() {
             return Err(ShapeError::BadWidth);
@@ -482,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn shapes_need_anchors_and_a_positive_width() {
+    fn shapes_need_finite_anchors_and_a_positive_width() {
         assert_eq!(
             Shape::new(vec![], Style::Fill, PaletteIndex(0)),
             Err(ShapeError::NoAnchors)
@@ -496,6 +503,13 @@ mod tests {
             Shape::new(dot.clone(), bad, PaletteIndex(0)),
             Err(ShapeError::BadWidth)
         );
+        for bad in [Vec2::new(f32::NAN, 0.0), Vec2::new(0.0, f32::INFINITY)] {
+            let anchor = Anchor::smooth(Vec2::ZERO, bad);
+            assert_eq!(
+                Shape::new(vec![anchor], Style::Fill, PaletteIndex(0)),
+                Err(ShapeError::NotFinite)
+            );
+        }
         let mut s = fill(dot);
         assert_eq!(s.remove_anchor(0), Err(ShapeError::NoAnchors));
         assert_eq!(s.set_style(bad), Err(ShapeError::BadWidth));

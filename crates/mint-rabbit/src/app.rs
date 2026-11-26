@@ -1,15 +1,17 @@
 //! The application window: menus, the Model View beside the Texture View
-//! with its painting controls, the palette and layer dock, and dialogs.
+//! with its painting controls, the dock of palette, layers, and stamps, and
+//! dialogs.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
 use glam::{Vec2, Vec3};
 use mint_ac::{Decomp, VillagerRef};
 use mint_core::{
-    Layer, LayerKind, PaletteIndex, Project, Texture, TextureContent, TextureId, VariantRef,
+    Layer, LayerKind, NonEmpty, PaletteIndex, Project, Stamp, Texture, TextureContent, TextureId,
+    VariantRef,
 };
 
 use crate::camera::Orbit;
@@ -20,6 +22,8 @@ use crate::panels::{self, Target};
 use crate::picker::{self, Gpu, Picker};
 use crate::previews::{Previews, thumbnail};
 use crate::render::{Ghost, ModelCallback, Renderer, SceneData};
+use crate::scene;
+use crate::stamps::{self, Choice, Library, Placing};
 use crate::surface::Surface;
 use crate::texture_view::{self, Canvas, Frame, ModelPointer, Paint, Selection, TextureView, Tool};
 
@@ -45,6 +49,19 @@ const MODE_BAR_HEIGHT: f32 = 28.0;
 
 /// Width of the tool strip at the Texture View's left.
 const TOOLS_WIDTH: f32 = 36.0;
+
+/// Size of a stamp's thumbnail in the Stamp Library.
+const STAMP_THUMBNAIL: egui::Vec2 = egui::vec2(48.0, 40.0);
+
+/// Most height the Stamp Library's thumbnails take before they scroll.
+const STAMPS_HEIGHT: f32 = 150.0;
+
+/// Most height the stamp colors dialog's description and rows take before
+/// they scroll.
+const STAMP_COLORS_HEIGHT: f32 = 360.0;
+/// Height of the stamp colors dialog without its description and rows,
+/// which the window keeps room for.
+const STAMP_COLORS_ROOM: f32 = 180.0;
 
 pub struct Options {
     pub decomp: Option<PathBuf>,
@@ -184,6 +201,8 @@ enum Confirm {
     SaveOver(PathBuf),
     /// Export a texture set over files already in a folder.
     OverwriteFolder(PathBuf),
+    /// Remove a stamp from the library.
+    DeleteStamp(String),
 }
 
 /// The texture-only export of a project to the texture set it was imported
@@ -219,6 +238,20 @@ enum Dialog {
     ExportSet {
         name: String,
     },
+    /// The name of a new stamp of the picked shapes, as typed so far.
+    SaveStamp {
+        name: String,
+        stamp: Stamp,
+    },
+    /// A stamp's new name, as typed so far.
+    RenameStamp {
+        from: String,
+        name: String,
+    },
+    /// What each color of the stamp being placed becomes, as chosen so far.
+    StampColors {
+        choices: Vec<Choice>,
+    },
 }
 
 /// A texture's name and pixel size.
@@ -250,7 +283,67 @@ fn tool_icon(tool: Tool) -> Icon {
         Tool::Pencil => Icon::Pencil,
         Tool::Eraser => Icon::Eraser,
         Tool::Fill => Icon::PaintBucket,
+        Tool::Stamp => Icon::Stamp,
     }
+}
+
+/// The Model View's Ghost Cursor at texture point `at` for `tool`: the ring
+/// it paints in, or the bounds of the stamp it would place there.
+fn ghost(
+    tool: Tool,
+    paint: Paint,
+    placing: Option<&Placing>,
+    texture: TextureId,
+    at: Vec2,
+) -> Option<Ghost> {
+    if tool == Tool::Stamp {
+        let stamp = &placing?.stamp;
+        let (min, max) = stamp.bounds();
+        return Some(Ghost {
+            texture,
+            center: stamp.offset(at) + (min + max) / 2.0,
+            half: (max - min) / 2.0,
+            radius: 0.0,
+        });
+    }
+    let radius = texture_view::footprint(tool, paint)?;
+    Some(Ghost {
+        texture,
+        center: at,
+        half: Vec2::ZERO,
+        radius,
+    })
+}
+
+/// Opens `dir` in the desktop's file manager. The opener keeps running, and
+/// `failed` gets why if it then exits with an error.
+fn open_folder(
+    ctx: &egui::Context,
+    dir: &Path,
+    failed: mpsc::Sender<String>,
+) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = std::process::Command::new(opener)
+        .arg(dir)
+        .spawn()
+        .map_err(|e| format!("Couldn't open {} with {opener}: {e}", dir.display()))?;
+    // Reaped once it exits, usually as soon as it hands the folder over.
+    let (ctx, dir) = (ctx.clone(), dir.to_owned());
+    std::thread::spawn(move || {
+        let mut child = child;
+        let why = match child.wait() {
+            Ok(status) if status.success() => return,
+            Ok(status) => format!("{opener} couldn't open {}: {status}", dir.display()),
+            Err(e) => format!("{opener} couldn't open {}: {e}", dir.display()),
+        };
+        let _ = failed.send(why);
+        ctx.request_repaint();
+    });
+    Ok(())
 }
 
 /// Gives a dialog's first text field the keyboard while nothing else has it,
@@ -342,6 +435,11 @@ pub struct App {
     texture_view: TextureView,
     tool: Tool,
     paint: Paint,
+    library: Library,
+    /// The stamp the Stamp tool places, once one is chosen.
+    placing: Option<Placing>,
+    /// Why opening the stamp folder failed, sent by the openers.
+    opener_failed: (mpsc::Sender<String>, mpsc::Receiver<String>),
     /// Name last given to a texture set exported to a folder.
     folder_set: String,
     /// The window title last set.
@@ -394,6 +492,9 @@ impl App {
                 fill: true,
                 width: 1.0,
             },
+            library: Library::new(stamps::default_dir()),
+            placing: None,
+            opener_failed: mpsc::channel(),
             folder_set: String::new(),
             title: String::new(),
             quitting: false,
@@ -655,6 +756,67 @@ impl App {
         }
     }
 
+    /// Whether a stamp can be placed on the picked layer now, or why not.
+    fn stamp_ready(&self) -> Result<(), String> {
+        let doc = self.doc.as_ref().ok_or("Open a project to place stamps")?;
+        let r = doc
+            .variant()
+            .ok_or("An external texture is filled in by the game, and isn't painted.")?;
+        texture_view::drawable(doc.editor.project(), r, &doc.selection)
+    }
+
+    /// Picks the Stamp tool to place `stamp`, named `name`. Its colors are
+    /// chosen at once if each matches a palette entry exactly; otherwise
+    /// [`Self::ask_stamp_colors`] asks.
+    fn arm(&mut self, name: String, stamp: Arc<Stamp>) {
+        let Some(doc) = &self.doc else { return };
+        self.placing = Some(Placing::new(name, stamp, doc.editor.project().palette()));
+        self.set_tool(Tool::Stamp);
+    }
+
+    /// Asks what the Stamp tool's stamp colors become, if they are still to
+    /// be chosen.
+    fn ask_stamp_colors(&mut self) {
+        if self.tool != Tool::Stamp || self.dialog.is_some() {
+            return;
+        }
+        let (Some(placing), Some(doc)) = (&self.placing, &self.doc) else {
+            return;
+        };
+        if placing.choices.is_none() {
+            let choices = stamps::nearest_choices(&placing.stamp, doc.editor.project().palette());
+            self.dialog = Some(Dialog::StampColors { choices });
+        }
+    }
+
+    /// Asks for the name of a new stamp of the picked shapes.
+    fn ask_stamp_name(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let Some(r) = doc.variant() else { return };
+        let project = doc.editor.project();
+        let Some(layer) = project.variant(r).layers().get(doc.selection.layer) else {
+            return;
+        };
+        let mut picked = doc.selection.shapes.clone();
+        picked.sort_unstable();
+        let shapes = picked
+            .iter()
+            .filter_map(|&s| layer.shapes().get(s).cloned())
+            .collect();
+        let Some(shapes) = NonEmpty::from_vec(shapes) else {
+            return;
+        };
+        match Stamp::from_shapes(shapes, project.palette()) {
+            Ok(stamp) => {
+                self.dialog = Some(Dialog::SaveStamp {
+                    name: String::new(),
+                    stamp,
+                });
+            }
+            Err(e) => self.fail(e.to_string()),
+        }
+    }
+
     /// The kind of the picked layer, or `None` with no painted variant
     /// shown or no layers in it. A pick past the top, as after an undo, is
     /// of the top layer, as [`Selection::fit`] makes it.
@@ -665,6 +827,12 @@ impl App {
             .get(doc.selection.layer)
             .or(layers.last())
             .map(Layer::kind)
+    }
+
+    /// Whether `tool` can be picked with a layer of `kind` picked: it works
+    /// there, and for Stamp, a stamp has been chosen.
+    fn can_use(&self, tool: Tool, kind: Option<LayerKind>) -> bool {
+        kind.is_none_or(|k| tool.works_on(k)) && (tool != Tool::Stamp || self.placing.is_some())
     }
 
     /// Switches to a tool that works on the picked layer, if the current one
@@ -733,6 +901,23 @@ impl App {
             picker.open();
         }
         ui.separator();
+        let folder = self.library.dir();
+        let why = folder.as_ref().err().cloned().unwrap_or_default();
+        if ui
+            .add_enabled(folder.is_ok(), egui::Button::new("Open stamp folder"))
+            .on_hover_text("The folder of the Stamp Library, one file per stamp")
+            .on_disabled_hover_text(why)
+            .clicked()
+        {
+            let opened = self.library.create_dir().and_then(|()| {
+                let failed = self.opener_failed.0.clone();
+                open_folder(ui.ctx(), self.library.dir()?, failed)
+            });
+            if let Err(e) = opened {
+                self.fail(e);
+            }
+        }
+        ui.separator();
         let ready = self.export_ready();
         let can_export = matches!(ready, Some(Ok(())));
         let why_not = match &ready {
@@ -796,6 +981,12 @@ impl App {
             && let Some(mut t) = self.target()
         {
             panels::duplicate(&mut t);
+        }
+        if ui
+            .add_enabled(shapes, egui::Button::new("Save as stamp…"))
+            .clicked()
+        {
+            self.ask_stamp_name();
         }
         let delete = if anchor {
             "Delete anchor"
@@ -875,8 +1066,13 @@ impl App {
         });
     }
 
-    /// The palette, and the layers of the variant shown.
+    /// The palette, the layers of the variant shown, and under them the
+    /// Stamp Library.
     fn dock(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("stamps")
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| self.stamp_library(ui));
         let Some(doc) = &mut self.doc else { return };
         panels::palette(ui, &mut doc.editor, &mut self.paint, &mut self.refusal);
         ui.separator();
@@ -913,6 +1109,130 @@ impl App {
                 panels::apply_layer_action(&mut target, &mut doc.rename, action);
             }
         });
+    }
+
+    /// The stamps in the library, which a click picks to place and a
+    /// right-click renames or deletes. Opening the section reads the folder
+    /// again.
+    fn stamp_library(&mut self, ui: &mut egui::Ui) {
+        enum Action {
+            Place(String, Arc<Stamp>),
+            Rename(String),
+            Delete(String),
+        }
+        ui.separator();
+        let ready = self.stamp_ready();
+        let armed = self
+            .placing
+            .as_ref()
+            .filter(|_| self.tool == Tool::Stamp)
+            .map(|p| (p.name.clone(), p.stamp.clone()));
+        let problem = self.library.problem();
+        let mut action = None;
+        let header = egui::CollapsingHeader::new(egui::RichText::new("Stamps").strong())
+            .id_salt("stamps")
+            .default_open(true)
+            .show(ui, |ui| {
+                if let Some(why) = problem {
+                    ui.weak(why);
+                    return;
+                }
+                let entries = self.library.entries_mut();
+                if entries.is_empty() {
+                    ui.weak("No stamps yet. Pick shapes, then use Save as stamp.");
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("stamps")
+                    .max_height(STAMPS_HEIGHT)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for entry in entries {
+                                ui.vertical(|ui| {
+                                    ui.set_width(STAMP_THUMBNAIL.x);
+                                    let name = entry.name.clone();
+                                    let response = match entry.stamp.clone() {
+                                        Ok(stamp) => {
+                                            // The one placing, unless its file
+                                            // has changed since.
+                                            let picked = armed
+                                                .as_ref()
+                                                .is_some_and(|(n, s)| *n == name && *s == stamp);
+                                            let r = thumbnail(ui, STAMP_THUMBNAIL, picked, |ctx| {
+                                                // As many pixels as it shows, so
+                                                // nothing drawn is dropped.
+                                                let side = STAMP_THUMBNAIL.min_elem()
+                                                    * ctx.pixels_per_point();
+                                                entry.thumbnail(ctx, &stamp, side as u32)
+                                            });
+                                            let hover = match &ready {
+                                                Ok(()) => format!("{name}\nClick to place it"),
+                                                Err(why) => format!("{name}\n{why}"),
+                                            };
+                                            let r = r.on_hover_text(hover);
+                                            if r.clicked() && ready.is_ok() {
+                                                action = Some(Action::Place(name.clone(), stamp));
+                                            }
+                                            r
+                                        }
+                                        Err(e) => {
+                                            let (rect, r) = ui.allocate_exact_size(
+                                                STAMP_THUMBNAIL,
+                                                Sense::click(),
+                                            );
+                                            let painter = ui.painter();
+                                            painter.rect_filled(
+                                                rect,
+                                                2.0,
+                                                ui.visuals().extreme_bg_color,
+                                            );
+                                            painter.text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                Icon::TriangleAlert.unicode(),
+                                                icons::font(icons::LARGE),
+                                                WARNING,
+                                            );
+                                            r.on_hover_text(format!("{name} can't be read: {e}"))
+                                        }
+                                    };
+                                    response.context_menu(|ui| {
+                                        if ui.button("Rename…").clicked() {
+                                            action = Some(Action::Rename(name.clone()));
+                                        }
+                                        if ui.button("Delete…").clicked() {
+                                            action = Some(Action::Delete(name.clone()));
+                                        }
+                                    });
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(&name).small())
+                                            .truncate(),
+                                    );
+                                });
+                            }
+                        });
+                    });
+            });
+        // The header keeps its state under its own id.
+        let id = header.header_response.id;
+        let open =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                .is_open();
+        if header.header_response.clicked() && open {
+            self.library.scan();
+            ui.ctx().request_repaint();
+        }
+        match action {
+            Some(Action::Place(name, stamp)) => self.arm(name, stamp),
+            Some(Action::Rename(from)) => {
+                self.dialog = Some(Dialog::RenameStamp {
+                    name: from.clone(),
+                    from,
+                });
+            }
+            Some(Action::Delete(name)) => self.ask(Confirm::DeleteStamp(name)),
+            None => {}
+        }
     }
 
     /// A thumbnail of each texture, and under them one of each variant of
@@ -970,6 +1290,7 @@ impl App {
     /// with the wheel, without a scroll bar, which would cover the controls.
     fn style_bar(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = &mut self.doc else { return };
+        let (mut save, mut recolor) = (false, false);
         ui.style_mut().always_scroll_the_only_direction = true;
         egui::ScrollArea::horizontal()
             .id_salt("style bar")
@@ -981,15 +1302,36 @@ impl App {
                         ui.weak("An external texture is filled in by the game, and isn't painted.");
                         return;
                     };
+                    if self.tool == Tool::Stamp
+                        && let Some(placing) = &self.placing
+                    {
+                        panels::bar_label(ui, "Stamp", "The stamp a click places");
+                        ui.strong(&placing.name);
+                        recolor = ui
+                            .button("Colors…")
+                            .on_hover_text("Choose the palette entry each stamp color becomes")
+                            .clicked();
+                        ui.separator();
+                    }
                     let mut target = Target::new(
                         &mut doc.editor,
                         variant,
                         &mut doc.selection,
                         &mut self.refusal,
                     );
-                    panels::style_bar(ui, &mut target, &mut self.paint, self.tool);
+                    save = panels::style_bar(ui, &mut target, &mut self.paint, self.tool);
                 });
             });
+        if save {
+            self.ask_stamp_name();
+        }
+        if recolor && let (Some(placing), Some(doc)) = (&mut self.placing, &self.doc) {
+            let palette = doc.editor.project().palette();
+            let choices = placing
+                .current(palette)
+                .unwrap_or_else(|| stamps::nearest_choices(&placing.stamp, palette));
+            self.dialog = Some(Dialog::StampColors { choices });
+        }
     }
 
     /// The tools, those that don't work on the picked layer disabled.
@@ -1001,8 +1343,11 @@ impl App {
                 egui::Button::selectable(self.tool == tool, icon).min_size(egui::vec2(28.0, 28.0));
             let keys = ui.ctx().format_shortcut(&tool.shortcut());
             let hover = format!("{} ({keys})", tool.label());
-            let works = kind.is_none_or(|k| tool.works_on(k));
+            let works = self.can_use(tool, kind);
             let disabled = match kind {
+                _ if tool == Tool::Stamp => {
+                    format!("{hover}\nChoose a stamp under Stamps to use it")
+                }
                 Some(LayerKind::Vector) => format!("{hover}\nPick a raster layer to use it"),
                 _ => format!("{hover}\nPick a vector layer to use it"),
             };
@@ -1103,11 +1448,8 @@ impl App {
         }
         let ghost = own
             .or(self.texture_ghost.filter(|_| self.view.ghost_cursor))
-            .zip(texture_view::footprint(self.tool, self.paint))
-            .map(|((texture, center), radius)| Ghost {
-                texture,
-                center,
-                radius,
+            .and_then(|(texture, at)| {
+                ghost(self.tool, self.paint, self.placing.as_ref(), texture, at)
             });
         let aspect = rect.width() / rect.height().max(1.0);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -1208,7 +1550,7 @@ impl App {
             pointer.filter(|_| response.dragged_by(primary))
         };
         let path = match end {
-            Some(p) if !matches!(self.tool, Tool::Select | Tool::Fill) => {
+            Some(p) if !matches!(self.tool, Tool::Select | Tool::Fill | Tool::Stamp) => {
                 self.model.trail(&doc.surface, rect, p, r.texture)
             }
             _ => Vec::new(),
@@ -1246,6 +1588,7 @@ impl App {
             selection: &mut doc.selection,
             paint: self.paint,
             message: &mut self.refusal,
+            stamp: self.placing.as_mut(),
         };
         self.texture_view
             .model_interact(ui, response, canvas, r, self.tool, &model_pointer);
@@ -1301,6 +1644,7 @@ impl App {
                     .model_ghost
                     .and_then(|(texture, p)| (texture == t).then_some(p)),
                 model_hovered: self.model.hovered,
+                stamp: self.placing.as_mut(),
             },
         );
         // The Model View, already drawn this frame, shows the Texture View's
@@ -1353,7 +1697,7 @@ impl App {
                         if *key == keys.logical_key && modifiers.matches_exact(keys.modifiers))
                 })
             });
-            if pressed && kind.is_none_or(|k| tool.works_on(k)) {
+            if pressed && self.can_use(tool, kind) {
                 self.set_tool(tool);
             }
         }
@@ -1364,6 +1708,9 @@ impl App {
             Some(Dialog::Confirm(confirm)) => self.confirm_dialog(ctx, confirm),
             Some(Dialog::OpenDecomp { path, version }) => self.decomp_dialog(ctx, path, version),
             Some(Dialog::ExportSet { name }) => self.export_set_dialog(ctx, name),
+            Some(Dialog::SaveStamp { name, stamp }) => self.save_stamp_dialog(ctx, name, stamp),
+            Some(Dialog::RenameStamp { from, name }) => self.rename_stamp_dialog(ctx, from, name),
+            Some(Dialog::StampColors { choices }) => self.stamp_colors_dialog(ctx, choices),
             None => {}
         }
     }
@@ -1400,6 +1747,13 @@ impl App {
                 ),
                 "Replace",
             ),
+            Confirm::DeleteStamp(name) => (
+                "Delete stamp?",
+                format!(
+                    "This removes {name} from the Stamp Library for good. Shapes placed from it stay."
+                ),
+                "Delete",
+            ),
         };
         let choice = modal(ctx, title, action, true, |ui| {
             ui.label(body);
@@ -1428,6 +1782,175 @@ impl App {
             }
             (Some(true), Confirm::SaveOver(dir)) => self.save_to(dir),
             (Some(true), Confirm::OverwriteFolder(dir)) => self.write_folder(&dir),
+            (Some(true), Confirm::DeleteStamp(name)) => match self.library.delete(&name) {
+                Ok(()) => {
+                    if self.placing.as_ref().is_some_and(|p| p.name == name) {
+                        self.placing = None;
+                        if self.tool == Tool::Stamp {
+                            self.set_tool(Tool::Select);
+                        }
+                    }
+                    self.tell(format!("Deleted stamp {name}"));
+                }
+                Err(e) => self.fail(e),
+            },
+        }
+    }
+
+    /// Why `name` can't name a new stamp, if it can't.
+    fn stamp_name_problem(&self, name: &str) -> Option<String> {
+        match stamps::check_name(name) {
+            Err(why) => Some(why),
+            Ok(name) if self.library.taken(name) => {
+                Some(format!("A stamp named {name:?} already exists"))
+            }
+            Ok(_) => None,
+        }
+    }
+
+    /// A field for a stamp's name, which says what's wrong with it. Returns
+    /// whether Enter was pressed in it.
+    fn stamp_name_field(ui: &mut egui::Ui, name: &mut String, problem: Option<&str>) -> bool {
+        let enter = ui
+            .horizontal(|ui| {
+                ui.label("Name");
+                let field = ui.add(egui::TextEdit::singleline(name).desired_width(200.0));
+                focus_if_none(ui, &field);
+                entered(ui, &field)
+            })
+            .inner;
+        // Nothing to complain about until something is typed.
+        match problem {
+            Some(why) if !name.is_empty() => {
+                ui.colored_label(WARNING, why);
+            }
+            _ => {
+                ui.label(" ");
+            }
+        }
+        enter
+    }
+
+    fn save_stamp_dialog(&mut self, ctx: &egui::Context, mut name: String, stamp: Stamp) {
+        let problem = self.stamp_name_problem(&name);
+        let choice = modal(ctx, "Save as stamp", "Save", problem.is_none(), |ui| {
+            ui.label("The picked shapes, saved with their colors to the Stamp Library.");
+            Self::stamp_name_field(ui, &mut name, problem.as_deref())
+        });
+        match choice {
+            Some(true) => match self.library.save(&name, &stamp) {
+                Ok(()) => self.tell(format!("Saved stamp {}", name.trim())),
+                Err(e) => self.fail(e),
+            },
+            Some(false) => {}
+            None => self.dialog = Some(Dialog::SaveStamp { name, stamp }),
+        }
+    }
+
+    fn rename_stamp_dialog(&mut self, ctx: &egui::Context, from: String, mut name: String) {
+        // The name it has needs no complaint, but renames nothing.
+        let unchanged = name.trim() == from;
+        let problem = (!unchanged)
+            .then(|| self.stamp_name_problem(&name))
+            .flatten();
+        let enabled = !unchanged && problem.is_none();
+        let choice = modal(ctx, "Rename stamp", "Rename", enabled, |ui| {
+            ui.label(format!("A new name for {from}."));
+            Self::stamp_name_field(ui, &mut name, problem.as_deref())
+        });
+        match choice {
+            Some(true) => match self.library.rename(&from, &name) {
+                Ok(()) => {
+                    let name = name.trim();
+                    if let Some(p) = self.placing.as_mut().filter(|p| p.name == from) {
+                        name.clone_into(&mut p.name);
+                    }
+                    self.tell(format!("Renamed stamp {from} to {name}"));
+                }
+                Err(e) => self.fail(e),
+            },
+            Some(false) => {}
+            None => self.dialog = Some(Dialog::RenameStamp { from, name }),
+        }
+    }
+
+    /// Chooses what each color of the Stamp tool's stamp becomes: a palette
+    /// entry, or a new one. Cancelling before any are chosen leaves the
+    /// Stamp tool.
+    fn stamp_colors_dialog(&mut self, ctx: &egui::Context, mut choices: Vec<Choice>) {
+        let (Some(placing), Some(doc)) = (&mut self.placing, &self.doc) else {
+            return;
+        };
+        let project = doc.editor.project();
+        let palette = project.palette().colors();
+        let added = stamps::new_entries(&placing.stamp, &choices);
+        let choice = modal(ctx, "Stamp colors", "Use", true, |ui| {
+            // Many colors, or a long name, scroll, keeping the buttons in
+            // view.
+            let room = ui.ctx().content_rect().height() - STAMP_COLORS_ROOM;
+            let row = ui.spacing().interact_size.y;
+            egui::ScrollArea::vertical()
+                .id_salt("stamp colors")
+                .min_scrolled_height(row)
+                .max_height(room.clamp(row, STAMP_COLORS_HEIGHT))
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "The palette entry each color of {} becomes.",
+                        placing.name
+                    ));
+                    egui::Grid::new("stamp colors")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for (color, choice) in placing.stamp.colors().iter().zip(&mut choices) {
+                                let shown = scene::display_color(project, *color);
+                                panels::swatch(ui, shown, false).on_hover_text(format!(
+                                    "Stamp color #{:02X}{:02X}{:02X}, alpha {}",
+                                    color.r, color.g, color.b, color.a
+                                ));
+                                ui.horizontal_wrapped(|ui| {
+                                    for (i, &c) in palette.iter().enumerate() {
+                                        let index = PaletteIndex(i as u8);
+                                        let picked =
+                                            matches!(*choice, Choice::Entry(j, _) if j == index);
+                                        let shown = scene::display_color(project, c);
+                                        if panels::swatch(ui, shown, picked)
+                                            .on_hover_text(format!("Entry {i}"))
+                                            .clicked()
+                                        {
+                                            *choice = Choice::Entry(index, c);
+                                        }
+                                    }
+                                    if ui
+                                        .selectable_label(*choice == Choice::New, "New")
+                                        .on_hover_text("Add the stamp color to the palette")
+                                        .clicked()
+                                    {
+                                        *choice = Choice::New;
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+            if let Some(limit) = panels::palette_limit(project)
+                && palette.len() + added > limit
+            {
+                ui.colored_label(
+                    WARNING,
+                    format!("This makes {} of {limit} colors", palette.len() + added),
+                );
+            }
+            false
+        });
+        match choice {
+            Some(true) => placing.choices = Some(choices),
+            Some(false) => {
+                if placing.choices.is_none() {
+                    self.set_tool(Tool::Select);
+                }
+            }
+            None => self.dialog = Some(Dialog::StampColors { choices }),
         }
     }
 
@@ -1558,8 +2081,12 @@ impl eframe::App for App {
         {
             self.replace(Replace::Import(v), &ctx);
         }
+        while let Ok(why) = self.opener_failed.1.try_recv() {
+            self.fail(why);
+        }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
+        self.ask_stamp_colors();
         self.dialogs(&ctx);
         if let Some(message) = self.refusal.take()
             && let Some(d) = &self.doc

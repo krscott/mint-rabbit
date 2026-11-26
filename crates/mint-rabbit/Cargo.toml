@@ -19,3 +19,4 @@ workspace = true
 [dev-dependencies]
 png = "0.18.1"
 pollster = "1.0.3"
+tempfile = "3.27.0"

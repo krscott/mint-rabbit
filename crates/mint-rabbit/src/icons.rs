@@ -25,5 +25,11 @@ pub fn install(ctx: &egui::Context) {
 
 /// `icon` as text `size` points high.
 pub fn text(icon: Icon, size: f32) -> RichText {
-    RichText::new(icon.unicode()).font(FontId::new(size, FontFamily::Name(FAMILY.into())))
+    RichText::new(icon.unicode()).font(font(size))
+}
+
+/// The icon font at `size` points, for painting an icon's
+/// [`Icon::unicode`] character.
+pub fn font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FAMILY.into()))
 }

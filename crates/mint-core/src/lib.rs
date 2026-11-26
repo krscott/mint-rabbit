@@ -4,16 +4,20 @@
 pub mod file;
 mod model;
 mod modifier;
+mod non_empty;
 mod pose;
 mod project;
 pub mod shape;
+mod stamp;
 mod texture;
 
 pub use model::{Corner, Mesh, Model, Node, NodeId, Transform, Triangle, Vertex};
 pub use modifier::{Axes, HalfPoint, Mirror, Modifier, ModifierKind, Radial, Turns};
+pub use non_empty::NonEmpty;
 pub use pose::Pose;
 pub use project::{EditError, ExportTarget, PaletteError, Project, ProjectError, VariantRef};
 pub use shape::{Anchor, Outline, Shape, ShapeError, Style};
+pub use stamp::{Stamp, StampError};
 pub use texture::{
     AlphaMode, IndexedImage, Layer, LayerKind, Material, MaterialId, Palette, PaletteFull,
     PaletteIndex, PixelCountMismatch, Raster, Rgba8, RgbaImage, Slot, Texture, TextureContent,
