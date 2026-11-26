@@ -1051,7 +1051,9 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             ui.add_enabled_ui(idle, |ui| self.mode_selector(ui));
         });
-        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        // Clicks and drags without keyboard focus, as in the Texture View, so
+        // Enter isn't a click here.
+        let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
         self.model.hovered = response.hovered();
         self.model_ghost = None;
         let dragging = self.texture_view.dragging();
@@ -1063,13 +1065,15 @@ impl App {
         // The middle button turns the camera in either mode.
         let orbit = response.dragged_by(egui::PointerButton::Middle)
             || (!paint && response.dragged_by(egui::PointerButton::Primary));
+        // The camera holds still while a drag paints, so the drag's path stays
+        // on the surface it was traced on.
         let camera = &mut self.model.camera;
-        if orbit {
+        if orbit && !dragging {
             let d = response.drag_delta();
             camera.yaw -= d.x * 0.01;
             camera.pitch = (camera.pitch + d.y * 0.01).clamp(-1.5, 1.5);
         }
-        if response.hovered() {
+        if response.hovered() && !dragging {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             camera.distance *= (-scroll * 0.002).exp();
         }
@@ -1154,10 +1158,26 @@ impl App {
         pointer: Option<egui::Pos2>,
         hit: Option<crate::surface::Hit>,
     ) {
-        // Where the button went down, which may differ from where the
-        // pointer is by the time this frame sees the press; a press released
-        // in the same frame has only the pointer's position.
-        let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
+        // Where the primary button went down and came up this frame, which
+        // may differ from where the pointer is by the time the frame sees
+        // them.
+        let button = |pressed| {
+            ui.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: p,
+                        ..
+                    } if *p == pressed => Some(*pos),
+                    _ => None,
+                })
+            })
+        };
+        let (pressed_at, release) = (button(true), button(false));
+        let origin = pressed_at
+            .or_else(|| ui.input(|i| i.pointer.press_origin()))
+            .or(pointer);
         if response.hovered()
             && ui.input(|i| i.pointer.primary_pressed())
             && let Some(doc) = &self.doc
@@ -1179,17 +1199,6 @@ impl App {
         // A drag's path, for the tools that follow it, up to where the
         // pointer is, or on the release's frame to where the button let go.
         let primary = egui::PointerButton::Primary;
-        let release = ui.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    ..
-                } => Some(*pos),
-                _ => None,
-            })
-        });
         let end = if response.drag_stopped_by(primary) {
             release.or(pointer)
         } else {
@@ -1208,9 +1217,14 @@ impl App {
             }
             _ => 1.0,
         };
+        // A click lands where the button came up.
+        let here = match release {
+            Some(p) if response.clicked() => self.model.hit(&doc.surface, rect, p),
+            _ => hit,
+        };
         let model_pointer = ModelPointer {
             press,
-            here: on(hit).map(|h| h.point),
+            here: on(here).map(|h| h.point),
             path,
             texels_per_point,
         };
