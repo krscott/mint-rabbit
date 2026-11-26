@@ -66,6 +66,12 @@ clothing; it holds only a preview image with its own colors and is never
 exported.
 _Avoid_: Placeholder, runtime texture
 
+**UV Island**:
+A connected part of a mesh drawn with one texture whose UVs run on without
+a cut or fold; a stroke can't continue straight from one UV island to
+another.
+_Avoid_: Island, UV shell, chart, seam (a seam vertex is something else)
+
 **Material**:
 How triangles draw with a texture: the texture, a wrap mode per axis (clamp,
 repeat, or mirror), an alpha mode (opaque or cutout), whether
@@ -140,6 +146,20 @@ _Avoid_: Preset, brush, symbol
 **Model View**:
 The 3D pane, where painting lands on the texture under the cursor.
 _Avoid_: 3D view, viewport
+
+**Orbit Mode**:
+The Model View mode in which dragging turns the camera around the model.
+_Avoid_: Rotate mode, camera mode
+
+**Paint Mode**:
+The Model View mode in which the picked tool draws on the model, painting the
+texture under the cursor.
+_Avoid_: Edit mode, draw mode
+
+**Ghost Cursor**:
+The tool's footprint shown at the cursor's matching point in the other view,
+and wherever else on the model that texture point appears.
+_Avoid_: Brush preview, shadow cursor
 
 **Texture View**:
 The 2D pane that shows a texture in UV space.

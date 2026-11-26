@@ -4,11 +4,13 @@ mod app;
 mod camera;
 mod editor;
 mod icons;
+mod model_view;
 mod panels;
 mod picker;
 mod previews;
 mod render;
 mod scene;
+mod surface;
 mod texture_view;
 
 use std::path::PathBuf;

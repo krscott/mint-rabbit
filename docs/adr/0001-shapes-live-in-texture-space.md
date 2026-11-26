@@ -7,8 +7,10 @@ so both views edit the same data and export is plain rasterization.
 
 ## Consequences
 
-- A shape that crosses a UV seam does not continue across it in the Model
-  View; it is clipped at the island edge or must be drawn on each side.
+- On the model, a shape doesn't continue past its UV island's edge. A
+  freehand stroke painted across UV islands in the Model View becomes a
+  separate shape on each UV island of its texture that it touches; pen paths
+  and boxes run straight in texture space between their points.
 - Moving a mesh's UVs moves the painting that lands on it.
 - Texel units keep circles round and stroke widths even on non-square
   textures, such as AC's 32x16 eyes, where normalized UV would stretch them.
@@ -18,7 +20,7 @@ so both views edit the same data and export is plain rasterization.
 
 ## Status
 
-Accepted for v1. Revisit if seam-crossing shapes become a real pain point; a
-surface-anchored representation projected into UV space is the main
-alternative. The imported image was first an immutable underlay beneath the
-shapes; ADR 0004 replaced it with raster layers.
+Accepted for v1. Revisit if shapes stopping at UV island edges become a real
+pain point; a surface-anchored representation projected into UV space is the
+main alternative. The imported image was first an immutable underlay beneath
+the shapes; ADR 0004 replaced it with raster layers.

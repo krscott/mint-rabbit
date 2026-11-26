@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use mint_ac::{Decomp, VillagerRef};
 use mint_core::{
     Layer, LayerKind, PaletteIndex, Project, Texture, TextureContent, TextureId, VariantRef,
@@ -15,11 +15,13 @@ use mint_core::{
 use crate::camera::Orbit;
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
+use crate::model_view::{Mode, ModelView};
 use crate::panels::{self, Target};
 use crate::picker::{self, Gpu, Picker};
 use crate::previews::{Previews, thumbnail};
-use crate::render::{ModelCallback, Renderer, SceneData};
-use crate::texture_view::{Frame, Paint, Selection, TextureView, Tool};
+use crate::render::{Ghost, ModelCallback, Renderer, SceneData};
+use crate::surface::Surface;
+use crate::texture_view::{self, Canvas, Frame, ModelPointer, Paint, Selection, TextureView, Tool};
 
 const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
 const REDO: KeyboardShortcut =
@@ -37,6 +39,9 @@ const NOTHING_OPEN: &str =
 
 /// Size of a texture's or variant's thumbnail above the Texture View.
 const THUMBNAIL: egui::Vec2 = egui::vec2(40.0, 32.0);
+
+/// Height of the mode selector above the Model View.
+const MODE_BAR_HEIGHT: f32 = 28.0;
 
 /// Width of the tool strip at the Texture View's left.
 const TOOLS_WIDTH: f32 = 36.0;
@@ -61,6 +66,8 @@ struct Doc {
     /// The layer name being typed in the layer list.
     rename: Option<panels::Rename>,
     scene: Arc<SceneData>,
+    /// The scene's surface, for the pointer in the Model View.
+    surface: Surface,
     /// What `scene` was built from.
     scene_for: (u64, Vec<usize>),
     /// Whether the project could export now, as of an editor generation.
@@ -68,7 +75,10 @@ struct Doc {
 }
 
 impl Doc {
-    fn new(project: Project, path: Option<PathBuf>, generation: u64) -> Self {
+    /// A document for `project`. Its scene is the `generation`th built, and
+    /// its surface finds cutout edges as a view sampling textures `smooth`ly
+    /// or not shows them.
+    fn new(project: Project, path: Option<PathBuf>, generation: u64, smooth: bool) -> Self {
         let variants = vec![0; project.textures().len()];
         let selected = project
             .textures()
@@ -94,9 +104,38 @@ impl Doc {
             selection,
             previews: Previews::default(),
             rename: None,
+            surface: Surface::new(scene.clone(), smooth),
             scene,
             check: None,
         }
+    }
+
+    /// Rebuilds the scene if the project or the variants shown changed. The
+    /// surface follows the scene, except while `dragging`, so a drag meets
+    /// the surface as it was when it began. `generation` counts rebuilds;
+    /// `smooth` is whether the view samples textures smoothly.
+    fn refresh_scene(&mut self, generation: &mut u64, smooth: bool, dragging: bool) {
+        if self.scene_stale() {
+            let key = (self.editor.generation(), self.variants.clone());
+            *generation += 1;
+            self.scene = Arc::new(SceneData::new(
+                self.editor.project(),
+                &self.variants,
+                *generation,
+            ));
+            self.scene_for = key;
+        }
+        let surface = &self.surface;
+        let stale = !Arc::ptr_eq(surface.scene(), &self.scene) || surface.smooth() != smooth;
+        if stale && !dragging {
+            self.surface = surface.with_scene(self.scene.clone(), smooth);
+        }
+    }
+
+    /// Whether the project or the variants shown changed since the scene
+    /// was built.
+    fn scene_stale(&self) -> bool {
+        self.scene_for.0 != self.editor.generation() || self.scene_for.1 != self.variants
     }
 
     /// The painted variant shown in the Texture View, if any.
@@ -267,6 +306,15 @@ enum Replace {
     Quit,
 }
 
+/// The View menu's settings.
+struct ViewOptions {
+    linear_filter: bool,
+    show_uv: bool,
+    /// Whether each view shows the Ghost Cursor where the pointer over the
+    /// other meets the texture.
+    ghost_cursor: bool,
+}
+
 pub struct App {
     /// The decomp checkout and game version last asked for.
     decomp_path: String,
@@ -278,9 +326,14 @@ pub struct App {
     doc: Option<Doc>,
     /// Counts scene rebuilds, so the renderer uploads each new one.
     generation: u64,
-    camera: Orbit,
-    linear_filter: bool,
-    show_uv: bool,
+    model: ModelView,
+    view: ViewOptions,
+    /// Where the pointer over the Model View, in Paint mode, meets the
+    /// model this frame, for the Texture View's Ghost Cursor.
+    model_ghost: Option<(TextureId, Vec2)>,
+    /// The texture point under the pointer over the Texture View last
+    /// frame, for the Model View's Ghost Cursor.
+    texture_ghost: Option<(TextureId, Vec2)>,
     status: Option<Status>,
     /// Why the last edit in a panel or view was refused, moved into
     /// `status` after them.
@@ -323,9 +376,14 @@ impl App {
             gpu,
             doc: None,
             generation: 0,
-            camera: Orbit::framing(Vec3::splat(-1.0), Vec3::ONE),
-            linear_filter: true,
-            show_uv: true,
+            model: ModelView::new(Orbit::framing(Vec3::splat(-1.0), Vec3::ONE)),
+            view: ViewOptions {
+                linear_filter: true,
+                show_uv: true,
+                ghost_cursor: true,
+            },
+            model_ghost: None,
+            texture_ghost: None,
             status: None,
             refusal: None,
             dialog: None,
@@ -391,8 +449,8 @@ impl App {
 
     fn set_doc(&mut self, project: Project, path: Option<PathBuf>) {
         self.generation += 1;
-        let doc = Doc::new(project, path, self.generation);
-        self.camera = Orbit::framing(doc.scene.mesh.bounds_min, doc.scene.mesh.bounds_max);
+        let doc = Doc::new(project, path, self.generation, self.view.linear_filter);
+        self.model.camera = Orbit::framing(doc.scene.mesh.bounds_min, doc.scene.mesh.bounds_max);
         self.texture_view = TextureView::default();
         self.paint.color = PaletteIndex(0);
         self.folder_set = mint_ac::imported_from(doc.editor.project())
@@ -752,8 +810,15 @@ impl App {
     }
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.linear_filter, "Smooth filtering (as in game)");
-        ui.checkbox(&mut self.show_uv, "UV layout in the Texture View");
+        ui.checkbox(
+            &mut self.view.linear_filter,
+            "Smooth filtering (as in game)",
+        );
+        ui.checkbox(&mut self.view.show_uv, "UV layout in the Texture View");
+        ui.checkbox(
+            &mut self.view.ghost_cursor,
+            "Ghost Cursor in the other view",
+        );
         ui.separator();
         if ui.button("Fit texture to view").clicked() {
             self.texture_view.fit();
@@ -761,7 +826,8 @@ impl App {
         ui.separator();
         ui.weak("Texture View: scroll to zoom, middle-drag to pan,");
         ui.weak("middle double-click to fit.");
-        ui.weak("Model View: drag to turn, scroll to zoom.");
+        ui.weak("Model View: in Orbit mode, drag to turn; in Paint mode,");
+        ui.weak("draw with the tools and middle-drag to turn. Scroll to zoom.");
     }
 
     /// The last thing done or what went wrong, and at the right whether the
@@ -974,44 +1040,250 @@ impl App {
         });
     }
 
-    fn model_view(&mut self, ui: &mut egui::Ui) {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::drag());
+    /// The Model View, with its mode selector. In Paint mode, the tools
+    /// draw on the texture under the pointer, which a press shows in the
+    /// Texture View. `idle` is whether the selector takes input.
+    fn model_view(&mut self, ui: &mut egui::Ui, idle: bool) {
+        // The mode selector has a strip of its own, so a press on it never
+        // reaches the model.
+        let full = ui.available_rect_before_wrap();
+        let (bar, rect) = full.split_top_bottom_at_y(full.top() + MODE_BAR_HEIGHT);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            ui.add_enabled_ui(idle, |ui| self.mode_selector(ui));
+        });
+        // Clicks and drags without keyboard focus, as in the Texture View, so
+        // Enter isn't a click here.
+        let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
+        self.model.hovered = response.hovered();
+        self.model_ghost = None;
+        let dragging = self.texture_view.dragging();
         let Some(doc) = &mut self.doc else {
             return;
         };
-        let key = (doc.editor.generation(), doc.variants.clone());
-        if doc.scene_for != key {
-            self.generation += 1;
-            doc.scene = Arc::new(SceneData::new(
-                doc.editor.project(),
-                &doc.variants,
-                self.generation,
-            ));
-            doc.scene_for = key;
-        }
-        if response.dragged_by(egui::PointerButton::Primary) {
+        doc.refresh_scene(&mut self.generation, self.view.linear_filter, dragging);
+        let paint = self.model.mode == Mode::Paint && self.dialog.is_none();
+        // The middle button turns the camera in either mode.
+        let orbit = response.dragged_by(egui::PointerButton::Middle)
+            || (!paint && response.dragged_by(egui::PointerButton::Primary));
+        // The camera holds still while a drag paints, so the drag's path stays
+        // on the surface it was traced on.
+        let camera = &mut self.model.camera;
+        if orbit && !dragging {
             let d = response.drag_delta();
-            self.camera.yaw -= d.x * 0.01;
-            self.camera.pitch = (self.camera.pitch + d.y * 0.01).clamp(-1.5, 1.5);
+            camera.yaw -= d.x * 0.01;
+            camera.pitch = (camera.pitch + d.y * 0.01).clamp(-1.5, 1.5);
         }
-        if response.hovered() {
+        if response.hovered() && !dragging {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.camera.distance *= (-scroll * 0.002).exp();
+            camera.distance *= (-scroll * 0.002).exp();
         }
+        let pointer = response
+            .interact_pointer_pos()
+            .or_else(|| response.hover_pos());
+        let hit = pointer
+            .filter(|_| paint)
+            .and_then(|p| self.model.hit(&doc.surface, rect, p));
+        if paint {
+            self.paint_model(ui, &response, rect, pointer, hit);
+        }
+        let dragging = self.texture_view.dragging();
+        let Some(doc) = &mut self.doc else {
+            return;
+        };
+        doc.refresh_scene(&mut self.generation, self.view.linear_filter, dragging);
+
+        // The tool's footprint where the pointer meets a painted texture in
+        // Paint mode, or else the Texture View's Ghost Cursor.
+        let project = doc.editor.project();
+        let own = hit
+            .filter(|h| response.hovered() && !project.texture(h.texture).variants().is_empty())
+            .map(|h| (h.texture, h.point));
+        if self.view.ghost_cursor {
+            self.model_ghost = own;
+        }
+        let ghost = own
+            .or(self.texture_ghost.filter(|_| self.view.ghost_cursor))
+            .zip(texture_view::footprint(self.tool, self.paint))
+            .map(|((texture, center), radius)| Ghost {
+                texture,
+                center,
+                radius,
+            });
         let aspect = rect.width() / rect.height().max(1.0);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             ModelCallback {
                 scene: doc.scene.clone(),
-                view_proj: self.camera.view_proj(aspect),
-                linear_filter: self.linear_filter,
+                view_proj: self.model.camera.view_proj(aspect),
+                linear_filter: self.view.linear_filter,
+                ghost,
             },
         ));
     }
 
+    /// The Model View's mode buttons.
+    fn mode_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            let modes = [
+                (
+                    Mode::Orbit,
+                    Icon::Orbit,
+                    "Orbit",
+                    "Drag to turn the camera around the model.",
+                ),
+                (
+                    Mode::Paint,
+                    Icon::Paintbrush,
+                    "Paint",
+                    "Draw on the model with the picked tool.\nMiddle-drag to turn the camera.",
+                ),
+            ];
+            for (mode, icon, label, hover) in modes {
+                let text = (icons::text(icon, icons::SMALL), label);
+                let button = egui::Button::selectable(self.model.mode == mode, text);
+                if ui.add(button).on_hover_text(hover).clicked() {
+                    self.model.mode = mode;
+                }
+            }
+        });
+    }
+
+    /// Paint-mode input over the Model View, whose pointer is at `pointer`
+    /// and meets the model at `hit`.
+    fn paint_model(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        rect: egui::Rect,
+        pointer: Option<egui::Pos2>,
+        hit: Option<crate::surface::Hit>,
+    ) {
+        // Where the primary button went down and came up this frame, which
+        // may differ from where the pointer is by the time the frame sees
+        // them.
+        let button = |pressed| {
+            ui.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: p,
+                        ..
+                    } if *p == pressed => Some(*pos),
+                    _ => None,
+                })
+            })
+        };
+        let (pressed_at, release) = (button(true), button(false));
+        let origin = pressed_at
+            .or_else(|| ui.input(|i| i.pointer.press_origin()))
+            .or(pointer);
+        // A drag finishes on the texture it began on, even if a new press
+        // arrives before its release is seen.
+        if response.hovered()
+            && ui.input(|i| i.pointer.primary_pressed())
+            && !self.texture_view.dragging()
+            && let Some(doc) = &self.doc
+            && let Some(h) = origin.and_then(|o| self.model.hit(&doc.surface, rect, o))
+        {
+            self.paint_texture(h.texture);
+            // The tools fit the texture now shown before the press acts.
+            self.fit_tool();
+        }
+        let Some(doc) = &mut self.doc else { return };
+        let Some(r) = doc.variant() else { return };
+        let on = |h: Option<crate::surface::Hit>| h.filter(|h| h.texture == r.texture);
+        let mut press = None;
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(origin) = origin
+        {
+            press = on(self.model.press(&doc.surface, rect, origin)).map(|h| h.point);
+        }
+        // A drag's path, for the tools that follow it, up to where the
+        // pointer is, or on the release's frame to where the button let go.
+        let primary = egui::PointerButton::Primary;
+        let end = if response.drag_stopped_by(primary) {
+            release.or(pointer)
+        } else {
+            pointer.filter(|_| response.dragged_by(primary))
+        };
+        let path = match end {
+            Some(p) if !matches!(self.tool, Tool::Select | Tool::Fill) => {
+                self.model.trail(&doc.surface, rect, p, r.texture)
+            }
+            _ => Vec::new(),
+        };
+        // A click lands where the button came up, a drag starts where it
+        // went down, and either finds what it's near within a reach measured
+        // there.
+        let acted_at = if response.clicked() {
+            release.or(pointer)
+        } else if response.drag_started() {
+            origin
+        } else {
+            None
+        };
+        let acted = acted_at.and_then(|p| Some((p, self.model.hit(&doc.surface, rect, p)?)));
+        let texels_per_point = match acted {
+            Some((p, h)) if on(Some(h)).is_some() => {
+                self.model.texels_per_point(&doc.surface, rect, p, &h)
+            }
+            _ => 1.0,
+        };
+        let here = if response.clicked() {
+            acted.map(|(_, h)| h)
+        } else {
+            hit
+        };
+        let model_pointer = ModelPointer {
+            press,
+            here: on(here).map(|h| h.point),
+            path,
+            texels_per_point,
+        };
+        let canvas = Canvas {
+            editor: &mut doc.editor,
+            selection: &mut doc.selection,
+            paint: self.paint,
+            message: &mut self.refusal,
+        };
+        self.texture_view
+            .model_interact(ui, response, canvas, r, self.tool, &model_pointer);
+    }
+
+    /// Shows `texture`, pressed on in the Model View, in the Texture View so
+    /// the tools act on it; refuses an external texture, and another
+    /// texture while a pen path is open on this one.
+    fn paint_texture(&mut self, texture: TextureId) {
+        let Some(doc) = &self.doc else { return };
+        let t = doc.editor.project().texture(texture);
+        if t.variants().is_empty() {
+            self.refusal = Some(format!(
+                "{} is filled in by the game, and isn't painted.",
+                t.name
+            ));
+            return;
+        }
+        if doc.selected == Some(texture) {
+            return;
+        }
+        if self.texture_view.drawing_path() {
+            self.refusal = Some(
+                "Finish the pen's path, or press Escape to drop it, to draw on another texture."
+                    .into(),
+            );
+            return;
+        }
+        let variant = doc.variants[texture.index()];
+        self.show_variant(VariantRef { texture, variant });
+    }
+
     fn texture_view(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = &mut self.doc else { return };
-        let Some(t) = doc.selected else { return };
+        let Some(t) = doc.selected else {
+            self.texture_ghost = None;
+            return;
+        };
         self.texture_view.show(
             ui,
             Frame {
@@ -1022,11 +1294,22 @@ impl App {
                 tool: self.tool,
                 paint: self.paint,
                 selection: &mut doc.selection,
-                show_uv: self.show_uv,
+                show_uv: self.view.show_uv,
                 input: self.dialog.is_none(),
                 message: &mut self.refusal,
+                ghost: self
+                    .model_ghost
+                    .and_then(|(texture, p)| (texture == t).then_some(p)),
+                model_hovered: self.model.hovered,
             },
         );
+        // The Model View, already drawn this frame, shows the Texture View's
+        // Ghost Cursor in the next.
+        let ghost = self.texture_view.hover().map(|p| (t, p));
+        if ghost != self.texture_ghost {
+            ui.ctx().request_repaint();
+        }
+        self.texture_ghost = ghost;
     }
 
     /// Keyboard shortcuts that work anywhere outside text fields.
@@ -1264,7 +1547,7 @@ impl eframe::App for App {
             let right =
                 egui::Rect::from_min_max(egui::pos2(full.min.x + half + 2.0, full.min.y), full.max);
             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                self.model_view(ui);
+                self.model_view(ui, idle);
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
                 self.texture_pane(ui, idle);
@@ -1294,6 +1577,13 @@ impl eframe::App for App {
             && !ctx.text_edit_focused()
         {
             d.editor.end_gesture();
+        }
+        // Changes after the Model View was drawn, from the Texture View, its
+        // strip, keys, or dialogs, show in the next frame.
+        if let Some(d) = &self.doc
+            && d.scene_stale()
+        {
+            ctx.request_repaint();
         }
         let title = self.title();
         if title != self.title {
