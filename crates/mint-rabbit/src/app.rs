@@ -816,7 +816,12 @@ impl App {
             &mut doc.selection,
             &mut self.refusal,
         );
-        // The actions keep to the bottom, and the list scrolls in the rest.
+        // The picked layer's modifiers keep to the bottom, the layer actions
+        // over them, and the list scrolls in the rest.
+        egui::Panel::bottom("modifiers")
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| panels::modifier_stack(ui, &mut target));
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let action = panels::layer_actions(ui, &target);
             panels::layer_opacity(ui, &mut target);

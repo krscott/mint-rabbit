@@ -399,8 +399,9 @@ mod tests {
         // Pixels are checked like shapes.
         assert_eq!(
             p.edit_variant(V, |v| {
-                let base = v.layers_mut()[1].raster_pixels_mut().unwrap();
-                base.fill(Vec2::splat(0.5), Some(PaletteIndex(2)));
+                v.layers_mut()[1].edit_raster(|base| {
+                    base.fill(Vec2::splat(0.5), Some(PaletteIndex(2)));
+                });
             }),
             missing
         );

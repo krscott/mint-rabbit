@@ -3,6 +3,7 @@
 use glam::{UVec2, Vec2};
 
 use crate::Shape;
+use crate::modifier::{self, Modifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgba8 {
@@ -130,6 +131,16 @@ impl IndexedImage {
     }
 }
 
+/// The palette entry each pixel of an image of `size` takes from the topmost
+/// of `shapes` covering its center, row-major, or `None` where none does.
+fn shape_coverage(shapes: &[Shape], size: UVec2) -> Vec<Option<PaletteIndex>> {
+    let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
+    for shape in shapes {
+        covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
+    }
+    out
+}
+
 /// Calls `f` with the row-major index of each pixel of an image of `size`
 /// whose center `shape` covers.
 fn covered_pixels(shape: &Shape, size: UVec2, mut f: impl FnMut(usize)) {
@@ -205,6 +216,10 @@ pub enum TextureContent {
 pub struct Raster {
     size: UVec2,
     pixels: Vec<Option<PaletteIndex>>,
+    /// While [`Layer::edit_raster`] edits a copy of the raster, which pixels
+    /// its tools have written, whether or not that changed them; otherwise
+    /// empty.
+    written: Vec<bool>,
 }
 
 impl Raster {
@@ -216,16 +231,21 @@ impl Raster {
                 len: pixels.len(),
             });
         }
-        Ok(Self { size, pixels })
+        Ok(Self {
+            size,
+            pixels,
+            written: Vec::new(),
+        })
     }
 
     /// A raster of `size` with no pixels set.
     #[must_use]
     pub fn clear(size: UVec2) -> Self {
-        Self {
+        Self::new(
             size,
-            pixels: vec![None; (u64::from(size.x) * u64::from(size.y)) as usize],
-        }
+            vec![None; (u64::from(size.x) * u64::from(size.y)) as usize],
+        )
+        .expect("the pixel count fits the size")
     }
 
     #[must_use]
@@ -250,9 +270,24 @@ impl Raster {
         texel_index(self.size, x, y)
     }
 
+    /// Whether a fill of pixels of value `old` still has pixel `i` to fill:
+    /// it has that value and isn't marked in `filled`.
+    fn fillable(&self, i: usize, old: Option<PaletteIndex>, filled: &[bool]) -> bool {
+        self.pixels[i] == old && !filled.get(i).is_some_and(|&f| f)
+    }
+
+    /// Writes `value` to pixel `i`.
+    fn write(&mut self, i: usize, value: Option<PaletteIndex>) {
+        self.pixels[i] = value;
+        if let Some(w) = self.written.get_mut(i) {
+            *w = true;
+        }
+    }
+
     /// Sets each pixel whose center `shape` covers to its color.
     pub fn paint_shape(&mut self, shape: &Shape) {
-        covered_pixels(shape, self.size, |i| self.pixels[i] = Some(shape.color()));
+        let size = self.size;
+        covered_pixels(shape, size, |i| self.write(i, Some(shape.color())));
     }
 
     /// Sets the pixels a pencil `width` texels wide covers from `from` to
@@ -270,7 +305,7 @@ impl Raster {
         loop {
             for &(ox, oy) in &tip {
                 if let Some(i) = self.index(x + ox, y + oy) {
-                    self.pixels[i] = value;
+                    self.write(i, value);
                 }
             }
             if (x, y) == (x1, y1) {
@@ -297,9 +332,17 @@ impl Raster {
             return;
         };
         let old = self.pixels[start];
-        if old == value {
+        // Filling with the value a region has changes nothing, but while
+        // written pixels are tracked it still writes them, each once, as
+        // marked in `filled`; a fill with a new value needs no marks.
+        if old == value && self.written.is_empty() {
             return;
         }
+        let mut filled = if old == value {
+            vec![false; self.pixels.len()]
+        } else {
+            Vec::new()
+        };
         // Scanline fill: each run of a row is filled as it is queued, so it
         // is queued once and the queue never holds more runs than the
         // raster has. Taking runs in the order queued usually keeps it near
@@ -307,13 +350,16 @@ impl Raster {
         // maze whose dead ends all lie equally far from the start can still
         // queue them all at once.
         let mut runs = std::collections::VecDeque::new();
-        runs.push_back(self.fill_run(x, y, old, value));
+        runs.push_back(self.fill_run(x, y, old, value, &mut filled));
         while let Some((left, right, y)) = runs.pop_front() {
             for ny in [y - 1, y + 1] {
                 let mut fx = left;
                 while fx <= right {
-                    if self.index(fx, ny).is_some_and(|i| self.pixels[i] == old) {
-                        let run = self.fill_run(fx, ny, old, value);
+                    if self
+                        .index(fx, ny)
+                        .is_some_and(|i| self.fillable(i, old, &filled))
+                    {
+                        let run = self.fill_run(fx, ny, old, value, &mut filled);
                         fx = run.1 + 1;
                         runs.push_back(run);
                     } else {
@@ -325,15 +371,17 @@ impl Raster {
     }
 
     /// Sets the run of `old` pixels through `(x, y)` in its row to `value`,
-    /// returning its left and right ends and its row.
+    /// marking them in `filled` if it has room, and returns the run's left
+    /// and right ends and its row.
     fn fill_run(
         &mut self,
         x: i64,
         y: i64,
         old: Option<PaletteIndex>,
         value: Option<PaletteIndex>,
+        filled: &mut [bool],
     ) -> (i64, i64, i64) {
-        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.pixels[i] == old);
+        let matches = |r: &Self, x: i64| r.index(x, y).is_some_and(|i| r.fillable(i, old, filled));
         let (mut left, mut right) = (x, x);
         while matches(self, left - 1) {
             left -= 1;
@@ -342,7 +390,12 @@ impl Raster {
             right += 1;
         }
         let start = self.index(left, y).expect("the run is inside the raster");
-        self.pixels[start..=start + (right - left) as usize].fill(value);
+        for i in start..=start + (right - left) as usize {
+            self.write(i, value);
+            if let Some(f) = filled.get_mut(i) {
+                *f = true;
+            }
+        }
         (left, right, y)
     }
 
@@ -411,6 +464,7 @@ impl From<IndexedImage> for Raster {
         Self {
             size: image.size,
             pixels: image.pixels.into_iter().map(Some).collect(),
+            written: Vec::new(),
         }
     }
 }
@@ -440,6 +494,9 @@ pub struct Layer {
     pub locked: bool,
     /// Opacity in the views only, from 0 to 1; export ignores it.
     pub opacity: f32,
+    /// Applied in order to what the layer holds; locked layers can only
+    /// turn them on and off, which the app enforces.
+    pub modifiers: Vec<Modifier>,
     pub(crate) content: LayerContent,
 }
 
@@ -462,6 +519,7 @@ impl Layer {
             visible: true,
             locked: false,
             opacity: 1.0,
+            modifiers: Vec::new(),
             content,
         }
     }
@@ -500,12 +558,58 @@ impl Layer {
         }
     }
 
-    /// The pixels of a raster layer.
-    pub fn raster_pixels_mut(&mut self) -> Option<&mut Raster> {
-        match &mut self.content {
-            LayerContent::Raster(r) => Some(r),
-            LayerContent::Vector(_) => None,
+    /// Edits a raster layer with `f`, returning its result, or `None` for a
+    /// vector layer. With modifiers on, `f` edits the pixels the layer shows,
+    /// copies included, and each pixel it writes is stored at that pixel,
+    /// even with the value it showed. The change also reaches every pixel
+    /// the modifiers show as the same one: clearing a pixel that showed
+    /// something clears them all, so no copy of it is left, and a set pixel
+    /// recolors those the layer holds, while those it doesn't hold show the
+    /// new pixel's copies. What the layer holds then stays what was drawn,
+    /// and moving the modifiers moves its copies. A raster `f` puts in place
+    /// of the one it is given replaces the layer's as it is.
+    pub fn edit_raster<T>(&mut self, f: impl FnOnce(&mut Raster) -> T) -> Option<T> {
+        let size = self.raster_pixels()?.size;
+        let stack = modifier::stack(&self.modifiers);
+        let shown = (!stack.is_empty()).then(|| self.coverage(size));
+        let LayerContent::Raster(r) = &mut self.content else {
+            return None;
+        };
+        let Some(shown) = shown else {
+            return Some(f(r));
+        };
+        let mut edited = Raster {
+            size,
+            written: vec![false; shown.len()],
+            pixels: shown.clone(),
+        };
+        let out = f(&mut edited);
+        // A raster put in place of the given one tracks no writes.
+        if edited.written.is_empty() {
+            *r = edited;
+            return Some(out);
         }
+        // Written pixels by their value, which the tools make one. Clearing
+        // a pixel that showed nothing reaches no others.
+        let mut changes: Vec<(Option<PaletteIndex>, Vec<usize>)> = Vec::new();
+        for (i, &now) in edited.pixels.iter().enumerate() {
+            if !edited.written[i] || (now.is_none() && shown[i].is_none()) {
+                continue;
+            }
+            r.pixels[i] = now;
+            match changes.iter_mut().find(|(v, _)| *v == now) {
+                Some((_, pixels)) => pixels.push(i),
+                None => changes.push((now, vec![i])),
+            }
+        }
+        for (now, pixels) in changes {
+            for j in modifier::matching(&stack, size, &pixels) {
+                if now.is_none() || r.pixels[j].is_some() {
+                    r.pixels[j] = now;
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The shape list of a vector layer. Panics on a raster layer, which
@@ -536,32 +640,53 @@ impl Layer {
     }
 
     /// The palette entry each pixel of an image of `size` takes from this
-    /// layer, row-major: for a vector layer, the topmost shape covering its
-    /// center, or `None` where none does. Visibility and opacity are not
-    /// applied. A raster layer must be of `size`.
+    /// layer, row-major, after its enabled modifiers: for a vector layer,
+    /// from the topmost shape covering its center or a copy of such a pixel,
+    /// or `None` where nothing does. Visibility and opacity are not applied.
+    /// A raster layer must be of `size`.
     #[must_use]
     pub fn coverage(&self, size: UVec2) -> Vec<Option<PaletteIndex>> {
-        match &self.content {
-            LayerContent::Vector(shapes) => {
-                let mut out = vec![None; (u64::from(size.x) * u64::from(size.y)) as usize];
-                for shape in shapes {
-                    covered_pixels(shape, size, |i| out[i] = Some(shape.color()));
-                }
-                out
-            }
+        let held = match &self.content {
+            LayerContent::Vector(shapes) => shape_coverage(shapes, size),
             LayerContent::Raster(r) => {
                 debug_assert_eq!(r.size, size);
                 r.pixels.clone()
             }
-        }
+        };
+        self.modifiers
+            .iter()
+            .filter(|m| m.enabled)
+            .fold(held, |px, m| m.apply_pixels(size, &px))
     }
 
     /// Turns a vector layer into a raster layer of `size` holding the
-    /// pixels its shapes cover. A raster layer stays as it is.
+    /// pixels its shapes cover, keeping its modifiers. A raster layer stays
+    /// as it is.
     fn rasterize(&mut self, size: UVec2) {
-        if self.kind() == LayerKind::Vector {
-            let pixels = self.coverage(size);
-            self.content = LayerContent::Raster(Raster { size, pixels });
+        if let LayerContent::Vector(shapes) = &self.content {
+            let pixels = shape_coverage(shapes, size);
+            self.content = LayerContent::Raster(Raster {
+                size,
+                pixels,
+                written: Vec::new(),
+            });
+        }
+    }
+
+    /// Writes the first modifier's copies into the layer, as shapes or
+    /// pixels, and removes the modifier, whether or not it is enabled.
+    /// Copied shapes go beneath the shapes they copy; being whole shapes,
+    /// they can show more than the copied pixels did, from parts past the
+    /// texture's edge or pixel centers lying exactly on their edges. Does
+    /// nothing without modifiers.
+    pub fn apply_first_modifier(&mut self) {
+        if self.modifiers.is_empty() {
+            return;
+        }
+        let m = self.modifiers.remove(0);
+        match &mut self.content {
+            LayerContent::Vector(shapes) => *shapes = m.apply_shapes(shapes),
+            LayerContent::Raster(r) => r.pixels = m.apply_pixels(r.size, &r.pixels),
         }
     }
 
@@ -911,6 +1036,177 @@ mod tests {
             px(l.raster_pixels().unwrap()),
             [Some(7), None, Some(7), None]
         );
+    }
+
+    fn mirror_x(at: i32) -> Modifier {
+        use crate::{Axes, HalfPoint, Mirror, ModifierKind};
+        Modifier::new(ModifierKind::Mirror(Mirror {
+            axes: Axes::X,
+            at: HalfPoint { x: at, y: 0 },
+        }))
+    }
+
+    #[test]
+    fn modifiers_show_until_turned_off_and_rasterizing_keeps_them() {
+        use crate::{Style, shape};
+        let size = UVec2::new(4, 1);
+        let mut l = Layer::new("l");
+        let dot = shape::rectangle(Vec2::ZERO, Vec2::new(1.0, 1.0));
+        l.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(4));
+        let shown = l.coverage(size);
+        assert_eq!(
+            shown,
+            [Some(7), None, None, Some(7)].map(|p| p.map(PaletteIndex))
+        );
+        let mut v = Variant::new("1", size);
+        v.insert_layer(0, l);
+        v.rasterize_layer(0);
+        let l = &mut v.layers_mut()[0];
+        assert_eq!(l.modifiers.len(), 1);
+        assert_eq!(px(l.raster_pixels().unwrap()), [Some(7), None, None, None]);
+        assert_eq!(l.coverage(size), shown);
+        l.modifiers[0].enabled = false;
+        assert_eq!(l.coverage(size)[3], None);
+    }
+
+    #[test]
+    fn applying_a_modifier_keeps_what_shows() {
+        use crate::{Style, shape};
+        let size = UVec2::new(4, 1);
+        let mut vector = Layer::new("v");
+        let dot = shape::rectangle(Vec2::new(1.0, 0.0), Vec2::new(2.0, 1.0));
+        vector.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        let mut raster = Layer::raster("r", Raster::clear(size));
+        raster.edit_raster(|r| r.draw_line(Vec2::ZERO, Vec2::ZERO, 1.0, Some(PaletteIndex(2))));
+        for mut l in [vector, raster] {
+            l.modifiers = vec![mirror_x(4), mirror_x(2)];
+            let shown = l.coverage(size);
+            l.apply_first_modifier();
+            assert_eq!(l.modifiers, [mirror_x(2)]);
+            assert_eq!(l.coverage(size), shown);
+        }
+        // Copies are of the pixels a shape covers; Apply copies the whole
+        // shape, which can bring its part past the edge into view.
+        let mut l = Layer::new("v");
+        let wide = shape::rectangle(Vec2::new(-2.0, 0.0), Vec2::new(1.0, 1.0));
+        l.insert_shape(0, Shape::new(wide, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(2));
+        let seven = Some(PaletteIndex(7));
+        assert_eq!(l.coverage(size), [seven, seven, None, None]);
+        l.apply_first_modifier();
+        assert_eq!(l.coverage(size), [seven; 4]);
+        // The copy goes beneath the shape it copies.
+        let mut l = Layer::new("v");
+        let dot = shape::rectangle(Vec2::ZERO, Vec2::ONE);
+        l.insert_shape(0, Shape::new(dot, Style::Fill, PaletteIndex(7)).unwrap());
+        l.modifiers.push(mirror_x(4));
+        l.apply_first_modifier();
+        assert!(l.modifiers.is_empty());
+        assert_eq!(l.shapes()[1].anchors()[0].point, Vec2::ZERO);
+        assert_eq!(l.shapes()[0].outline().bounds().0, Vec2::new(3.0, 0.0));
+    }
+
+    /// A raster layer of `rows` of `.` (unset) and digits.
+    fn raster_layer(rows: &[&str]) -> Layer {
+        let size = UVec2::new(rows[0].len() as u32, rows.len() as u32);
+        let px = rows
+            .iter()
+            .flat_map(|r| r.chars())
+            .map(|c| c.to_digit(10).map(|d| PaletteIndex(d as u8)))
+            .collect();
+        Layer::raster("r", Raster::new(size, px).unwrap())
+    }
+
+    fn row(px: &[Option<PaletteIndex>]) -> String {
+        px.iter()
+            .map(|p| p.map_or('.', |i| char::from(b'0' + i.0)))
+            .collect()
+    }
+
+    fn stored(l: &Layer) -> String {
+        row(l.raster_pixels().unwrap().pixels())
+    }
+
+    fn shown(l: &Layer) -> String {
+        row(&l.coverage(l.raster_pixels().unwrap().size()))
+    }
+
+    fn dot(l: &mut Layer, x: f32, value: Option<u8>) {
+        let value = value.map(PaletteIndex);
+        let at = Vec2::new(x, 0.5);
+        l.edit_raster(|r| r.draw_line(at, at, 1.0, value));
+    }
+
+    #[test]
+    fn raster_edits_act_on_what_shows() {
+        // Erasing a copy clears its source.
+        let mut l = raster_layer(&["5..."]);
+        l.modifiers.push(mirror_x(4));
+        assert_eq!(shown(&l), "5..5");
+        dot(&mut l, 3.5, None);
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("....", "...."));
+
+        // Erasing where nothing shows clears nothing elsewhere.
+        let mut l = raster_layer(&["..7....."]);
+        l.modifiers = vec![mirror_x(4), mirror_x(6)];
+        assert_eq!(shown(&l), ".7777...");
+        dot(&mut l, 0.5, None);
+        assert_eq!(shown(&l), ".7777...");
+
+        // A raster put in place of the one shown replaces the layer's.
+        let mut l = raster_layer(&["5..."]);
+        l.modifiers.push(mirror_x(4));
+        l.edit_raster(|r| *r = raster_layer(&["..3."]).raster_pixels().unwrap().clone());
+        assert_eq!(stored(&l), "..3.");
+
+        // Painting stores only what is drawn, recoloring what the layer
+        // holds at matching pixels; the rest shows as copies.
+        let mut l = raster_layer(&["5..4"]);
+        l.modifiers.push(mirror_x(4));
+        dot(&mut l, 1.5, Some(2));
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("52.4", "5224"));
+        dot(&mut l, 3.5, Some(7));
+        assert_eq!((stored(&l).as_str(), shown(&l).as_str()), ("72.7", "7227"));
+
+        // Painting a pixel the color it has still reaches matching pixels.
+        let mut l = raster_layer(&["1..2"]);
+        l.modifiers.push(mirror_x(4));
+        dot(&mut l, 0.5, Some(1));
+        assert_eq!(stored(&l), "1..1");
+        // So does filling, through the region that shows, copies included,
+        // also after other writes in the same edit.
+        let mut l = raster_layer(&["111111"]);
+        l.modifiers.push(mirror_x(0));
+        l.edit_raster(|r| {
+            r.draw_line(
+                Vec2::new(3.5, 0.5),
+                Vec2::new(3.5, 0.5),
+                1.0,
+                Some(PaletteIndex(1)),
+            );
+            r.fill(Vec2::new(1.5, 0.5), Some(PaletteIndex(2)));
+        });
+        assert_eq!(stored(&l), "222222");
+        let mut l = raster_layer(&["11.2"]);
+        l.modifiers.push(mirror_x(4));
+        l.edit_raster(|r| r.fill(Vec2::new(0.5, 0.5), Some(PaletteIndex(1))));
+        assert_eq!(stored(&l), "1111");
+
+        // Fill stops at copies.
+        let mut l = raster_layer(&["1.1...."]);
+        l.modifiers.push(mirror_x(7));
+        assert_eq!(shown(&l), "1.1.1.1");
+        l.edit_raster(|r| r.fill(Vec2::new(5.5, 0.5), Some(PaletteIndex(2))));
+        assert_eq!(shown(&l), "121.121");
+
+        // Off, a modifier leaves edits where they are.
+        let mut l = raster_layer(&["...."]);
+        l.modifiers.push(mirror_x(4));
+        l.modifiers[0].enabled = false;
+        dot(&mut l, 3.5, Some(5));
+        assert_eq!(stored(&l), "...5");
+        assert!(Layer::new("v").edit_raster(|_| ()).is_none());
     }
 
     #[test]
