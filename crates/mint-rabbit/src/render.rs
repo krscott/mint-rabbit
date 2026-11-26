@@ -92,7 +92,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     var color = texel.rgb * material.tint.rgb * light;
     // The ghost outline: a light line about a pixel wide in a darker one.
     if globals.ghost.w >= 0.0 && abs(material.texture.x - globals.ghost.w) < 0.5 {
-        let off = abs(d - globals.ghost.z) / w;
+        var off = abs(d - globals.ghost.z) / w;
+        // A box also rings its center, which may be all of it on the texture.
+        if globals.ghost_box.x + globals.ghost_box.y > 0.0 {
+            off = min(off, abs(distance(p, globals.ghost.xy) - 1.0) / w);
+        }
         color = mix(color, vec3<f32>(0.0), 0.6 * clamp(2.5 - off, 0.0, 1.0));
         color = mix(color, vec3<f32>(1.0), clamp(1.25 - off, 0.0, 1.0));
     }
@@ -165,7 +169,8 @@ impl SceneData {
 
 /// The Ghost Cursor on the model: an outline `radius` texels around a box
 /// `half` texels either way from `center` on `texture`, wherever the model
-/// shows that texture point. With no box, it is a ring.
+/// shows that texture point, and a small ring at a box's center. With no
+/// box, it is a ring.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ghost {
     pub texture: TextureId,

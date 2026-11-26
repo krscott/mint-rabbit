@@ -314,9 +314,13 @@ fn ghost(
     })
 }
 
-/// Opens `dir` in the desktop's file manager. The opener keeps running; the
-/// returned channel gets why if it then exits with an error.
-fn open_folder(ctx: &egui::Context, dir: &Path) -> Result<mpsc::Receiver<String>, String> {
+/// Opens `dir` in the desktop's file manager. The opener keeps running, and
+/// `failed` gets why if it then exits with an error.
+fn open_folder(
+    ctx: &egui::Context,
+    dir: &Path,
+    failed: mpsc::Sender<String>,
+) -> Result<(), String> {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -326,8 +330,7 @@ fn open_folder(ctx: &egui::Context, dir: &Path) -> Result<mpsc::Receiver<String>
         .arg(dir)
         .spawn()
         .map_err(|e| format!("Couldn't open {} with {opener}: {e}", dir.display()))?;
-    // Reaped once it exits, which the opener does as soon as it hands over.
-    let (send, failed) = mpsc::channel();
+    // Reaped once it exits, usually as soon as it hands the folder over.
     let (ctx, dir) = (ctx.clone(), dir.to_owned());
     std::thread::spawn(move || {
         let mut child = child;
@@ -336,10 +339,10 @@ fn open_folder(ctx: &egui::Context, dir: &Path) -> Result<mpsc::Receiver<String>
             Ok(status) => format!("{opener} couldn't open {}: {status}", dir.display()),
             Err(e) => format!("{opener} couldn't open {}: {e}", dir.display()),
         };
-        let _ = send.send(why);
+        let _ = failed.send(why);
         ctx.request_repaint();
     });
-    Ok(failed)
+    Ok(())
 }
 
 /// Gives a dialog's first text field the keyboard while nothing else has it,
@@ -434,9 +437,8 @@ pub struct App {
     library: Library,
     /// The stamp the Stamp tool places, once one is chosen.
     placing: Option<Placing>,
-    /// Where why opening the stamp folder failed arrives, while the
-    /// opener runs.
-    opener: Option<mpsc::Receiver<String>>,
+    /// Why opening the stamp folder failed, sent by the openers.
+    opener_failed: (mpsc::Sender<String>, mpsc::Receiver<String>),
     /// Name last given to a texture set exported to a folder.
     folder_set: String,
     /// The window title last set.
@@ -491,7 +493,7 @@ impl App {
             },
             library: Library::new(stamps::default_dir()),
             placing: None,
-            opener: None,
+            opener_failed: mpsc::channel(),
             folder_set: String::new(),
             title: String::new(),
             quitting: false,
@@ -903,13 +905,12 @@ impl App {
             .on_disabled_hover_text(why)
             .clicked()
         {
-            let opened = self
-                .library
-                .create_dir()
-                .and_then(|()| open_folder(ui.ctx(), self.library.dir()?));
-            match opened {
-                Ok(failed) => self.opener = Some(failed),
-                Err(e) => self.fail(e),
+            let opened = self.library.create_dir().and_then(|()| {
+                let failed = self.opener_failed.0.clone();
+                open_folder(ui.ctx(), self.library.dir()?, failed)
+            });
+            if let Err(e) = opened {
+                self.fail(e);
             }
         }
         ui.separator();
@@ -2076,15 +2077,8 @@ impl eframe::App for App {
         {
             self.replace(Replace::Import(v), &ctx);
         }
-        if let Some(failed) = &self.opener {
-            match failed.try_recv() {
-                Ok(why) => {
-                    self.opener = None;
-                    self.fail(why);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.opener = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
+        while let Ok(why) = self.opener_failed.1.try_recv() {
+            self.fail(why);
         }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
