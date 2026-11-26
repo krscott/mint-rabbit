@@ -166,7 +166,10 @@ fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     let t = if mirrored { 1.0 - f } else { f };
     // The edges themselves are in the edge texels, which the view shows
     // there.
-    ((t * size).clamp(0.0, size - size * f32::EPSILON), cell as i32)
+    (
+        (t * size).clamp(0.0, size - size * f32::EPSILON),
+        cell as i32,
+    )
 }
 
 /// The alpha, from 0 to 1, that material `m` shows at texel point `point`:
