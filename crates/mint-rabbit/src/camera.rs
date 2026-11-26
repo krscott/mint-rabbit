@@ -1,6 +1,6 @@
 //! The Model View's orbit camera.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
 /// Vertical field of view, in radians.
 const FOV_Y: f32 = 0.7;
@@ -51,6 +51,16 @@ impl Orbit {
             self.pitch.sin(),
             self.yaw.cos() * self.pitch.cos(),
         )
+    }
+
+    /// The ray from the eye through `ndc`, a point of the view in
+    /// normalized device coordinates (-1 to 1, y up): its origin on the
+    /// near plane and its unit direction.
+    pub fn ray(&self, aspect: f32, ndc: Vec2) -> (Vec3, Vec3) {
+        let inverse = self.view_proj(aspect).inverse();
+        let near = inverse.project_point3(ndc.extend(0.0));
+        let far = inverse.project_point3(ndc.extend(1.0));
+        (near, (far - near).normalize())
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {

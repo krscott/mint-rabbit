@@ -70,6 +70,17 @@ layer's modifiers can only be turned on and off.
 - Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes, Ctrl+S saves, and Ctrl+D
   duplicates the picked shapes.
 
+The Model View has two modes, chosen at its top left. In Orbit, drag to turn
+the camera. In Paint, the tools draw on the model where the pointer meets it,
+into the texture there, which a press shows in the Texture View; middle-drag
+turns the camera. A brush stroke or pencil line that crosses a UV seam breaks
+there into a piece on each island, and a stroke's part on another texture is
+dropped. Pen anchors and box corners stay on one texture. Select there only
+picks the shape under a click. In either mode, scroll to zoom. The Ghost Cursor
+shows the tool's reach at the pointer's matching point in the other view, and
+on every part of the model that shows that texture point; View > Ghost Cursor
+turns it off.
+
 A project saves as a folder (File > Save, Save as). The File menu's exports
 either replace the imported villager's texture set in the decomp, after which
 the decomp must be built with `python configure.py --non-matching && ninja`, or

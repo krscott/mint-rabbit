@@ -7,8 +7,9 @@ so both views edit the same data and export is plain rasterization.
 
 ## Consequences
 
-- A shape that crosses a UV seam does not continue across it in the Model
-  View; it is clipped at the island edge or must be drawn on each side.
+- A shape cannot cross a UV seam. A freehand stroke painted across one in the
+  Model View becomes a separate shape on each island it touches; pen paths
+  and boxes run straight in texture space between their points.
 - Moving a mesh's UVs moves the painting that lands on it.
 - Texel units keep circles round and stroke widths even on non-square
   textures, such as AC's 32x16 eyes, where normalized UV would stretch them.

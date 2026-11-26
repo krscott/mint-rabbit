@@ -141,6 +141,20 @@ _Avoid_: Preset, brush, symbol
 The 3D pane, where painting lands on the texture under the cursor.
 _Avoid_: 3D view, viewport
 
+**Orbit Mode**:
+The Model View mode in which dragging turns the camera around the model.
+_Avoid_: Rotate mode, camera mode
+
+**Paint Mode**:
+The Model View mode in which the picked tool draws on the model, painting the
+texture under the cursor.
+_Avoid_: Edit mode, draw mode
+
+**Ghost Cursor**:
+The tool's footprint shown at the cursor's matching point in the other view,
+and wherever else on the model that texture point appears.
+_Avoid_: Brush preview, shadow cursor
+
 **Texture View**:
 The 2D pane that shows a texture in UV space.
 _Avoid_: UV view, 2D view

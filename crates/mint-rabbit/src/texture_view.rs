@@ -220,10 +220,12 @@ enum Drag {
         original: Shape,
     },
     PenHandle,
-    /// A freehand stroke through `points`, drawn into the picked layer as
-    /// it goes; `before` is that layer as it was, once the stroke is drawn.
+    /// A freehand stroke through the points of each of `runs`, a shape per
+    /// run, drawn into the picked layer as it goes; `before` is that layer
+    /// as it was, once the stroke is drawn. A stroke painted on the model
+    /// breaks into runs where it leaves a UV island.
     Brush {
-        points: Vec<Vec2>,
+        runs: Vec<Vec<Vec2>>,
         before: Option<Layer>,
     },
     /// Pencil or eraser pixels, painted with `value` as the pointer moves
@@ -283,6 +285,43 @@ pub struct Frame<'a> {
     pub input: bool,
     /// Set when the view refuses an edit, to show the user.
     pub message: &'a mut Option<String>,
+    /// Where the pointer over the Model View meets this texture, to show
+    /// the Ghost Cursor at.
+    pub ghost: Option<Vec2>,
+    /// Whether the pointer is over the Model View, whose keys reach the
+    /// tools too.
+    pub model_hovered: bool,
+}
+
+/// A view the tools take pointer input from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum View {
+    #[default]
+    Texture,
+    Model,
+}
+
+/// A point of the pointer's path, in texture space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    pub point: Vec2,
+    /// Whether the path left the texture or crossed onto another UV island
+    /// before `point`, so a stroke breaks there.
+    pub jump: bool,
+}
+
+/// The pointer over the Model View, where it meets the texture the Texture
+/// View shows.
+#[derive(Clone, Debug, Default)]
+pub struct ModelPointer {
+    /// Where the press that started a drag landed, if on the texture.
+    pub press: Option<Vec2>,
+    /// Where the pointer is now, if on the texture.
+    pub here: Option<Vec2>,
+    /// The pointer's path since the last frame, while dragging.
+    pub path: Vec<Sample>,
+    /// Texels per screen point where the pointer is.
+    pub texels_per_point: f32,
 }
 
 #[derive(Default)]
@@ -298,6 +337,10 @@ pub struct TextureView {
     pen: Vec<Anchor>,
     /// Whether a text field had the keyboard when the view was last shown.
     typing: bool,
+    /// The view the drag in progress started in, which moves and ends it.
+    drag_view: View,
+    /// The texture point under the pointer, while it is over the view.
+    hover: Option<Vec2>,
 }
 
 /// Screen placement of the image: texture space to screen and back.
@@ -333,6 +376,16 @@ impl TextureView {
         self.drag.is_some()
     }
 
+    /// The texture point under the pointer, while it is over the view.
+    pub fn hover(&self) -> Option<Vec2> {
+        self.hover
+    }
+
+    /// Whether a pen path is open.
+    pub fn drawing_path(&self) -> bool {
+        !self.pen.is_empty()
+    }
+
     /// Drops the pen path being drawn, as when the tool or texture
     /// changes. No drag is in progress then: controls and shortcuts wait
     /// for drags to end.
@@ -360,6 +413,7 @@ impl TextureView {
         // by now.
         let now = ui.ctx().text_edit_focused();
         let typing = std::mem::replace(&mut self.typing, now) || now;
+        self.hover = None;
         let r = VariantRef {
             texture: f.texture,
             variant: f.variant,
@@ -476,6 +530,8 @@ impl TextureView {
             paint,
             selection,
             message,
+            ghost,
+            model_hovered,
             ..
         } = f;
         if tool != Tool::Pen && !self.pen.is_empty() {
@@ -485,6 +541,7 @@ impl TextureView {
             .interact_pointer_pos()
             .or_else(|| response.hover_pos())
             .map(|p| at.to_texture(p));
+        self.hover = response.hover_pos().map(|p| at.to_texture(p));
         let shift = ui.input(|i| i.modifiers.shift);
 
         // A click ending a drag (egui can report both in one frame) is part
@@ -497,64 +554,43 @@ impl TextureView {
                 .input(|i| i.pointer.press_origin())
                 .map(|p| at.to_texture(p))
         {
-            // A canvas drag ends any other control's open edit and takes
-            // keyboard focus from it and closes popups such as the color
-            // picker, so nothing typed mid-drag reaches them.
-            editor.end_gesture();
-            ui.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
-                }
-            });
-            egui::Popup::close_all(ui.ctx());
-            self.drag = self.start(editor, tool, paint, selection, r, origin, at, message);
+            take_keyboard(ui, editor);
+            // Any tool moves the picked layer's modifier guides.
+            let project = editor.project();
+            self.drag = if let Some(guide) = guide_drag(project, r, selection.layer, origin, at) {
+                Some(guide)
+            } else if tool == Tool::Select {
+                start_select(project, r, selection, origin, at)
+            } else {
+                let canvas = Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                };
+                self.start(canvas, tool, r, origin, at.hit())
+            };
+            self.drag_view = View::Texture;
             self.targets = (selection.layer, selection.shapes.clone());
         } else if response.clicked()
             && !was_dragging
             && let Some(p) = pointer
             && guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)).is_none()
         {
-            match tool {
-                Tool::Pen => self.pen_click(editor, paint, selection, r, p, at, message),
-                Tool::Brush => {
-                    add_shape(
-                        editor,
-                        selection,
-                        r,
-                        tool,
-                        vec![Anchor::corner(p)],
-                        paint.style(false),
-                        paint.color,
-                        message,
-                    );
-                }
-                Tool::Select => {
-                    // A click on the picked shape's anchor picks the nearest.
-                    let anchor = selection.single().and_then(|s| {
-                        let shapes = editor
-                            .project()
-                            .variant(r)
-                            .layers()
-                            .get(selection.layer)?
-                            .shapes();
-                        shapes[s]
-                            .anchors()
-                            .iter()
-                            .enumerate()
-                            .map(|(k, a)| (k, a.point.distance(p)))
-                            .filter(|&(_, d)| d <= at.hit())
-                            .min_by(|a, b| a.1.total_cmp(&b.1))
-                            .map(|(k, _)| k)
-                    });
-                    match anchor {
-                        Some(k) if !shift => selection.anchor = Some(k),
-                        _ => pick(editor.project(), r, selection, p, at, shift),
-                    }
-                }
-                Tool::Pencil | Tool::Eraser | Tool::Fill => {
-                    press_pixels(editor, selection, r, tool, paint, p, None, message);
-                }
-                Tool::Ellipse | Tool::Rectangle => {}
+            // A click on the picked shape's anchor picks the nearest.
+            let anchor = (tool == Tool::Select && !shift)
+                .then(|| anchor_under(editor.project(), r, selection, p, at.hit()))
+                .flatten();
+            if let Some(k) = anchor {
+                selection.anchor = Some(k);
+            } else {
+                let canvas = Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                };
+                self.click(canvas, tool, r, p, at.hit(), shift);
             }
         }
         if response.double_clicked()
@@ -566,14 +602,20 @@ impl TextureView {
             selection.anchor = Some(k);
         }
 
-        if let (Some(drag), Some(p)) = (&mut self.drag, pointer) {
+        if self.drag_view == View::Texture
+            && let (Some(drag), Some(p)) = (&mut self.drag, pointer)
+        {
             let canvas = Canvas {
                 editor,
                 selection,
                 paint,
                 message,
             };
-            continue_drag(canvas, drag, &self.targets, r, p, &mut self.pen, shift);
+            let path = [Sample {
+                point: p,
+                jump: false,
+            }];
+            continue_drag(canvas, drag, &self.targets, r, &path, &mut self.pen, shift);
         }
         // The pointer shows which way a guide under it moves.
         let part = match &self.drag {
@@ -590,127 +632,278 @@ impl TextureView {
                 GuidePart::Y => egui::CursorIcon::ResizeVertical,
             });
         }
-        let escape = ui.input(|i| i.key_pressed(Key::Escape));
-        let cancelled = escape && self.drag.is_some();
-        if cancelled {
+        if self.drag_view == View::Texture {
+            self.release(ui, response, editor, selection, r);
+        }
+        let keys = response.hovered() || model_hovered;
+        let canvas = Canvas {
+            editor,
+            selection,
+            paint,
+            message,
+        };
+        self.keys(ui, canvas, r, tool, keys && !typing);
+
+        let cursor = pointer.or(ghost);
+        self.overlay(ui, editor.project(), r, selection, at, cursor, tool, paint);
+    }
+
+    /// Input from the Model View, already in this texture's space: the
+    /// drawing tools draw where the pointer meets the texture on the model,
+    /// and Select picks there. Keys are left to [`Self::show`].
+    pub fn model_interact(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        f: Frame<'_>,
+        pointer: &ModelPointer,
+    ) {
+        let Frame {
+            editor,
+            texture,
+            variant,
+            tool,
+            paint,
+            selection,
+            input,
+            message,
+            ..
+        } = f;
+        let r = VariantRef { texture, variant };
+        if !input || editor.project().texture(texture).variants().is_empty() {
+            return;
+        }
+        // The Texture View fits the picks later in the frame; tools here
+        // need them fitted now.
+        selection.fit(editor.project(), r);
+        if tool != Tool::Pen && !self.pen.is_empty() {
+            self.pen.clear();
+        }
+        let shift = ui.input(|i| i.modifiers.shift);
+        let reach = HIT * pointer.texels_per_point;
+        let was_dragging = self.drag.is_some();
+        if response.drag_started_by(PointerButton::Primary)
+            && tool != Tool::Select
+            && let Some(p) = pointer.press
+        {
+            take_keyboard(ui, editor);
+            let canvas = Canvas {
+                editor,
+                selection,
+                paint,
+                message,
+            };
+            self.drag = self.start(canvas, tool, r, p, reach);
+            self.drag_view = View::Model;
+            self.targets = (selection.layer, selection.shapes.clone());
+        } else if response.clicked()
+            && !was_dragging
+            && let Some(p) = pointer.here
+        {
+            let canvas = Canvas {
+                editor,
+                selection,
+                paint,
+                message,
+            };
+            self.click(canvas, tool, r, p, reach, shift);
+        }
+        if self.drag_view == View::Model
+            && let Some(drag) = &mut self.drag
+        {
+            let canvas = Canvas {
+                editor,
+                selection,
+                paint,
+                message,
+            };
+            continue_drag(
+                canvas,
+                drag,
+                &self.targets,
+                r,
+                &pointer.path,
+                &mut self.pen,
+                shift,
+            );
+            self.release(ui, response, editor, selection, r);
+        }
+    }
+
+    /// Ends this view's drag when the pointer lets go of it: the primary
+    /// button's release finishes it, and any other end cancels it, decided
+    /// by the frame's first release. Escape cancels it first, even with a
+    /// release in the same frame, and is used up doing so.
+    fn release(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        editor: &mut Editor,
+        selection: &mut Selection,
+        r: VariantRef,
+    ) {
+        if self.drag.is_some() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.cancel_drag(editor);
-        } else if response.drag_stopped() {
-            // Only the primary button's release finishes a drag; any other
-            // end cancels it, decided by the frame's first release.
-            let first_release = ui.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::PointerButton {
-                        button,
-                        pressed: false,
-                        ..
-                    } => Some(*button),
-                    _ => None,
-                })
-            });
-            if first_release == Some(PointerButton::Primary) {
-                if let Some(drag) = self.drag.take() {
-                    finish_drag(editor, drag, selection);
-                }
-                editor.end_gesture();
+            return;
+        }
+        if !response.drag_stopped() {
+            return;
+        }
+        let first_release = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    button,
+                    pressed: false,
+                    ..
+                } => Some(*button),
+                _ => None,
+            })
+        });
+        if first_release == Some(PointerButton::Primary) {
+            if let Some(drag) = self.drag.take() {
+                finish_drag(editor, drag, selection, r);
+            }
+            editor.end_gesture();
+        } else {
+            self.cancel_drag(editor);
+        }
+    }
+
+    /// The tools' keys, while no drag is in progress and, with `keys`, the
+    /// pointer is over either view and no text field has the keyboard, or
+    /// while a pen path is open: Enter finishes the path, Escape drops it or
+    /// else the picks, and Delete removes the path's last anchor or, with
+    /// Select, the picked artwork.
+    fn keys(&mut self, ui: &egui::Ui, canvas: Canvas<'_>, r: VariantRef, tool: Tool, keys: bool) {
+        let Canvas {
+            editor,
+            selection,
+            paint,
+            message,
+        } = canvas;
+        if self.drag.is_some() || (!keys && self.pen.is_empty()) {
+            return;
+        }
+        let escape = ui.input(|i| i.key_pressed(Key::Escape));
+        let (enter, delete) = ui.input(|i| {
+            (
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+            )
+        });
+        if enter && !self.pen.is_empty() {
+            // Enter finishes an open path; clicking the first anchor closes
+            // one.
+            let anchors = std::mem::take(&mut self.pen);
+            add_shape(
+                editor,
+                selection,
+                r,
+                Tool::Pen,
+                anchors,
+                paint.style(false),
+                paint.color,
+                message,
+            );
+        }
+        if escape {
+            if self.pen.is_empty() {
+                selection.shapes.clear();
+                selection.anchor = None;
             } else {
-                self.cancel_drag(editor);
+                self.pen.clear();
             }
         }
+        if delete {
+            // The pen removes its path's last anchor; only Select deletes
+            // picked artwork.
+            match tool {
+                Tool::Pen => {
+                    self.pen.pop();
+                }
+                Tool::Select => delete_selected(editor, r, selection),
+                _ => {}
+            }
+        }
+    }
 
-        // Keys, while the view has the pointer.
-        // Keys a text field is using are its own, and none act mid-drag.
-        if (response.hovered() || !self.pen.is_empty()) && !typing && self.drag.is_none() {
-            let (enter, delete) = ui.input(|i| {
-                (
-                    i.key_pressed(Key::Enter),
-                    i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-                )
-            });
-            if enter && !self.pen.is_empty() {
-                // Enter finishes an open path; clicking the first anchor
-                // closes one.
-                let anchors = std::mem::take(&mut self.pen);
+    /// A click of `tool` at `p`: a pen anchor, a brush dot, pixels, or a
+    /// pick. `reach` is how near, in texels, a click finds what it's near.
+    fn click(
+        &mut self,
+        canvas: Canvas<'_>,
+        tool: Tool,
+        r: VariantRef,
+        p: Vec2,
+        reach: f32,
+        add: bool,
+    ) {
+        match tool {
+            Tool::Pen => self.pen_click(canvas, r, p, reach),
+            Tool::Brush => {
+                let Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                } = canvas;
+                let dot = vec![Anchor::corner(p)];
                 add_shape(
                     editor,
                     selection,
                     r,
-                    Tool::Pen,
-                    anchors,
+                    tool,
+                    dot,
                     paint.style(false),
                     paint.color,
                     message,
                 );
             }
-            if escape && !cancelled {
-                if self.pen.is_empty() {
-                    selection.shapes.clear();
-                    selection.anchor = None;
-                } else {
-                    self.pen.clear();
-                }
+            Tool::Select => pick(canvas.editor.project(), r, canvas.selection, p, reach, add),
+            Tool::Pencil | Tool::Eraser | Tool::Fill => {
+                let Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                } = canvas;
+                press_pixels(editor, selection, r, tool, paint, p, None, message);
             }
-            if delete {
-                // The pen removes its path's last anchor; only Select
-                // deletes picked artwork.
-                match tool {
-                    Tool::Pen => {
-                        self.pen.pop();
-                    }
-                    Tool::Select => delete_selected(editor, r, selection),
-                    _ => {}
-                }
-            }
+            Tool::Ellipse | Tool::Rectangle => {}
         }
-
-        self.overlay(ui, editor.project(), r, selection, at, pointer, tool, paint);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Starts a drag of a drawing tool pressed at `p`.
     fn start(
         &mut self,
-        editor: &mut Editor,
+        canvas: Canvas<'_>,
         tool: Tool,
-        paint: Paint,
-        selection: &mut Selection,
         r: VariantRef,
         p: Vec2,
-        at: Placement,
-        message: &mut Option<String>,
+        reach: f32,
     ) -> Option<Drag> {
-        // Any tool moves the picked layer's modifier guides.
-        if let Some(h) = guide_hit(editor.project(), r, selection.layer, at, at.to_screen(p)) {
-            let axis = h.part as usize;
-            let kind =
-                editor.project().variant(r).layers()[selection.layer].modifiers[h.modifier].kind;
-            return Some(Drag::Guide {
-                layer: selection.layer,
-                modifier: h.modifier,
-                part: h.part,
-                offset: kind.guides().0.to_vec2()[axis] - p[axis],
-            });
-        }
         if matches!(tool, Tool::Brush | Tool::Ellipse | Tool::Rectangle)
-            && let Err(why) = drawable(editor.project(), r, selection)
+            && let Err(why) = drawable(canvas.editor.project(), r, canvas.selection)
         {
-            *message = Some(why);
+            *canvas.message = Some(why);
             return None;
         }
         match tool {
             Tool::Brush => {
                 let mut drag = Drag::Brush {
-                    points: vec![p],
+                    runs: vec![vec![p]],
                     before: None,
-                };
-                let canvas = Canvas {
-                    editor,
-                    selection,
-                    paint,
-                    message,
                 };
                 redraw(canvas, &mut drag, r);
                 Some(drag)
             }
             Tool::Pencil | Tool::Eraser => {
+                let Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                } = canvas;
                 let edit = Some(CANVAS_DRAG);
                 press_pixels(editor, selection, r, tool, paint, p, edit, message).map(|layer| {
                     Drag::Pixels {
@@ -723,6 +916,12 @@ impl TextureView {
             }
             // A fill acts at once, where the press began.
             Tool::Fill => {
+                let Canvas {
+                    editor,
+                    selection,
+                    paint,
+                    message,
+                } = canvas;
                 press_pixels(editor, selection, r, tool, paint, p, None, message);
                 None
             }
@@ -733,31 +932,27 @@ impl TextureView {
                 before: None,
             }),
             Tool::Pen => {
-                self.pen_click(editor, paint, selection, r, p, at, message);
+                self.pen_click(canvas, r, p, reach);
                 (!self.pen.is_empty()).then_some(Drag::PenHandle)
             }
-            Tool::Select => start_select(editor.project(), r, selection, p, at),
+            Tool::Select => None,
         }
     }
 
     /// A pen click: closes the path on its first anchor, or adds an anchor.
-    #[allow(clippy::too_many_arguments)]
-    fn pen_click(
-        &mut self,
-        editor: &mut Editor,
-        paint: Paint,
-        selection: &mut Selection,
-        r: VariantRef,
-        p: Vec2,
-        at: Placement,
-        message: &mut Option<String>,
-    ) {
+    fn pen_click(&mut self, canvas: Canvas<'_>, r: VariantRef, p: Vec2, reach: f32) {
+        let Canvas {
+            editor,
+            selection,
+            paint,
+            message,
+        } = canvas;
         if let Err(why) = drawable(editor.project(), r, selection) {
             *message = Some(why);
             self.pen.clear();
             return;
         }
-        if self.pen.len() >= 2 && self.pen[0].point.distance(p) <= at.hit() {
+        if self.pen.len() >= 2 && self.pen[0].point.distance(p) <= reach {
             let anchors = std::mem::take(&mut self.pen);
             add_shape(
                 editor,
@@ -769,11 +964,7 @@ impl TextureView {
                 paint.color,
                 message,
             );
-        } else if self
-            .pen
-            .last()
-            .is_none_or(|a| a.point.distance(p) > at.hit())
-        {
+        } else if self.pen.last().is_none_or(|a| a.point.distance(p) > reach) {
             self.pen.push(Anchor::corner(p));
         }
     }
@@ -879,6 +1070,19 @@ impl TextureView {
                 painter.rect_filled(rect, 0.0, shade);
             }
         }
+        // What other tools paint around the cursor: a ring a stroke's width
+        // across, or a dot.
+        if !matches!(tool, Tool::Pencil | Tool::Eraser)
+            && let (Some(p), Some(radius)) = (cursor, footprint(tool, paint))
+        {
+            let (center, radius) = (at.to_screen(p), (radius * at.scale).max(1.5));
+            painter.circle_stroke(
+                center,
+                radius,
+                Stroke::new(3.0, Color32::from_black_alpha(150)),
+            );
+            painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::WHITE));
+        }
         // The pen's path in progress. Other drawings are already in the
         // layer.
         let preview = Stroke::new(1.5, Color32::from_rgb(255, 120, 200));
@@ -978,6 +1182,70 @@ fn guide_hit(
         .map(|(_, h)| h)
 }
 
+/// A drag of the guide of layer `layer` whose handle is under `p`, if any.
+fn guide_drag(
+    project: &Project,
+    r: VariantRef,
+    layer: usize,
+    p: Vec2,
+    at: Placement,
+) -> Option<Drag> {
+    let h = guide_hit(project, r, layer, at, at.to_screen(p))?;
+    let axis = h.part as usize;
+    let kind = project.variant(r).layers()[layer].modifiers[h.modifier].kind;
+    Some(Drag::Guide {
+        layer,
+        modifier: h.modifier,
+        part: h.part,
+        offset: kind.guides().0.to_vec2()[axis] - p[axis],
+    })
+}
+
+/// The anchor of the one picked shape nearest `p` within `reach` texels.
+fn anchor_under(
+    project: &Project,
+    r: VariantRef,
+    selection: &Selection,
+    p: Vec2,
+    reach: f32,
+) -> Option<usize> {
+    let shape = &project.variant(r).layers().get(selection.layer)?.shapes()[selection.single()?];
+    shape
+        .anchors()
+        .iter()
+        .enumerate()
+        .map(|(k, a)| (k, a.point.distance(p)))
+        .filter(|&(_, d)| d <= reach)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(k, _)| k)
+}
+
+/// Readies a canvas drag: it ends any other control's open edit, takes
+/// keyboard focus from it, and closes popups such as the color picker, so
+/// nothing typed mid-drag reaches them.
+fn take_keyboard(ui: &egui::Ui, editor: &mut Editor) {
+    editor.end_gesture();
+    ui.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    egui::Popup::close_all(ui.ctx());
+}
+
+/// The radius, in texels, of what `tool` paints around the cursor: half
+/// the width of a stroke, or nothing for a fill or a point. Select paints
+/// nothing.
+pub fn footprint(tool: Tool, paint: Paint) -> Option<f32> {
+    let stroke = paint.width / 2.0;
+    match tool {
+        Tool::Select => None,
+        Tool::Brush | Tool::Pencil | Tool::Eraser => Some(stroke),
+        Tool::Pen | Tool::Ellipse | Tool::Rectangle if !paint.fill => Some(stroke),
+        Tool::Pen | Tool::Ellipse | Tool::Rectangle | Tool::Fill => Some(0.0),
+    }
+}
+
 /// Draws the guides of `layer`'s enabled modifiers if it is visible, faint
 /// on a locked layer, whose guides don't move. A radial center is ringed.
 fn draw_guides(painter: &egui::Painter, layer: &Layer, at: Placement) {
@@ -1064,7 +1332,7 @@ fn box_anchors(tool: Tool, a: Vec2, b: Vec2) -> Vec<Anchor> {
 /// covering `p` or the center of the pixel under it, as it covers pixels,
 /// comes first; where the layer shows nothing, one within reach of its
 /// outline does.
-fn shape_under(project: &Project, r: VariantRef, p: Vec2, at: Placement) -> Option<(usize, usize)> {
+fn shape_under(project: &Project, r: VariantRef, p: Vec2, reach: f32) -> Option<(usize, usize)> {
     let (layers, size) = (project.variant(r).layers(), project.variant(r).size());
     let pixel = mint_core::texel_index(size, p.x.floor() as i64, p.y.floor() as i64);
     let center = p.floor() + Vec2::splat(0.5);
@@ -1072,7 +1340,7 @@ fn shape_under(project: &Project, r: VariantRef, p: Vec2, at: Placement) -> Opti
         let o = s.outline();
         o.covers(p) || (pixel.is_some() && o.covers(center))
     };
-    let near = |s: &Shape| s.outline().distance(p) <= at.hit();
+    let near = |s: &Shape| s.outline().distance(p) <= reach;
     for (li, l) in layers.iter().enumerate().rev() {
         if !l.visible {
             continue;
@@ -1100,10 +1368,10 @@ fn pick(
     r: VariantRef,
     selection: &mut Selection,
     p: Vec2,
-    at: Placement,
+    reach: f32,
     add: bool,
 ) {
-    match shape_under(project, r, p, at) {
+    match shape_under(project, r, p, reach) {
         Some((layer, shape)) if add && layer == selection.layer => {
             if let Some(k) = selection.shapes.iter().position(|&s| s == shape) {
                 selection.shapes.remove(k);
@@ -1190,7 +1458,7 @@ fn start_select(
             });
         }
         // A press where a picked shape shows on top moves them all.
-        let on_top = shape_under(project, r, p, at);
+        let on_top = shape_under(project, r, p, at.hit());
         if on_top.is_some_and(|(l, s)| l == selection.layer && selection.shapes.contains(&s)) {
             return Some(Drag::Move {
                 start: p,
@@ -1199,7 +1467,7 @@ fn start_select(
         }
     }
     // Not on the selection: pick what is under the pointer and move it.
-    pick(project, r, selection, p, at, false);
+    pick(project, r, selection, p, at.hit(), false);
     let layer = project.variant(r).layers().get(selection.layer)?;
     let s = selection.single()?;
     Some(Drag::Move {
@@ -1251,19 +1519,39 @@ struct Canvas<'a> {
     message: &'a mut Option<String>,
 }
 
+/// Moves a drag along the pointer's `path` since the last frame. A brush
+/// stroke or pencil line breaks where the path jumps; other drags follow
+/// its end.
 fn continue_drag(
     canvas: Canvas<'_>,
     drag: &mut Drag,
     targets: &(usize, Vec<usize>),
     r: VariantRef,
-    p: Vec2,
+    path: &[Sample],
     pen: &mut [Anchor],
     shift: bool,
 ) {
+    let Some(&Sample { point: p, .. }) = path.last() else {
+        return;
+    };
     match drag {
-        Drag::Brush { points, .. } => {
-            if points.last().is_none_or(|q| q.distance(p) > 0.05) {
-                points.push(p);
+        Drag::Brush { runs, .. } => {
+            let mut moved = false;
+            for s in path {
+                match runs.last_mut() {
+                    Some(run) if !s.jump => {
+                        if run.last().is_none_or(|q| q.distance(s.point) > 0.05) {
+                            run.push(s.point);
+                            moved = true;
+                        }
+                    }
+                    _ => {
+                        runs.push(vec![s.point]);
+                        moved = true;
+                    }
+                }
+            }
+            if moved {
                 redraw(canvas, drag, r);
             }
             return;
@@ -1379,14 +1667,23 @@ fn continue_drag(
             value,
             width,
         } => {
-            if p == *last {
+            if let [s] = path
+                && !s.jump
+                && s.point == *last
+            {
                 return;
             }
-            let (from, layer, value, width) = (*last, *layer, *value, *width);
+            let (mut from, layer, value, width) = (*last, *layer, *value, *width);
             *last = p;
             let _ = editor.edit_variant_continuous(CANVAS_DRAG, r, |v| {
                 if let Some(l) = v.layers_mut().get_mut(layer) {
-                    l.edit_raster(|raster| raster.draw_line(from, p, width, value));
+                    l.edit_raster(|raster| {
+                        for s in path {
+                            let start = if s.jump { s.point } else { from };
+                            raster.draw_line(start, s.point, width, value);
+                            from = s.point;
+                        }
+                    });
                 }
             });
         }
@@ -1406,8 +1703,8 @@ fn opposite(handle: Vec2, len: f32) -> Vec2 {
 }
 
 /// Shows a brush stroke or box as it now is: puts the picked layer back as
-/// it was before the drag, then adds the drawing to it as [`add_shape`]
-/// does. A box with no area adds nothing.
+/// it was before the drag, then adds the drawing's shapes to it as
+/// [`add_shape`] does. A box with no area adds nothing.
 fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
     let Canvas {
         editor,
@@ -1416,9 +1713,11 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
         message,
     } = canvas;
     let (tool, anchors, style, before) = match drag {
-        Drag::Brush { points, before } => (
+        Drag::Brush { runs, before } => (
             Tool::Brush,
-            Some(shape::freehand(points, BRUSH_TOLERANCE)),
+            runs.iter()
+                .map(|run| shape::freehand(run, BRUSH_TOLERANCE))
+                .collect(),
             paint.style(false),
             before,
         ),
@@ -1429,20 +1728,27 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
             before,
         } => (
             *tool,
-            ((*end - *start).abs().min_element() > 0.0).then(|| box_anchors(*tool, *start, *end)),
+            ((*end - *start).abs().min_element() > 0.0)
+                .then(|| box_anchors(*tool, *start, *end))
+                .into_iter()
+                .collect::<Vec<_>>(),
             paint.style(true),
             before,
         ),
         _ => return,
     };
-    let shape = match anchors.map(|a| Shape::new(a, style, paint.color)).transpose() {
-        Ok(shape) => shape,
+    let shapes = match anchors
+        .into_iter()
+        .map(|a| Shape::new(a, style, paint.color))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(shapes) => shapes,
         Err(e) => {
             *message = Some(e.to_string());
             return;
         }
     };
-    if before.is_none() && shape.is_none() {
+    if before.is_none() && shapes.is_empty() {
         return;
     }
     let drawn = edit_picked_layer(editor, selection, r, tool, Some(CANVAS_DRAG), |l| {
@@ -1450,10 +1756,10 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
             Some(b) => l.clone_from(b),
             None => *before = Some(l.clone()),
         }
-        if let Some(shape) = shape
-            && l.edit_raster(|raster| raster.paint_shape(&shape)).is_none()
-        {
-            l.insert_shape(l.shapes().len(), shape);
+        for shape in shapes {
+            if l.edit_raster(|raster| raster.paint_shape(&shape)).is_none() {
+                l.insert_shape(l.shapes().len(), shape);
+            }
         }
     });
     if let Err(why) = drawn {
@@ -1462,9 +1768,9 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
 }
 
 /// Ends a drag the primary button let go of: a brush stroke or box picks
-/// the shape it drew, as [`add_shape`] does, and a box with no area is
+/// the shapes it drew, as [`add_shape`] does, and a box with no area is
 /// dropped.
-fn finish_drag(editor: &mut Editor, drag: Drag, selection: &mut Selection) {
+fn finish_drag(editor: &mut Editor, drag: Drag, selection: &mut Selection, r: VariantRef) {
     match drag {
         Drag::Box { start, end, .. } if (end - start).abs().min_element() <= 0.0 => {
             editor.revert_gesture(CANVAS_DRAG);
@@ -1475,8 +1781,12 @@ fn finish_drag(editor: &mut Editor, drag: Drag, selection: &mut Selection) {
         | Drag::Box {
             before: Some(b), ..
         } => {
-            let vector = b.kind() == LayerKind::Vector;
-            selection.shapes = vector.then_some(b.shapes().len()).into_iter().collect();
+            let layers = editor.project().variant(r).layers();
+            let drawn = match layers.get(selection.layer) {
+                Some(l) if l.kind() == LayerKind::Vector => b.shapes().len()..l.shapes().len(),
+                _ => 0..0,
+            };
+            selection.shapes = drawn.collect();
             selection.anchor = None;
         }
         _ => {}
@@ -1776,6 +2086,14 @@ mod tests {
         width: 1.0,
     };
 
+    /// A pointer path of one step to `p`.
+    fn to(p: Vec2) -> [Sample; 1] {
+        [Sample {
+            point: p,
+            jump: false,
+        }]
+    }
+
     /// A canvas on `editor` whose pick and refusals no one looks at.
     fn canvas(editor: &mut Editor) -> Canvas<'_> {
         Canvas {
@@ -1791,7 +2109,15 @@ mod tests {
         let (mut editor, r) = layerless();
         let mut selection = Selection::default();
         let step = |editor: &mut Editor, drag: &mut Drag, p: Vec2| {
-            continue_drag(canvas(editor), drag, &(0, Vec::new()), r, p, &mut [], false);
+            continue_drag(
+                canvas(editor),
+                drag,
+                &(0, Vec::new()),
+                r,
+                &to(p),
+                &mut [],
+                false,
+            );
         };
         let shapes = |e: &Editor| -> Vec<Shape> {
             let layers = e.project().variant(r).layers();
@@ -1814,7 +2140,7 @@ mod tests {
         assert_eq!(drawn.len(), 1);
         let far = drawn[0].anchors().iter().map(|a| a.point).reduce(Vec2::max);
         assert_eq!(far, Some(Vec2::splat(2.0)));
-        finish_drag(&mut editor, drag, &mut selection);
+        finish_drag(&mut editor, drag, &mut selection, r);
         editor.end_gesture();
         assert_eq!(selection.shapes, vec![0]);
         // The whole drag undoes as one step.
@@ -1824,7 +2150,7 @@ mod tests {
 
         // A cancelled stroke leaves nothing.
         let mut drag = Drag::Brush {
-            points: vec![Vec2::ONE],
+            runs: vec![vec![Vec2::ONE]],
             before: None,
         };
         step(&mut editor, &mut drag, Vec2::splat(2.0));
@@ -1841,10 +2167,68 @@ mod tests {
         };
         step(&mut editor, &mut drag, Vec2::splat(3.0));
         step(&mut editor, &mut drag, Vec2::ONE);
-        finish_drag(&mut editor, drag, &mut selection);
+        finish_drag(&mut editor, drag, &mut selection, r);
         editor.end_gesture();
         assert!(editor.project().variant(r).layers().is_empty());
         assert!(!editor.can_undo());
+    }
+
+    #[test]
+    fn strokes_break_where_the_path_jumps() {
+        let (mut editor, r) = layerless();
+        let mut selection = Selection::default();
+        let path = [(1.5, false), (3.5, true)].map(|(x, jump)| Sample {
+            point: Vec2::new(x, 1.5),
+            jump,
+        });
+        // A brush stroke is a shape per run, all picked when it ends.
+        let mut drag = Drag::Brush {
+            runs: vec![vec![Vec2::new(0.5, 1.5)]],
+            before: None,
+        };
+        continue_drag(
+            canvas(&mut editor),
+            &mut drag,
+            &(0, Vec::new()),
+            r,
+            &path,
+            &mut [],
+            false,
+        );
+        finish_drag(&mut editor, drag, &mut selection, r);
+        editor.end_gesture();
+        assert_eq!(editor.project().variant(r).layers()[0].shapes().len(), 2);
+        assert_eq!(selection.shapes, vec![0, 1]);
+        editor.undo();
+        assert!(editor.project().variant(r).layers().is_empty());
+
+        // A pencil line skips the jump.
+        editor
+            .edit_variant(r, |v| {
+                v.insert_layer(0, Layer::raster("l", Raster::clear(v.size())));
+            })
+            .unwrap();
+        let mut drag = Drag::Pixels {
+            layer: 0,
+            last: Vec2::new(0.5, 1.5),
+            value: Some(PaletteIndex(0)),
+            width: 1.0,
+        };
+        continue_drag(
+            canvas(&mut editor),
+            &mut drag,
+            &(0, Vec::new()),
+            r,
+            &path,
+            &mut [],
+            false,
+        );
+        let row: Vec<bool> = editor.project().variant(r).layers()[0].coverage(UVec2::new(4, 4))
+            [4..8]
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        assert_eq!(row, vec![true, true, false, true]);
     }
 
     #[test]
@@ -1885,32 +2269,15 @@ mod tests {
         let kind = |e: &Editor, k: usize| e.project().variant(r).layers()[0].modifiers[k].kind;
         // A drag keeps the offset it grabbed the handle at: grabbed 0.15
         // texels right of the line and moved 0.2 right, the line stays put.
-        let mut view = TextureView::default();
-        let paint = Paint {
-            color: PaletteIndex(0),
-            fill: true,
-            width: 1.0,
-        };
         let grab = at.to_texture(pos2(106.0, 20.0 - GUIDE_REACH));
-        let mut d = view
-            .start(
-                &mut editor,
-                Tool::Pencil,
-                paint,
-                &mut Selection::default(),
-                r,
-                grab,
-                at,
-                &mut None,
-            )
-            .unwrap();
-        let to = grab + Vec2::new(0.2, 3.0);
+        let mut d = guide_drag(editor.project(), r, 0, grab, at).unwrap();
+        let moved = to(grab + Vec2::new(0.2, 3.0));
         continue_drag(
             canvas(&mut editor),
             &mut d,
             &(0, Vec::new()),
             r,
-            to,
+            &moved,
             &mut [],
             false,
         );
@@ -1923,7 +2290,15 @@ mod tests {
                 part,
                 offset: 0.0,
             };
-            continue_drag(canvas(e), &mut d, &(0, Vec::new()), r, p, &mut [], false);
+            continue_drag(
+                canvas(e),
+                &mut d,
+                &(0, Vec::new()),
+                r,
+                &to(p),
+                &mut [],
+                false,
+            );
         };
         drag(&mut editor, 0, GuidePart::X, Vec2::new(1.3, 9.0));
         let moved = Mirror {
@@ -1987,7 +2362,7 @@ mod tests {
         };
         let picked = |e: &Editor, x: f32, y: f32| {
             let mut s = Selection::default();
-            pick(e.project(), r, &mut s, Vec2::new(x, y), at, false);
+            pick(e.project(), r, &mut s, Vec2::new(x, y), at.hit(), false);
             s.single().map(|shape| (s.layer, shape))
         };
         let set = |e: &mut Editor, f: fn(&mut Layer)| {
@@ -2047,7 +2422,7 @@ mod tests {
             image: Rect::from_min_size(pos2(20.0, 20.0), vec2(160.0, 160.0)),
             scale: 40.0,
         };
-        let under = |x: f32, y: f32| shape_under(editor.project(), r, Vec2::new(x, y), at);
+        let under = |x: f32, y: f32| shape_under(editor.project(), r, Vec2::new(x, y), at.hit());
         // On the copy, within reach of the shape's outline: nothing.
         assert_eq!(under(2.1, 0.5), None);
         // Within reach of the outline where nothing shows: the shape.
