@@ -40,6 +40,9 @@ const NOTHING_OPEN: &str =
 /// Size of a texture's or variant's thumbnail above the Texture View.
 const THUMBNAIL: egui::Vec2 = egui::vec2(40.0, 32.0);
 
+/// Height of the mode selector above the Model View.
+const MODE_BAR_HEIGHT: f32 = 28.0;
+
 /// Width of the tool strip at the Texture View's left.
 const TOOLS_WIDTH: f32 = 36.0;
 
@@ -101,6 +104,28 @@ impl Doc {
             surface: Surface::new(scene.clone(), true),
             scene,
             check: None,
+        }
+    }
+
+    /// Rebuilds the scene if the project or the variants shown changed. The
+    /// surface follows the scene, except while `dragging`, so a drag meets
+    /// the surface as it was when it began. `generation` counts rebuilds;
+    /// `smooth` is whether the view samples textures smoothly.
+    fn refresh_scene(&mut self, generation: &mut u64, smooth: bool, dragging: bool) {
+        let key = (self.editor.generation(), self.variants.clone());
+        if self.scene_for != key {
+            *generation += 1;
+            self.scene = Arc::new(SceneData::new(
+                self.editor.project(),
+                &self.variants,
+                *generation,
+            ));
+            self.scene_for = key;
+        }
+        let surface = &self.surface;
+        let stale = !Arc::ptr_eq(surface.scene(), &self.scene) || surface.smooth() != smooth;
+        if stale && !dragging {
+            self.surface = surface.with_scene(self.scene.clone(), smooth);
         }
     }
 
@@ -1010,12 +1035,21 @@ impl App {
     /// draw on the texture under the pointer, which a press shows in the
     /// Texture View. `idle` is whether the selector takes input.
     fn model_view(&mut self, ui: &mut egui::Ui, idle: bool) {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        // The mode selector has a strip of its own, so a press on it never
+        // reaches the model.
+        let full = ui.available_rect_before_wrap();
+        let (bar, rect) = full.split_top_bottom_at_y(full.top() + MODE_BAR_HEIGHT);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            ui.add_enabled_ui(idle, |ui| self.mode_selector(ui));
+        });
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.model.hovered = response.hovered();
         self.model_ghost = None;
-        let Some(doc) = &self.doc else {
+        let dragging = self.texture_view.dragging();
+        let Some(doc) = &mut self.doc else {
             return;
         };
+        doc.refresh_scene(&mut self.generation, self.view.linear_filter, dragging);
         let paint = self.model.mode == Mode::Paint && self.dialog.is_none();
         // The middle button turns the camera in either mode.
         let orbit = response.dragged_by(egui::PointerButton::Middle)
@@ -1039,26 +1073,11 @@ impl App {
         if paint {
             self.paint_model(ui, &response, rect, pointer, hit);
         }
+        let dragging = self.texture_view.dragging();
         let Some(doc) = &mut self.doc else {
             return;
         };
-        // The scene with this frame's edits. The surface follows it between
-        // drags, so a drag meets the surface as it was when it began.
-        let key = (doc.editor.generation(), doc.variants.clone());
-        if doc.scene_for != key {
-            self.generation += 1;
-            doc.scene = Arc::new(SceneData::new(
-                doc.editor.project(),
-                &doc.variants,
-                self.generation,
-            ));
-            doc.scene_for = key;
-        }
-        let smooth = self.view.linear_filter;
-        let stale = !Arc::ptr_eq(doc.surface.scene(), &doc.scene) || doc.surface.smooth() != smooth;
-        if stale && !self.texture_view.dragging() {
-            doc.surface = doc.surface.with_scene(doc.scene.clone(), smooth);
-        }
+        doc.refresh_scene(&mut self.generation, self.view.linear_filter, dragging);
 
         // The tool's footprint where the pointer meets a painted texture in
         // Paint mode, or else the Texture View's Ghost Cursor.
@@ -1087,32 +1106,32 @@ impl App {
                 ghost,
             },
         ));
+    }
 
-        let bar = egui::Rect::from_min_size(
-            rect.min + egui::vec2(8.0, 8.0),
-            egui::vec2(rect.width() - 16.0, 28.0),
-        );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
-            ui.add_enabled_ui(idle, |ui| {
-                ui.horizontal(|ui| {
-                    let modes = [
-                        (Mode::Orbit, Icon::Orbit, "Orbit", "Drag to turn the camera around the model."),
-                        (
-                            Mode::Paint,
-                            Icon::Paintbrush,
-                            "Paint",
-                            "Draw on the model with the picked tool.\nMiddle-drag to turn the camera.",
-                        ),
-                    ];
-                    for (mode, icon, label, hover) in modes {
-                        let text = (icons::text(icon, icons::SMALL), label);
-                        let button = egui::Button::selectable(self.model.mode == mode, text);
-                        if ui.add(button).on_hover_text(hover).clicked() {
-                            self.model.mode = mode;
-                        }
-                    }
-                });
-            });
+    /// The Model View's mode buttons.
+    fn mode_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            let modes = [
+                (
+                    Mode::Orbit,
+                    Icon::Orbit,
+                    "Orbit",
+                    "Drag to turn the camera around the model.",
+                ),
+                (
+                    Mode::Paint,
+                    Icon::Paintbrush,
+                    "Paint",
+                    "Draw on the model with the picked tool.\nMiddle-drag to turn the camera.",
+                ),
+            ];
+            for (mode, icon, label, hover) in modes {
+                let text = (icons::text(icon, icons::SMALL), label);
+                let button = egui::Button::selectable(self.model.mode == mode, text);
+                if ui.add(button).on_hover_text(hover).clicked() {
+                    self.model.mode = mode;
+                }
+            }
         });
     }
 
@@ -1127,28 +1146,48 @@ impl App {
         hit: Option<crate::surface::Hit>,
     ) {
         // Where the button went down, which may differ from where the
-        // pointer is by the time this frame sees the press.
+        // pointer is by the time this frame sees the press; a press released
+        // in the same frame has only the pointer's position.
+        let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
         if response.hovered()
             && ui.input(|i| i.pointer.primary_pressed())
             && let Some(doc) = &self.doc
-            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-            && let Some(h) = self.model.hit(&doc.surface, rect, origin)
+            && let Some(h) = origin.and_then(|o| self.model.hit(&doc.surface, rect, o))
         {
             self.paint_texture(h.texture);
+            // The tools fit the texture now shown before the press acts.
+            self.fit_tool();
         }
         let Some(doc) = &mut self.doc else { return };
         let Some(r) = doc.variant() else { return };
         let on = |h: Option<crate::surface::Hit>| h.filter(|h| h.texture == r.texture);
         let mut press = None;
         if response.drag_started_by(egui::PointerButton::Primary)
-            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+            && let Some(origin) = origin
         {
             press = on(self.model.press(&doc.surface, rect, origin)).map(|h| h.point);
         }
-        // The release's frame may move the pointer last.
+        // A drag's path, for the tools that follow it, up to where the
+        // pointer is, or on the release's frame to where the button let go.
         let primary = egui::PointerButton::Primary;
-        let path = match pointer {
-            Some(p) if response.dragged_by(primary) || response.drag_stopped_by(primary) => {
+        let release = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+        });
+        let end = if response.drag_stopped_by(primary) {
+            release.or(pointer)
+        } else {
+            pointer.filter(|_| response.dragged_by(primary))
+        };
+        let path = match end {
+            Some(p) if !matches!(self.tool, Tool::Select | Tool::Fill) => {
                 self.model.trail(&doc.surface, rect, p, r.texture)
             }
             _ => Vec::new(),

@@ -142,11 +142,12 @@ fn intersect(origin: Vec3, dir: Vec3, [a, b, c]: [Vec3; 3], cull: bool) -> Optio
 /// triangle whose corners average `center`. A point within rounding of the
 /// edge between two repeats belongs to the one its triangle is in, so a
 /// triangle ending on the texture's edge stays on it. Clamped coordinates
-/// past the texture land on its edge texel, which the view shows there.
+/// on or past the texture's far edge, or before its near one, land on the
+/// edge texel, which the view shows there.
 fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     if mode == Wrap::Clamp {
         let half = 0.5 / size;
-        let t = if (0.0..=1.0).contains(&uv) {
+        let t = if (0.0..1.0).contains(&uv) {
             uv
         } else {
             uv.clamp(half, 1.0 - half)
