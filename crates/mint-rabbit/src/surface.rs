@@ -142,10 +142,9 @@ fn intersect(origin: Vec3, dir: Vec3, [a, b, c]: [Vec3; 3], cull: bool) -> Optio
 /// texels across, and the repeat of the texture it is in, for a point of a
 /// triangle whose corners average `center`. A point within rounding of the
 /// edge between two repeats belongs to the one its triangle is in, so a
-/// triangle ending on the texture's edge stays on it, just inside its last
-/// texel. Clamped coordinates
-/// on or past the texture's far edge, or before its near one, land on the
-/// edge texel, which the view shows there.
+/// triangle ending on the texture's edge stays on it, inside its edge
+/// texel. Clamped coordinates on or past the texture's far edge, or before
+/// its near one, land on the edge texel, which the view shows there.
 fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     if mode == Wrap::Clamp {
         let half = 0.5 / size;
@@ -165,8 +164,9 @@ fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     let f = uv - cell;
     let mirrored = mode == Wrap::Mirror && cell.rem_euclid(2.0) >= 1.0;
     let t = if mirrored { 1.0 - f } else { f };
-    // The far edge itself is in the last texel, which the view shows there.
-    ((t * size).min(size - size * f32::EPSILON), cell as i32)
+    // The edges themselves are in the edge texels, which the view shows
+    // there.
+    ((t * size).clamp(0.0, size - size * f32::EPSILON), cell as i32)
 }
 
 /// The alpha, from 0 to 1, that material `m` shows at texel point `point`:
