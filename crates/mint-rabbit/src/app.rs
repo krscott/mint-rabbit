@@ -55,10 +55,11 @@ const STAMP_THUMBNAIL: egui::Vec2 = egui::vec2(48.0, 40.0);
 /// Most height the Stamp Library's thumbnails take before they scroll.
 const STAMPS_HEIGHT: f32 = 150.0;
 
-/// Most height the stamp colors dialog's rows take before they scroll.
+/// Most height the stamp colors dialog's description and rows take before
+/// they scroll.
 const STAMP_COLORS_HEIGHT: f32 = 360.0;
-/// Height of the stamp colors dialog without its rows, which the window
-/// keeps room for.
+/// Height of the stamp colors dialog without its description and rows,
+/// which the window keeps room for.
 const STAMP_COLORS_ROOM: f32 = 180.0;
 
 pub struct Options {
@@ -417,9 +418,6 @@ pub struct App {
     tool: Tool,
     paint: Paint,
     library: Library,
-    /// Whether the Stamp Library's section was open last frame, so that
-    /// opening it reads the folder again.
-    library_open: bool,
     /// The stamp the Stamp tool places, once one is chosen.
     placing: Option<Placing>,
     /// Name last given to a texture set exported to a folder.
@@ -475,7 +473,6 @@ impl App {
                 width: 1.0,
             },
             library: Library::new(stamps::default_dir()),
-            library_open: true,
             placing: None,
             folder_set: String::new(),
             title: String::new(),
@@ -1184,12 +1181,14 @@ impl App {
                         });
                     });
             });
-        let open = header.body_returned.is_some();
-        if open && !self.library_open {
+        let id = ui.make_persistent_id("stamps");
+        let open =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                .is_open();
+        if header.header_response.clicked() && open {
             self.library.scan();
             ui.ctx().request_repaint();
         }
-        self.library_open = open;
         match action {
             Some(Action::Place(name, stamp)) => self.arm(name, stamp),
             Some(Action::Rename(from)) => {
@@ -1859,6 +1858,7 @@ impl App {
             let row = ui.spacing().interact_size.y;
             egui::ScrollArea::vertical()
                 .id_salt("stamp colors")
+                .min_scrolled_height(row)
                 .max_height(room.clamp(row, STAMP_COLORS_HEIGHT))
                 .show(ui, |ui| {
                     ui.label(format!(

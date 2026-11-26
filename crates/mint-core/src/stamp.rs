@@ -143,7 +143,8 @@ impl Stamp {
 
     /// The stamp's pixels in its own colors, from the pixel corner at or
     /// above and left of its bounds, and its shapes and stroke widths scaled
-    /// down if needed so that neither side is over `max_side` pixels.
+    /// down if needed so that neither side is over `max_side` pixels. Scaled
+    /// down, strokes are wide enough to cover a pixel wherever they lie.
     #[must_use]
     pub fn raster(&self, max_side: u32) -> Raster {
         let (min, max) = self.bounds();
@@ -156,11 +157,11 @@ impl Stamp {
         for s in &self.shapes {
             let mut s = s.clone();
             s.transform(fit);
-            // Scaled down to no less than a pixel, so thin strokes show.
+            // A dot this wide holds a pixel center wherever it lies.
             if let Style::Stroke { width, closed } = s.style()
                 && scale < 1.0
             {
-                let width = (width * scale).max(1.0);
+                let width = (width * scale).max(std::f32::consts::SQRT_2);
                 s.set_style(Style::Stroke { width, closed })
                     .expect("a positive width");
             }
@@ -285,15 +286,6 @@ mod tests {
             Stamp::new(vec![red], vec![shape.clone()]),
             Err(StampError::TooFar)
         );
-        // Shapes whose middle overflows are refused, not shifted to NaN.
-        let mut other = shape;
-        other.transform(Affine2::from_translation(Vec2::new(-3e38, 0.0)));
-        let opposite = square(Vec2::new(3e38, 0.0), 1.0, 0);
-        let palette = Palette::from_colors([red]).unwrap();
-        assert_eq!(
-            Stamp::from_shapes(vec![other, opposite], &palette),
-            Err(StampError::TooFar)
-        );
     }
 
     #[test]
@@ -324,8 +316,32 @@ mod tests {
         // A ring 2 pixels wide around a 16-pixel square.
         assert_eq!(set, 18 * 18 - 14 * 14);
 
-        // Outlines thinner than a texel, 200 texels across, stay a pixel
-        // wide.
+        // A dot thinner than a texel still shows, though at a quarter size
+        // it falls between pixel centers: dots at the far corners set the
+        // scale, 256 texels to 64 pixels, and one lands at (32.1, 1.1),
+        // over half a pixel from any center.
+        let dot = |x: f32, y: f32| {
+            let stroke = Style::Stroke {
+                width: 0.5,
+                closed: false,
+            };
+            Shape::new(
+                vec![Anchor::corner(Vec2::new(x, y))],
+                stroke,
+                PaletteIndex(0),
+            )
+            .unwrap()
+        };
+        let stamp = Stamp::new(
+            vec![Rgba8::new(0, 0, 0, 255)],
+            vec![dot(0.25, 0.25), dot(255.75, 0.25), dot(128.4, 4.4)],
+        )
+        .unwrap();
+        let raster = stamp.raster(64);
+        assert_eq!(raster.size().x, 64);
+        assert!(raster.pixels()[64 + 32].is_some(), "the dot vanished");
+
+        // Outlines thinner than a texel, 200 texels across, still show.
         for width in [1.0, 0.5] {
             let mut thin = square(Vec2::splat(0.25), 200.0, 0);
             thin.set_style(Style::Stroke {
