@@ -1178,8 +1178,11 @@ impl App {
         let origin = pressed_at
             .or_else(|| ui.input(|i| i.pointer.press_origin()))
             .or(pointer);
+        // A drag finishes on the texture it began on, even if a new press
+        // arrives before its release is seen.
         if response.hovered()
             && ui.input(|i| i.pointer.primary_pressed())
+            && !self.texture_view.dragging()
             && let Some(doc) = &self.doc
             && let Some(h) = origin.and_then(|o| self.model.hit(&doc.surface, rect, o))
         {
@@ -1210,17 +1213,27 @@ impl App {
             }
             _ => Vec::new(),
         };
-        // How near a click or press finds a pen anchor or a shape.
-        let texels_per_point = match (pointer, on(hit)) {
-            (Some(p), Some(h)) if response.clicked() || response.drag_started() => {
+        // A click lands where the button came up, a drag starts where it
+        // went down, and either finds what it's near within a reach measured
+        // there.
+        let acted_at = if response.clicked() {
+            release.or(pointer)
+        } else if response.drag_started() {
+            origin
+        } else {
+            None
+        };
+        let acted = acted_at.and_then(|p| Some((p, self.model.hit(&doc.surface, rect, p)?)));
+        let texels_per_point = match acted {
+            Some((p, h)) if on(Some(h)).is_some() => {
                 self.model.texels_per_point(&doc.surface, rect, p, &h)
             }
             _ => 1.0,
         };
-        // A click lands where the button came up.
-        let here = match release {
-            Some(p) if response.clicked() => self.model.hit(&doc.surface, rect, p),
-            _ => hit,
+        let here = if response.clicked() {
+            acted.map(|(_, h)| h)
+        } else {
+            hit
         };
         let model_pointer = ModelPointer {
             press,

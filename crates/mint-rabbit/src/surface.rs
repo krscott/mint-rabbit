@@ -103,7 +103,10 @@ impl Surface {
             let [(x, cx), (y, cy)] =
                 [0, 1].map(|k| texel(uv[k], center[k], m.wrap[k], m.size[k] as f32));
             let point = Vec2::new(x, y);
-            if m.alpha == AlphaMode::Cutout && alpha(m, point, self.smooth) < 0.5 {
+            // The cutout test samples as the view's sampler does, from the
+            // unwrapped coordinate.
+            let size = Vec2::new(m.size[0] as f32, m.size[1] as f32);
+            if m.alpha == AlphaMode::Cutout && alpha(m, uv * size, self.smooth) < 0.5 {
                 continue;
             }
             let hit = Hit {
@@ -172,9 +175,10 @@ fn texel(uv: f32, center: f32, mode: Wrap, size: f32) -> (f32, i32) {
     )
 }
 
-/// The alpha, from 0 to 1, that material `m` shows at texel point `point`:
-/// of the texel under it, or with `smooth`, blended from the four nearest
-/// as the view's sampler does.
+/// The alpha, from 0 to 1, that material `m` shows at `point`, a UV
+/// coordinate in texels before wrapping: of the texel under it, or with
+/// `smooth`, blended from the four nearest, wrapped as the view's sampler
+/// wraps them.
 fn alpha(m: &crate::render::MaterialData, point: Vec2, smooth: bool) -> f32 {
     let [w, h] = m.size.map(i64::from);
     let at = |x: i64, y: i64| {
