@@ -107,6 +107,8 @@ impl Editor {
     ) -> Result<T, E> {
         let key = hash(key);
         if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
+            // Another control's edit ends the open one.
+            self.end_gesture();
             self.gesture = Gesture::Open {
                 key,
                 recorded: None,
@@ -381,6 +383,27 @@ mod tests {
         }
         assert_eq!(steps, UNDO_LIMIT);
         assert_eq!(current(&e), 0);
+    }
+
+    #[test]
+    fn continuous_edits_by_turns_keep_to_the_undo_limit() {
+        let mut e = editor();
+        for r in 1..=u8::try_from(UNDO_LIMIT).unwrap() {
+            red(&mut e, r);
+        }
+        for g in 0..50u8 {
+            e.edit_continuous(g % 2, |p| {
+                p.set_palette_color(PaletteIndex(0), Rgba8::new(0, g, 1, 255))
+            })
+            .unwrap();
+        }
+        e.end_gesture();
+        let mut steps = 0;
+        while e.can_undo() {
+            e.undo();
+            steps += 1;
+        }
+        assert_eq!(steps, UNDO_LIMIT);
     }
 
     #[test]
