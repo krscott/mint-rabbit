@@ -18,14 +18,13 @@ const UNDO_LIMIT: usize = 200;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gesture {
     None,
-    /// Edits until the gesture ends undo as one step; `recorded` once that
-    /// step is on the undo stack. `key` names the control making them.
-    /// `dirty` is whether rolling the gesture back leaves changes unsaved:
-    /// there were some before it, or it was saved partway.
+    /// Edits until the gesture ends undo as one step. `key` names the
+    /// control making them. `recorded` once that step is on the undo stack,
+    /// holding whether rolling it back leaves changes unsaved: there were
+    /// some before it, or it was saved partway.
     Open {
         key: u64,
-        recorded: bool,
-        dirty: bool,
+        recorded: Option<bool>,
     },
 }
 
@@ -82,8 +81,7 @@ impl Editor {
         self.path = Some(path);
         self.dirty = false;
         if let Gesture::Open {
-            recorded: true,
-            dirty,
+            recorded: Some(dirty),
             ..
         } = &mut self.gesture
         {
@@ -111,8 +109,7 @@ impl Editor {
         if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
             self.gesture = Gesture::Open {
                 key,
-                recorded: false,
-                dirty: self.dirty,
+                recorded: None,
             };
         }
         self.apply(f)
@@ -148,12 +145,11 @@ impl Editor {
         };
         if self.project != before {
             match &mut self.gesture {
-                Gesture::Open { recorded: true, .. } => {}
                 Gesture::Open {
-                    recorded, dirty, ..
-                } => {
-                    *recorded = true;
-                    *dirty = self.dirty;
+                    recorded: Some(_), ..
+                } => {}
+                Gesture::Open { recorded, .. } => {
+                    *recorded = Some(self.dirty);
                     let redo = std::mem::take(&mut self.redo);
                     self.push_undo(before);
                     self.gesture_redo = redo;
@@ -173,8 +169,7 @@ impl Editor {
         let key = hash(key);
         if let Gesture::Open {
             key: open,
-            recorded: true,
-            dirty,
+            recorded: Some(dirty),
         } = self.gesture
             && open == key
             && let Some(before) = self.undo.pop()
