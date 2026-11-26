@@ -18,14 +18,13 @@ const UNDO_LIMIT: usize = 200;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gesture {
     None,
-    /// Edits until the gesture ends undo as one step; `recorded` once that
-    /// step is on the undo stack. `key` names the control making them.
-    /// `dirty` is whether rolling the gesture back leaves changes unsaved:
-    /// there were some before it, or it was saved partway.
+    /// Edits until the gesture ends undo as one step. `key` names the
+    /// control making them. `recorded` once that step is on the undo stack,
+    /// holding whether rolling it back leaves changes unsaved: there were
+    /// some before it, or it was saved partway.
     Open {
         key: u64,
-        recorded: bool,
-        dirty: bool,
+        recorded: Option<bool>,
     },
 }
 
@@ -82,8 +81,7 @@ impl Editor {
         self.path = Some(path);
         self.dirty = false;
         if let Gesture::Open {
-            recorded: true,
-            dirty,
+            recorded: Some(dirty),
             ..
         } = &mut self.gesture
         {
@@ -109,10 +107,11 @@ impl Editor {
     ) -> Result<T, E> {
         let key = hash(key);
         if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
+            // Another control's edit ends the open one.
+            self.end_gesture();
             self.gesture = Gesture::Open {
                 key,
-                recorded: false,
-                dirty: self.dirty,
+                recorded: None,
             };
         }
         self.apply(f)
@@ -148,12 +147,11 @@ impl Editor {
         };
         if self.project != before {
             match &mut self.gesture {
-                Gesture::Open { recorded: true, .. } => {}
                 Gesture::Open {
-                    recorded, dirty, ..
-                } => {
-                    *recorded = true;
-                    *dirty = self.dirty;
+                    recorded: Some(_), ..
+                } => {}
+                Gesture::Open { recorded, .. } => {
+                    *recorded = Some(self.dirty);
                     let redo = std::mem::take(&mut self.redo);
                     self.push_undo(before);
                     self.gesture_redo = redo;
@@ -173,8 +171,7 @@ impl Editor {
         let key = hash(key);
         if let Gesture::Open {
             key: open,
-            recorded: true,
-            dirty,
+            recorded: Some(dirty),
         } = self.gesture
             && open == key
             && let Some(before) = self.undo.pop()
@@ -386,6 +383,27 @@ mod tests {
         }
         assert_eq!(steps, UNDO_LIMIT);
         assert_eq!(current(&e), 0);
+    }
+
+    #[test]
+    fn continuous_edits_by_turns_keep_to_the_undo_limit() {
+        let mut e = editor();
+        for r in 1..=u8::try_from(UNDO_LIMIT).unwrap() {
+            red(&mut e, r);
+        }
+        for g in 0..50u8 {
+            e.edit_continuous(g % 2, |p| {
+                p.set_palette_color(PaletteIndex(0), Rgba8::new(0, g, 1, 255))
+            })
+            .unwrap();
+        }
+        e.end_gesture();
+        let mut steps = 0;
+        while e.can_undo() {
+            e.undo();
+            steps += 1;
+        }
+        assert_eq!(steps, UNDO_LIMIT);
     }
 
     #[test]
