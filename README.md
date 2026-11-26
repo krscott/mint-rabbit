@@ -41,10 +41,11 @@ layer's name to rename it, or right-click it to rename, duplicate, copy to
 other variants, rasterize, or delete it.
 
 Stamps are saved groups of shapes, kept in the Stamp Library: one RON file per
-stamp in `$XDG_DATA_HOME/mint-rabbit/stamps` (File > Open stamp folder), shared
-by every project and easy to copy or version. With shapes picked, Edit > Save
-as stamp… or the stamp button in the style bar saves them with their colors
-under a name. The Stamps section at the bottom of the dock lists them; it reads
+stamp in `$XDG_DATA_HOME/mint-rabbit/stamps`, else
+`~/.local/share/mint-rabbit/stamps` (File > Open stamp folder), shared by every
+project and easy to copy or version. With shapes picked, Edit > Save as stamp…
+or the stamp button in the style bar saves them with their colors under a
+name. The Stamps section at the bottom of the dock lists them; it reads
 the folder again when opened, and right-clicking a stamp renames or deletes it.
 Clicking a stamp picks the Stamp tool (S), first asking which palette entry,
 or new entry, each stamp color becomes, unless each matches an entry exactly.

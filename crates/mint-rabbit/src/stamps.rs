@@ -182,12 +182,9 @@ impl Library {
     /// needed.
     pub fn save(&mut self, name: &str, stamp: &Stamp) -> Result<(), String> {
         let path = self.path(name)?;
-        let result = self.create_dir().and_then(|()| {
-            file::save_stamp(stamp, &path).map_err(|e| match e {
-                file::StampFileError::Exists(_) => taken(name),
-                e => e.to_string(),
-            })
-        });
+        let result = self
+            .create_dir()
+            .and_then(|()| file::save_stamp(stamp, &path).map_err(|e| file_error(e, name)));
         self.scan();
         result
     }
@@ -195,19 +192,7 @@ impl Library {
     /// Renames stamp `from` to `to`, unless another file has that name.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
         let (old, new) = (self.existing(from)?, self.path(to)?);
-        // Persisting a temporary path renames without replacing. One that
-        // fails must be kept, or dropping it would delete the stamp.
-        let fail = |e: std::io::Error| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => taken(to),
-            _ => format!("Couldn't rename {}: {e}", old.display()),
-        };
-        let result = match tempfile::TempPath::try_from_path(&old) {
-            Ok(temp) => temp.persist_noclobber(&new).map_err(|e| {
-                let _ = e.path.keep();
-                fail(e.error)
-            }),
-            Err(e) => Err(fail(e)),
-        };
+        let result = file::rename_stamp(&old, &new).map_err(|e| file_error(e, to));
         self.scan();
         result
     }
@@ -227,8 +212,14 @@ impl Library {
     }
 }
 
-fn taken(name: &str) -> String {
-    format!("A stamp named {:?} already exists", name.trim())
+/// What went wrong writing the stamp named `name`.
+fn file_error(e: file::StampFileError, name: &str) -> String {
+    match e {
+        file::StampFileError::Exists(_) => {
+            format!("A stamp named {:?} already exists", name.trim())
+        }
+        e => e.to_string(),
+    }
 }
 
 /// What a stamp color becomes on placing.

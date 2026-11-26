@@ -57,6 +57,11 @@ const STAMPS_HEIGHT: f32 = 150.0;
 
 /// Most height the stamp colors dialog's rows take before they scroll.
 const STAMP_COLORS_HEIGHT: f32 = 360.0;
+/// Height of the stamp colors dialog without its rows, which the window
+/// keeps room for.
+const STAMP_COLORS_ROOM: f32 = 180.0;
+/// Height of one of the stamp colors dialog's rows.
+const STAMP_ROW: f32 = 26.0;
 
 pub struct Options {
     pub decomp: Option<PathBuf>,
@@ -1103,13 +1108,13 @@ impl App {
             .as_ref()
             .filter(|_| self.tool == Tool::Stamp)
             .map(|p| p.name.clone());
-        let missing = self.library.problem();
+        let problem = self.library.problem();
         let mut action = None;
         let header = egui::CollapsingHeader::new(egui::RichText::new("Stamps").strong())
             .id_salt("stamps")
             .default_open(true)
             .show(ui, |ui| {
-                if let Some(why) = missing {
+                if let Some(why) = problem {
                     ui.weak(why);
                     return;
                 }
@@ -1855,9 +1860,10 @@ impl App {
                 placing.name
             ));
             // Many colors scroll, keeping the buttons in view.
+            let room = ui.ctx().content_rect().height() - STAMP_COLORS_ROOM;
             egui::ScrollArea::vertical()
                 .id_salt("stamp colors")
-                .max_height(STAMP_COLORS_HEIGHT)
+                .max_height(room.clamp(STAMP_ROW, STAMP_COLORS_HEIGHT))
                 .show(ui, |ui| {
                     egui::Grid::new("stamp colors")
                         .num_columns(2)

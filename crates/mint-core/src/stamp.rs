@@ -5,6 +5,10 @@ use glam::{Affine2, UVec2, Vec2};
 
 use crate::{Palette, PaletteIndex, Raster, Rgba8, Shape, Style};
 
+/// Farthest a stamp's shapes may reach from its origin, in texels: far past
+/// any texture's size, and near enough that placing never overflows.
+const MAX_REACH: f32 = 65536.0;
+
 /// A group of shapes with its own colors: each shape's color is an index
 /// into the stamp's colors, not into a project's palette. Placing moves the
 /// shapes by whole texels, so they cover the same pixels they did.
@@ -26,6 +30,8 @@ pub enum StampError {
     MissingColor { index: u8, len: usize },
     #[error("stamp color {0} isn't used by any of its shapes")]
     UnusedColor(usize),
+    #[error("a stamp's shapes reach at most {MAX_REACH} texels from its origin")]
+    TooFar,
 }
 
 impl Stamp {
@@ -52,6 +58,10 @@ impl Stamp {
         }
         if let Some(i) = used.iter().position(|u| !u) {
             return Err(StampError::UnusedColor(i));
+        }
+        let (min, max) = bounds(&shapes).ok_or(StampError::NoShapes)?;
+        if min.min_element() < -MAX_REACH || max.max_element() > MAX_REACH {
+            return Err(StampError::TooFar);
         }
         Ok(Self { colors, shapes })
     }
@@ -146,8 +156,9 @@ impl Stamp {
         for s in &self.shapes {
             let mut s = s.clone();
             s.transform(fit);
+            // Down to a pixel wide, so thin strokes still show.
             if let Style::Stroke { width, closed } = s.style() {
-                let width = (width * scale).max(f32::MIN_POSITIVE);
+                let width = (width * scale).max(width.min(1.0));
                 s.set_style(Style::Stroke { width, closed })
                     .expect("a positive width");
             }
@@ -245,6 +256,10 @@ mod tests {
             Stamp::new(vec![red, red], vec![square(Vec2::ZERO, 1.0, 1)]),
             Err(StampError::UnusedColor(0))
         );
+        assert_eq!(
+            Stamp::new(vec![red], vec![square(Vec2::splat(2e38), 1.0, 0)]),
+            Err(StampError::TooFar)
+        );
     }
 
     #[test]
@@ -274,5 +289,21 @@ mod tests {
         let set = raster.pixels().iter().filter(|p| p.is_some()).count();
         // A ring 2 pixels wide around a 16-pixel square.
         assert_eq!(set, 18 * 18 - 14 * 14);
+
+        // A 1-texel outline 200 texels across stays a pixel wide.
+        let mut thin = square(Vec2::ZERO, 200.0, 0);
+        thin.set_style(Style::Stroke {
+            width: 1.0,
+            closed: true,
+        })
+        .unwrap();
+        let stamp = Stamp::from_shapes(vec![thin], &palette()).unwrap();
+        let set = stamp
+            .raster(64)
+            .pixels()
+            .iter()
+            .filter(|p| p.is_some())
+            .count();
+        assert!(set > 4 * 50, "{set} pixels set");
     }
 }

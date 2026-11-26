@@ -807,6 +807,22 @@ pub fn save_stamp(stamp: &Stamp, path: &Path) -> Result<(), StampFileError> {
     })
 }
 
+/// Renames the stamp file at `from` to `to`, never replacing a file
+/// already there.
+pub fn rename_stamp(from: &Path, to: &Path) -> Result<(), StampFileError> {
+    let fail = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => StampFileError::Exists(to.to_owned()),
+        _ => StampFileError::Io(from.to_owned(), e),
+    };
+    // Persisting a temporary path renames without replacing. One that
+    // fails must be kept, or dropping it would delete the stamp.
+    let temp = tempfile::TempPath::try_from_path(from).map_err(fail)?;
+    temp.persist_noclobber(to).map_err(|e| {
+        let _ = e.path.keep();
+        fail(e.error)
+    })
+}
+
 /// Reads the stamp file at `path`.
 pub fn load_stamp(path: &Path) -> Result<Stamp, StampFileError> {
     let text = std::fs::read_to_string(path).map_err(|e| StampFileError::Io(path.to_owned(), e))?;
@@ -1372,6 +1388,27 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn renaming_a_stamp_never_replaces_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (eye, brow, lid) = (
+            dir.path().join("Eye.ron"),
+            dir.path().join("Brow.ron"),
+            dir.path().join("Lid.ron"),
+        );
+        save_stamp(&stamp(), &eye).unwrap();
+        std::fs::write(&brow, "mine").unwrap();
+        assert!(matches!(
+            rename_stamp(&eye, &brow),
+            Err(StampFileError::Exists(p)) if p == brow
+        ));
+        assert!(eye.is_file());
+        assert_eq!(std::fs::read_to_string(&brow).unwrap(), "mine");
+        rename_stamp(&eye, &lid).unwrap();
+        assert!(!eye.exists());
+        assert_eq!(load_stamp(&lid).unwrap(), stamp());
     }
 
     #[test]
