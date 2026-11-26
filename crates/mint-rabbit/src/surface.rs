@@ -81,10 +81,10 @@ impl Surface {
         self.smooth
     }
 
-    /// Where the ray from `origin` along `dir` first meets a face that
-    /// shows: faces its material culls and texels its cutout drops let it
-    /// through.
-    pub fn hit(&self, origin: Vec3, dir: Vec3) -> Option<Hit> {
+    /// Where the ray from `origin` along unit `dir`, `length` long, first
+    /// meets a face that shows: faces its material culls and texels its
+    /// cutout drops let it through.
+    pub fn hit(&self, origin: Vec3, dir: Vec3, length: f32) -> Option<Hit> {
         let vertices = &self.scene.mesh.vertices;
         let mut best: Option<(f32, Hit)> = None;
         for (i, &(material, island)) in self.triangles.iter().enumerate() {
@@ -94,7 +94,7 @@ impl Surface {
             let Some((t, u, v)) = intersect(origin, dir, [a, b, c], !m.double_sided) else {
                 continue;
             };
-            if best.is_some_and(|(d, _)| d <= t) {
+            if t > length || best.is_some_and(|(d, _)| d <= t) {
                 continue;
             }
             let [ua, ub, uc] = std::array::from_fn(|k| Vec2::from(corners[k].uv));
@@ -210,9 +210,10 @@ fn wrap_index(i: i64, n: i64, mode: Wrap) -> i64 {
     }
 }
 
-/// The UV island of each triangle: triangles of one texture whose UVs run
-/// the same way around (so not folded over each other), sharing an edge
-/// whose ends have the same position and UV coordinate, are on one island.
+/// The UV island of each triangle: triangles of one texture, wrapped the
+/// same way, whose UVs run the same way around (so not folded over each
+/// other), sharing an edge whose ends have the same position and UV
+/// coordinate, are on one island.
 fn islands(scene: &SceneData, materials: &[usize]) -> Vec<usize> {
     let vertices = &scene.mesh.vertices;
     // Positions are matched on a grid a millionth of the model's size
@@ -234,7 +235,8 @@ fn islands(scene: &SceneData, materials: &[usize]) -> Vec<usize> {
     for (t, &m) in materials.iter().enumerate() {
         for k in 0..3 {
             let (a, b) = (corner(t * 3 + k), corner(t * 3 + (k + 1) % 3));
-            let key = (scene.materials[m].texture, winding(t), a.min(b), a.max(b));
+            let m = &scene.materials[m];
+            let key = (m.texture, m.wrap, winding(t), a.min(b), a.max(b));
             match edges.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     union(&mut parent, *e.get(), t);
@@ -362,7 +364,7 @@ pub(crate) mod tests {
 
     /// Where a ray straight down -Z through `(x, y)` meets the surface.
     fn down(s: &Surface, x: f32, y: f32) -> Option<Hit> {
-        s.hit(Vec3::new(x, y, 10.0), Vec3::NEG_Z)
+        s.hit(Vec3::new(x, y, 10.0), Vec3::NEG_Z, f32::INFINITY)
     }
 
     fn near(a: Vec2, b: Vec2) -> bool {
@@ -469,6 +471,20 @@ pub(crate) mod tests {
         let s = surface(&[OPAQUE], &tris);
         let [b, c] = [0.9, 1.1].map(|x| down(&s, x, 0.5).unwrap());
         assert!(!b.joins(&c));
+        // Nor do faces sharing UVs but wrapping the texture differently.
+        let mut tris = square(0, 0.0, 0.0, [1.0, 0.0], [1.25, 1.0]).to_vec();
+        tris.extend(square(1, 1.0, 0.0, [1.25, 0.0], [1.5, 1.0]));
+        let s = surface(&[repeat, mirror], &tris);
+        let [b, c] = [0.9, 1.1].map(|x| down(&s, x, 0.5).unwrap());
+        assert!(!b.joins(&c));
+    }
+
+    #[test]
+    fn rays_end_at_the_far_plane() {
+        let s = surface(&[OPAQUE], &square(0, 0.0, 0.0, [0.0, 0.0], [1.0, 1.0]));
+        let from = Vec3::new(0.5, 0.5, 10.0);
+        assert!(s.hit(from, Vec3::NEG_Z, 9.0).is_none());
+        assert!(s.hit(from, Vec3::NEG_Z, 11.0).is_some());
     }
 
     #[test]

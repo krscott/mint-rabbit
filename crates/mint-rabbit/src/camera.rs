@@ -54,13 +54,15 @@ impl Orbit {
     }
 
     /// The ray from the eye through `ndc`, a point of the view in
-    /// normalized device coordinates (-1 to 1, y up): its origin on the
-    /// near plane and its unit direction.
-    pub fn ray(&self, aspect: f32, ndc: Vec2) -> (Vec3, Vec3) {
+    /// normalized device coordinates (-1 to 1, y up), as far as the view
+    /// shows: its origin on the near plane, its unit direction, and its
+    /// length to the far plane.
+    pub fn ray(&self, aspect: f32, ndc: Vec2) -> (Vec3, Vec3, f32) {
         let inverse = self.view_proj(aspect).inverse();
         let near = inverse.project_point3(ndc.extend(0.0));
         let far = inverse.project_point3(ndc.extend(1.0));
-        (near, (far - near).normalize())
+        let span = far - near;
+        (near, span.normalize(), span.length())
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {

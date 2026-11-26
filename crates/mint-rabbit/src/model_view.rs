@@ -55,8 +55,8 @@ impl ModelView {
             (pos.x - rect.left()) / rect.width() * 2.0 - 1.0,
             1.0 - (pos.y - rect.top()) / rect.height() * 2.0,
         );
-        let (origin, dir) = self.camera.ray(rect.width() / rect.height().max(1.0), ndc);
-        surface.hit(origin, dir)
+        let (origin, dir, length) = self.camera.ray(rect.width() / rect.height().max(1.0), ndc);
+        surface.hit(origin, dir, length)
     }
 
     /// Texels per screen point where the pointer at `pos` meets the model at
