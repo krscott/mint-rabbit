@@ -78,7 +78,13 @@ impl Doc {
             .map(|i| TextureId(i as u32));
         let scene = Arc::new(SceneData::new(&project, &variants, generation));
         let selection = selected.map_or_else(Selection::default, |texture| {
-            Selection::top(&project, VariantRef { texture, variant: 0 })
+            Selection::top(
+                &project,
+                VariantRef {
+                    texture,
+                    variant: 0,
+                },
+            )
         });
         Self {
             editor: Editor::new(project, path),

@@ -1242,7 +1242,6 @@ fn transformed(original: &[Shape], t: Affine2) -> Vec<Shape> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 /// What a drag edits, and where it reports a refused edit.
 struct Canvas<'a> {
     editor: &'a mut Editor,
@@ -1435,7 +1434,10 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
         ),
         _ => return,
     };
-    let shape = match anchors.map(|a| Shape::new(a, style, paint.color)).transpose() {
+    let shape = match anchors
+        .map(|a| Shape::new(a, style, paint.color))
+        .transpose()
+    {
         Ok(shape) => shape,
         Err(e) => {
             *message = Some(e.to_string());
