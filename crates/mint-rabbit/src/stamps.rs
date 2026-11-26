@@ -58,19 +58,25 @@ pub struct Entry {
     path: PathBuf,
     /// The stamp, or why its file couldn't be read.
     pub stamp: Result<Arc<Stamp>, String>,
-    thumbnail: Option<TextureHandle>,
+    /// The image last drawn, with the most pixels a side it was drawn for.
+    thumbnail: Option<(u32, TextureHandle)>,
 }
 
 impl Entry {
     /// The image of `stamp`, this entry's, in its own colors, at most
-    /// `max_side` pixels a side, drawn the first time it is asked for.
+    /// `max_side` pixels a side, drawn again only when `max_side` changes.
     pub fn thumbnail(
         &mut self,
         ctx: &egui::Context,
         stamp: &Stamp,
         max_side: u32,
     ) -> TextureHandle {
-        let handle = self.thumbnail.get_or_insert_with(|| {
+        if let Some((side, handle)) = &self.thumbnail
+            && *side == max_side
+        {
+            return handle.clone();
+        }
+        let handle = {
             let raster = stamp.raster(max_side);
             let size = raster.size();
             let pixels = raster
@@ -86,8 +92,9 @@ impl Entry {
                 .collect();
             let image = ColorImage::new([size.x as usize, size.y as usize], pixels);
             ctx.load_texture("stamp", image, TextureOptions::NEAREST)
-        });
-        handle.clone()
+        };
+        self.thumbnail = Some((max_side, handle.clone()));
+        handle
     }
 }
 

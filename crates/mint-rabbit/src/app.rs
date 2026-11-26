@@ -3,7 +3,7 @@
 //! dialogs.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
@@ -314,8 +314,9 @@ fn ghost(
     })
 }
 
-/// Opens `dir` in the desktop's file manager.
-fn open_folder(dir: &Path) -> Result<(), String> {
+/// Opens `dir` in the desktop's file manager. The opener keeps running; the
+/// returned channel gets why if it then exits with an error.
+fn open_folder(ctx: &egui::Context, dir: &Path) -> Result<mpsc::Receiver<String>, String> {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -326,11 +327,19 @@ fn open_folder(dir: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Couldn't open {} with {opener}: {e}", dir.display()))?;
     // Reaped once it exits, which the opener does as soon as it hands over.
+    let (send, failed) = mpsc::channel();
+    let (ctx, dir) = (ctx.clone(), dir.to_owned());
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        let why = match child.wait() {
+            Ok(status) if status.success() => return,
+            Ok(status) => format!("{opener} couldn't open {}: {status}", dir.display()),
+            Err(e) => format!("{opener} couldn't open {}: {e}", dir.display()),
+        };
+        let _ = send.send(why);
+        ctx.request_repaint();
     });
-    Ok(())
+    Ok(failed)
 }
 
 /// Gives a dialog's first text field the keyboard while nothing else has it,
@@ -425,6 +434,9 @@ pub struct App {
     library: Library,
     /// The stamp the Stamp tool places, once one is chosen.
     placing: Option<Placing>,
+    /// Where why opening the stamp folder failed arrives, while the
+    /// opener runs.
+    opener: Option<mpsc::Receiver<String>>,
     /// Name last given to a texture set exported to a folder.
     folder_set: String,
     /// The window title last set.
@@ -479,6 +491,7 @@ impl App {
             },
             library: Library::new(stamps::default_dir()),
             placing: None,
+            opener: None,
             folder_set: String::new(),
             title: String::new(),
             quitting: false,
@@ -893,9 +906,10 @@ impl App {
             let opened = self
                 .library
                 .create_dir()
-                .and_then(|()| open_folder(self.library.dir()?));
-            if let Err(e) = opened {
-                self.fail(e);
+                .and_then(|()| open_folder(ui.ctx(), self.library.dir()?));
+            match opened {
+                Ok(failed) => self.opener = Some(failed),
+                Err(e) => self.fail(e),
             }
         }
         ui.separator();
@@ -1107,7 +1121,7 @@ impl App {
             .placing
             .as_ref()
             .filter(|_| self.tool == Tool::Stamp)
-            .map(|p| p.name.clone());
+            .map(|p| (p.name.clone(), p.stamp.clone()));
         let problem = self.library.problem();
         let mut action = None;
         let header = egui::CollapsingHeader::new(egui::RichText::new("Stamps").strong())
@@ -1134,7 +1148,11 @@ impl App {
                                     let name = entry.name.clone();
                                     let response = match entry.stamp.clone() {
                                         Ok(stamp) => {
-                                            let picked = armed.as_ref() == Some(&name);
+                                            // The one placing, unless its file
+                                            // has changed since.
+                                            let picked = armed
+                                                .as_ref()
+                                                .is_some_and(|(n, s)| *n == name && *s == stamp);
                                             let r = thumbnail(ui, STAMP_THUMBNAIL, picked, |ctx| {
                                                 // As many pixels as it shows, so
                                                 // nothing drawn is dropped.
@@ -2057,6 +2075,16 @@ impl eframe::App for App {
             && let Some(v) = picker.show(&ctx)
         {
             self.replace(Replace::Import(v), &ctx);
+        }
+        if let Some(failed) = &self.opener {
+            match failed.try_recv() {
+                Ok(why) => {
+                    self.opener = None;
+                    self.fail(why);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.opener = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
         }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
