@@ -93,7 +93,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     // The ghost outline: a light line about a pixel wide in a darker one.
     if globals.ghost.w >= 0.0 && abs(material.texture.x - globals.ghost.w) < 0.5 {
         var off = abs(d - globals.ghost.z) / w;
-        // A box also rings its center, which may be all of it on the texture.
+        // A box also rings its center, the only part shown when the box is
+        // larger than the texture.
         if globals.ghost_box.x + globals.ghost_box.y > 0.0 {
             off = min(off, abs(distance(p, globals.ghost.xy) - 1.0) / w);
         }

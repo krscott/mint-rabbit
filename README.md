@@ -95,8 +95,8 @@ picks the shape under a click, and Enter, Escape, and Delete work as over the
 Texture View. In either mode, scroll to zoom. The view under the pointer shows
 what the tool paints around it, and the Ghost Cursor shows the same at the
 pointer's matching point in the other view, on every part of the model that
-shows that texture point (for a stamp, the box around it); View > Ghost Cursor
-in the other view turns it off.
+shows that texture point (for a stamp, the box around it and a small ring at
+its center); View > Ghost Cursor in the other view turns it off.
 
 A project saves as a folder (File > Save, Save as). The File menu's exports
 either replace the imported villager's texture set in the decomp, after which
