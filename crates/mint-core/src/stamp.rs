@@ -3,7 +3,7 @@
 
 use glam::{Affine2, UVec2, Vec2};
 
-use crate::{Palette, PaletteIndex, Raster, Rgba8, Shape, Style};
+use crate::{NonEmpty, Palette, PaletteIndex, Raster, Rgba8, Shape, Style};
 
 /// Farthest a stamp's points, curve controls, and stroke widths may reach
 /// from its origin, in texels: far past any texture's size, and near enough
@@ -17,8 +17,8 @@ const MAX_REACH: f32 = 65536.0;
 pub struct Stamp {
     /// Each used by a shape.
     colors: Vec<Rgba8>,
-    /// Never empty; each color indexes `colors`.
-    shapes: Vec<Shape>,
+    /// Each color indexes `colors`.
+    shapes: NonEmpty<Shape>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -37,10 +37,7 @@ pub enum StampError {
 
 impl Stamp {
     /// A stamp of `shapes` as they are, coloring them from `colors`.
-    pub fn new(colors: Vec<Rgba8>, shapes: Vec<Shape>) -> Result<Self, StampError> {
-        if shapes.is_empty() {
-            return Err(StampError::NoShapes);
-        }
+    pub fn new(colors: Vec<Rgba8>, shapes: NonEmpty<Shape>) -> Result<Self, StampError> {
         if colors.len() > Palette::MAX_LEN {
             return Err(StampError::TooManyColors);
         }
@@ -71,7 +68,7 @@ impl Stamp {
     /// pixel corner nearest the middle of their bounds is the origin, which
     /// keeps the numbers in its file small. Panics if a shape's color isn't
     /// in `palette`.
-    pub fn from_shapes(shapes: Vec<Shape>, palette: &Palette) -> Result<Self, StampError> {
+    pub fn from_shapes(shapes: NonEmpty<Shape>, palette: &Palette) -> Result<Self, StampError> {
         let mut used = vec![false; palette.len()];
         for s in &shapes {
             used[usize::from(s.color().0)] = true;
@@ -84,18 +81,13 @@ impl Stamp {
                 colors.push(c);
             }
         }
-        let Some((min, max)) = bounds(&shapes) else {
-            return Err(StampError::NoShapes);
-        };
+        let (min, max) = bounds(&shapes);
         let origin = ((min + max) / 2.0).round();
-        let shapes = shapes
-            .into_iter()
-            .map(|mut s| {
-                s.transform(Affine2::from_translation(-origin));
-                s.set_color(index[usize::from(s.color().0)]);
-                s
-            })
-            .collect();
+        let shapes = shapes.map(|mut s| {
+            s.transform(Affine2::from_translation(-origin));
+            s.set_color(index[usize::from(s.color().0)]);
+            s
+        });
         Self::new(colors, shapes)
     }
 
@@ -112,7 +104,7 @@ impl Stamp {
     /// The area the shapes cover about the origin, as min and max corners.
     #[must_use]
     pub fn bounds(&self) -> (Vec2, Vec2) {
-        bounds(&self.shapes).expect("a stamp has shapes")
+        bounds(&self.shapes)
     }
 
     /// The whole-texel offset the stamp moves by to be placed at `at`: the
@@ -187,11 +179,11 @@ fn within_reach(shape: &Shape) -> bool {
         })
 }
 
-fn bounds(shapes: &[Shape]) -> Option<(Vec2, Vec2)> {
-    shapes
-        .iter()
-        .map(|s| s.outline().bounds())
-        .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
+fn bounds(shapes: &NonEmpty<Shape>) -> (Vec2, Vec2) {
+    shapes.fold_map(
+        |s| s.outline().bounds(),
+        |(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)),
+    )
 }
 
 #[cfg(test)]
@@ -212,6 +204,10 @@ mod tests {
         Shape::new(anchors, Style::Fill, PaletteIndex(color)).unwrap()
     }
 
+    fn list(shapes: Vec<Shape>) -> NonEmpty<Shape> {
+        NonEmpty::from_vec(shapes).unwrap()
+    }
+
     fn palette() -> Palette {
         Palette::from_colors([
             Rgba8::new(0, 0, 0, 255),
@@ -225,7 +221,7 @@ mod tests {
     #[test]
     fn a_stamp_keeps_only_the_colors_it_uses() {
         let shapes = vec![square(Vec2::ZERO, 2.0, 3), square(Vec2::ONE, 2.0, 1)];
-        let stamp = Stamp::from_shapes(shapes, &palette()).unwrap();
+        let stamp = Stamp::from_shapes(list(shapes), &palette()).unwrap();
         assert_eq!(
             stamp.colors(),
             [Rgba8::new(255, 0, 0, 255), Rgba8::new(0, 0, 255, 255)]
@@ -247,7 +243,7 @@ mod tests {
             .unwrap();
             s
         }];
-        let stamp = Stamp::from_shapes(shapes.clone(), &palette()).unwrap();
+        let stamp = Stamp::from_shapes(list(shapes.clone()), &palette()).unwrap();
         // Placed with their middle near where it was.
         let placed = stamp.placed(Vec2::new(5.3, 2.8), &[PaletteIndex(2)]);
         assert_eq!(placed, shapes);
@@ -255,35 +251,31 @@ mod tests {
 
     #[test]
     fn placing_maps_each_color_and_moves_by_whole_texels() {
-        let stamp = Stamp::from_shapes(vec![square(Vec2::ZERO, 2.0, 1)], &palette()).unwrap();
+        let stamp = Stamp::from_shapes(list(vec![square(Vec2::ZERO, 2.0, 1)]), &palette()).unwrap();
         let placed = stamp.placed(Vec2::new(10.2, 4.7), &[PaletteIndex(7)]);
         assert_eq!(placed, [square(Vec2::new(9.0, 4.0), 2.0, 7)]);
     }
 
     #[test]
-    fn stamps_need_shapes_and_their_colors() {
+    fn stamps_need_their_colors() {
         assert_eq!(
-            Stamp::from_shapes(Vec::new(), &palette()),
-            Err(StampError::NoShapes)
-        );
-        assert_eq!(
-            Stamp::new(Vec::new(), vec![square(Vec2::ZERO, 1.0, 0)]),
+            Stamp::new(Vec::new(), list(vec![square(Vec2::ZERO, 1.0, 0)])),
             Err(StampError::MissingColor { index: 0, len: 0 })
         );
         let red = Rgba8::new(255, 0, 0, 255);
         assert_eq!(
-            Stamp::new(vec![red, red], vec![square(Vec2::ZERO, 1.0, 1)]),
+            Stamp::new(vec![red, red], list(vec![square(Vec2::ZERO, 1.0, 1)])),
             Err(StampError::UnusedColor(0))
         );
         assert_eq!(
-            Stamp::new(vec![red], vec![square(Vec2::splat(2e38), 1.0, 0)]),
+            Stamp::new(vec![red], list(vec![square(Vec2::splat(2e38), 1.0, 0)])),
             Err(StampError::TooFar)
         );
         // Handles out of reach, though the point is near.
         let far = Anchor::smooth(Vec2::ZERO, Vec2::new(1e5, 0.0));
         let shape = Shape::new(vec![far], Style::Fill, PaletteIndex(0)).unwrap();
         assert_eq!(
-            Stamp::new(vec![red], vec![shape.clone()]),
+            Stamp::new(vec![red], list(vec![shape.clone()])),
             Err(StampError::TooFar)
         );
     }
@@ -291,7 +283,7 @@ mod tests {
     #[test]
     fn the_raster_covers_the_bounds_in_stamp_colors() {
         let shapes = vec![square(Vec2::ZERO, 2.0, 3), square(Vec2::ONE, 2.0, 1)];
-        let stamp = Stamp::from_shapes(shapes, &palette()).unwrap();
+        let stamp = Stamp::from_shapes(list(shapes), &palette()).unwrap();
         let raster = stamp.raster(64);
         assert_eq!(raster.size(), UVec2::new(3, 3));
         let (b, r) = (Some(PaletteIndex(1)), Some(PaletteIndex(0)));
@@ -309,7 +301,7 @@ mod tests {
             closed: true,
         })
         .unwrap();
-        let stamp = Stamp::from_shapes(vec![ring], &palette()).unwrap();
+        let stamp = Stamp::from_shapes(list(vec![ring]), &palette()).unwrap();
         let raster = stamp.raster(18);
         assert_eq!(raster.size(), UVec2::new(18, 18));
         let set = raster.pixels().iter().filter(|p| p.is_some()).count();
@@ -334,7 +326,7 @@ mod tests {
         };
         let stamp = Stamp::new(
             vec![Rgba8::new(0, 0, 0, 255)],
-            vec![dot(0.25, 0.25), dot(255.75, 0.25), dot(128.4, 4.4)],
+            list(vec![dot(0.25, 0.25), dot(255.75, 0.25), dot(128.4, 4.4)]),
         )
         .unwrap();
         let raster = stamp.raster(64);
@@ -349,7 +341,7 @@ mod tests {
                 closed: true,
             })
             .unwrap();
-            let stamp = Stamp::from_shapes(vec![thin], &palette()).unwrap();
+            let stamp = Stamp::from_shapes(list(vec![thin]), &palette()).unwrap();
             let set = stamp
                 .raster(64)
                 .pixels()

@@ -2534,7 +2534,8 @@ mod tests {
         let source = Palette::from_colors([black, RED]).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("square.ron");
-        let saved = mint_core::Stamp::from_shapes(vec![square], &source).unwrap();
+        let saved =
+            mint_core::Stamp::from_shapes(mint_core::NonEmpty::one(square), &source).unwrap();
         mint_core::file::save_stamp(&saved, &path).unwrap();
         let stamp = std::sync::Arc::new(mint_core::file::load_stamp(&path).unwrap());
 
@@ -2611,7 +2612,11 @@ mod tests {
             PaletteIndex(0),
         )
         .unwrap();
-        let stamp = mint_core::Stamp::from_shapes(vec![dot], editor.project().palette()).unwrap();
+        let stamp = mint_core::Stamp::from_shapes(
+            mint_core::NonEmpty::one(dot),
+            editor.project().palette(),
+        )
+        .unwrap();
         let mut placing = Placing::new(
             "dot".into(),
             std::sync::Arc::new(stamp),

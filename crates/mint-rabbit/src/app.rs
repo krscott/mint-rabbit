@@ -10,7 +10,8 @@ use eframe::egui_wgpu;
 use glam::{Vec2, Vec3};
 use mint_ac::{Decomp, VillagerRef};
 use mint_core::{
-    Layer, LayerKind, PaletteIndex, Project, Stamp, Texture, TextureContent, TextureId, VariantRef,
+    Layer, LayerKind, NonEmpty, PaletteIndex, Project, Stamp, Texture, TextureContent, TextureId,
+    VariantRef,
 };
 
 use crate::camera::Orbit;
@@ -802,6 +803,9 @@ impl App {
             .iter()
             .filter_map(|&s| layer.shapes().get(s).cloned())
             .collect();
+        let Some(shapes) = NonEmpty::from_vec(shapes) else {
+            return;
+        };
         match Stamp::from_shapes(shapes, project.palette()) {
             Ok(stamp) => {
                 self.dialog = Some(Dialog::SaveStamp {

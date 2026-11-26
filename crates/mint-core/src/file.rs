@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::texture::LayerContent;
 use crate::{
     AlphaMode, Anchor, Axes, Corner, ExportTarget, HalfPoint, Layer, Material, Mesh, Mirror, Model,
-    Modifier, ModifierKind, NodeId, Palette, PaletteIndex, Pose, Project, Radial, Raster, Rgba8,
-    RgbaImage, Shape, ShapeError, Slot, Stamp, StampError, Style, Texture, TextureContent,
+    Modifier, ModifierKind, NodeId, NonEmpty, Palette, PaletteIndex, Pose, Project, Radial, Raster,
+    Rgba8, RgbaImage, Shape, ShapeError, Slot, Stamp, StampError, Style, Texture, TextureContent,
     TextureId, Transform, Triangle, Turns, Variant, Vertex, Wrap,
 };
 
@@ -838,12 +838,14 @@ pub fn load_stamp(path: &Path) -> Result<Stamp, StampFileError> {
         .map(shape)
         .collect::<Result<_, _>>()
         .map_err(|e| StampFileError::Shape(path.to_owned(), e))?;
+    let stamp_error = |e| StampFileError::Stamp(path.to_owned(), e);
+    let shapes = NonEmpty::from_vec(shapes).ok_or_else(|| stamp_error(StampError::NoShapes))?;
     let colors = file
         .colors
         .into_iter()
         .map(|[r, g, b, a]| Rgba8::new(r, g, b, a))
         .collect();
-    Stamp::new(colors, shapes).map_err(|e| StampFileError::Stamp(path.to_owned(), e))
+    Stamp::new(colors, shapes).map_err(stamp_error)
 }
 
 /// Replaces the file at `path` with `bytes` all at once: they are written
@@ -1361,7 +1363,7 @@ mod tests {
         .unwrap();
         Stamp::new(
             vec![Rgba8::new(10, 20, 30, 255), Rgba8::new(200, 100, 0, 128)],
-            vec![curve, dot],
+            NonEmpty::from_vec(vec![curve, dot]).unwrap(),
         )
         .unwrap()
     }

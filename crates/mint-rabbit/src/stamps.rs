@@ -360,6 +360,7 @@ mod tests {
                 Shape::new(vec![Anchor::corner(p)], Style::Fill, PaletteIndex(i as u8)).unwrap()
             })
             .collect();
+        let shapes = mint_core::NonEmpty::from_vec(shapes).unwrap();
         Stamp::new(colors.to_vec(), shapes).unwrap()
     }
 
