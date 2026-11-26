@@ -75,7 +75,10 @@ struct Doc {
 }
 
 impl Doc {
-    fn new(project: Project, path: Option<PathBuf>, generation: u64) -> Self {
+    /// A document for `project`. Its scene is the `generation`th built, and
+    /// its surface finds cutout edges as a view sampling textures `smooth`ly
+    /// or not shows them.
+    fn new(project: Project, path: Option<PathBuf>, generation: u64, smooth: bool) -> Self {
         let variants = vec![0; project.textures().len()];
         let selected = project
             .textures()
@@ -101,7 +104,7 @@ impl Doc {
             selection,
             previews: Previews::default(),
             rename: None,
-            surface: Surface::new(scene.clone(), true),
+            surface: Surface::new(scene.clone(), smooth),
             scene,
             check: None,
         }
@@ -440,7 +443,7 @@ impl App {
 
     fn set_doc(&mut self, project: Project, path: Option<PathBuf>) {
         self.generation += 1;
-        let doc = Doc::new(project, path, self.generation);
+        let doc = Doc::new(project, path, self.generation, self.view.linear_filter);
         self.model.camera = Orbit::framing(doc.scene.mesh.bounds_min, doc.scene.mesh.bounds_max);
         self.texture_view = TextureView::default();
         self.paint.color = PaletteIndex(0);
@@ -1268,10 +1271,9 @@ impl App {
             },
         );
         // The Model View, already drawn this frame, shows the Texture View's
-        // edits and Ghost Cursor in the next.
+        // Ghost Cursor in the next.
         let ghost = self.texture_view.hover().map(|p| (t, p));
-        let edited = doc.scene_for.0 != doc.editor.generation();
-        if edited || ghost != self.texture_ghost {
+        if ghost != self.texture_ghost {
             ui.ctx().request_repaint();
         }
         self.texture_ghost = ghost;
@@ -1542,6 +1544,13 @@ impl eframe::App for App {
             && !ctx.text_edit_focused()
         {
             d.editor.end_gesture();
+        }
+        // Edits after the Model View was drawn, from the Texture View, keys,
+        // or dialogs, show in the next frame.
+        if let Some(d) = &self.doc
+            && d.scene_for.0 != d.editor.generation()
+        {
+            ctx.request_repaint();
         }
         let title = self.title();
         if title != self.title {

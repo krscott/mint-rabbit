@@ -74,8 +74,9 @@ The Model View has two modes, chosen at its top left. In Orbit, drag to turn
 the camera. In Paint, the tools draw on the model where the pointer meets it,
 into the texture there, which a press shows in the Texture View; middle-drag
 turns the camera. A brush, pencil, or eraser stroke that leaves a UV island
-(where the UVs are cut or folded) breaks there into a piece on each UV island,
-and a stroke's part on another texture is dropped. Pen anchors and box corners
+(where the UVs are cut or folded) or crosses a repeat of the texture breaks
+there into a piece on each side, and a stroke's part on another texture is
+dropped. Pen anchors and box corners
 stay on one texture. Select there only picks the shape under a click, and
 Enter, Escape, and Delete work as over the Texture View. In either mode, scroll
 to zoom. The view under the pointer shows what the tool paints around it, and

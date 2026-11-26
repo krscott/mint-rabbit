@@ -63,6 +63,7 @@ impl Surface {
     /// The surface of `scene`, which poses the same triangles as this one's
     /// with other texture pixels, keeping its islands.
     pub fn with_scene(&self, scene: Arc<SceneData>, smooth: bool) -> Self {
+        debug_assert_eq!(scene.mesh.vertices.len(), self.triangles.len() * 3);
         Self {
             scene,
             smooth,
