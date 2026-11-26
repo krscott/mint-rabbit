@@ -115,8 +115,8 @@ impl Doc {
     /// the surface as it was when it began. `generation` counts rebuilds;
     /// `smooth` is whether the view samples textures smoothly.
     fn refresh_scene(&mut self, generation: &mut u64, smooth: bool, dragging: bool) {
-        let key = (self.editor.generation(), self.variants.clone());
-        if self.scene_for != key {
+        if self.scene_stale() {
+            let key = (self.editor.generation(), self.variants.clone());
             *generation += 1;
             self.scene = Arc::new(SceneData::new(
                 self.editor.project(),
@@ -130,6 +130,12 @@ impl Doc {
         if stale && !dragging {
             self.surface = surface.with_scene(self.scene.clone(), smooth);
         }
+    }
+
+    /// Whether the project or the variants shown changed since the scene
+    /// was built.
+    fn scene_stale(&self) -> bool {
+        self.scene_for.0 != self.editor.generation() || self.scene_for.1 != self.variants
     }
 
     /// The painted variant shown in the Texture View, if any.
@@ -1545,10 +1551,10 @@ impl eframe::App for App {
         {
             d.editor.end_gesture();
         }
-        // Edits after the Model View was drawn, from the Texture View, keys,
-        // or dialogs, show in the next frame.
+        // Changes after the Model View was drawn, from the Texture View, its
+        // strip, keys, or dialogs, show in the next frame.
         if let Some(d) = &self.doc
-            && d.scene_for.0 != d.editor.generation()
+            && d.scene_stale()
         {
             ctx.request_repaint();
         }
