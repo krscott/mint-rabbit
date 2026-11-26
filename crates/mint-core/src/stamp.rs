@@ -3,14 +3,14 @@
 
 use glam::{Affine2, UVec2, Vec2};
 
-use crate::{Palette, PaletteIndex, Raster, Rgba8, Shape};
+use crate::{Palette, PaletteIndex, Raster, Rgba8, Shape, Style};
 
 /// A group of shapes with its own colors: each shape's color is an index
-/// into the stamp's colors, not into a project's palette. Shapes are in
-/// texels about an origin on a pixel corner near their middle, so placing
-/// a stamp at a whole-texel offset keeps which pixels it covers.
+/// into the stamp's colors, not into a project's palette. Placing moves the
+/// shapes by whole texels, so they cover the same pixels they did.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stamp {
+    /// Each used by a shape.
     colors: Vec<Rgba8>,
     /// Never empty; each color indexes `colors`.
     shapes: Vec<Shape>,
@@ -24,6 +24,8 @@ pub enum StampError {
     TooManyColors,
     #[error("a stamp shape uses color {index}, but the stamp has {len}")]
     MissingColor { index: u8, len: usize },
+    #[error("stamp color {0} isn't used by any of its shapes")]
+    UnusedColor(usize),
 }
 
 impl Stamp {
@@ -35,22 +37,30 @@ impl Stamp {
         if colors.len() > Palette::MAX_LEN {
             return Err(StampError::TooManyColors);
         }
-        if let Some(s) = shapes
-            .iter()
-            .find(|s| usize::from(s.color().0) >= colors.len())
-        {
-            return Err(StampError::MissingColor {
-                index: s.color().0,
-                len: colors.len(),
-            });
+        let mut used = vec![false; colors.len()];
+        for s in &shapes {
+            let i = usize::from(s.color().0);
+            match used.get_mut(i) {
+                Some(u) => *u = true,
+                None => {
+                    return Err(StampError::MissingColor {
+                        index: s.color().0,
+                        len: colors.len(),
+                    });
+                }
+            }
+        }
+        if let Some(i) = used.iter().position(|u| !u) {
+            return Err(StampError::UnusedColor(i));
         }
         Ok(Self { colors, shapes })
     }
 
     /// A stamp of `shapes`, colored from `palette`, holding only the colors
     /// they use, in palette order. They move by whole texels so that the
-    /// pixel corner nearest the middle of their bounds is the origin.
-    /// Panics if a shape's color isn't in `palette`.
+    /// pixel corner nearest the middle of their bounds is the origin, which
+    /// keeps the numbers in its file small. Panics if a shape's color isn't
+    /// in `palette`.
     pub fn from_shapes(shapes: Vec<Shape>, palette: &Palette) -> Result<Self, StampError> {
         let mut used = vec![false; palette.len()];
         for s in &shapes {
@@ -122,8 +132,8 @@ impl Stamp {
     }
 
     /// The stamp's pixels in its own colors, from the pixel corner at or
-    /// above and left of its bounds, and its shapes scaled down if needed so
-    /// that neither side is over `max_side` pixels.
+    /// above and left of its bounds, and its shapes and stroke widths scaled
+    /// down if needed so that neither side is over `max_side` pixels.
     #[must_use]
     pub fn raster(&self, max_side: u32) -> Raster {
         let (min, max) = self.bounds();
@@ -136,16 +146,14 @@ impl Stamp {
         for s in &self.shapes {
             let mut s = s.clone();
             s.transform(fit);
+            if let Style::Stroke { width, closed } = s.style() {
+                let width = (width * scale).max(f32::MIN_POSITIVE);
+                s.set_style(Style::Stroke { width, closed })
+                    .expect("a positive width");
+            }
             raster.paint_shape(&s);
         }
         raster
-    }
-
-    /// The palette entry each stamp color matches exactly, if every color
-    /// has one: the first entry of that color.
-    #[must_use]
-    pub fn exact_entries(&self, palette: &Palette) -> Option<Vec<PaletteIndex>> {
-        self.colors.iter().map(|&c| palette.find(c)).collect()
     }
 }
 
@@ -158,7 +166,7 @@ fn bounds(shapes: &[Shape]) -> Option<(Vec2, Vec2)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Anchor, Style};
+    use crate::Anchor;
 
     use super::*;
 
@@ -232,6 +240,11 @@ mod tests {
             Stamp::new(Vec::new(), vec![square(Vec2::ZERO, 1.0, 0)]),
             Err(StampError::MissingColor { index: 0, len: 0 })
         );
+        let red = Rgba8::new(255, 0, 0, 255);
+        assert_eq!(
+            Stamp::new(vec![red, red], vec![square(Vec2::ZERO, 1.0, 1)]),
+            Err(StampError::UnusedColor(0))
+        );
     }
 
     #[test]
@@ -247,18 +260,19 @@ mod tests {
     }
 
     #[test]
-    fn exact_entries_need_every_color() {
-        let stamp = Stamp::new(
-            vec![Rgba8::new(0, 0, 255, 255), Rgba8::new(1, 2, 3, 255)],
-            vec![square(Vec2::ZERO, 1.0, 0), square(Vec2::ONE, 1.0, 1)],
-        )
+    fn thumbnails_scale_strokes_too() {
+        // A 64-texel square outline 8 texels wide, drawn at a quarter size.
+        let mut ring = square(Vec2::ZERO, 64.0, 0);
+        ring.set_style(Style::Stroke {
+            width: 8.0,
+            closed: true,
+        })
         .unwrap();
-        assert_eq!(stamp.exact_entries(&palette()), None);
-        let one = Stamp::new(
-            vec![Rgba8::new(0, 0, 255, 255)],
-            vec![square(Vec2::ZERO, 1.0, 0)],
-        )
-        .unwrap();
-        assert_eq!(one.exact_entries(&palette()), Some(vec![PaletteIndex(3)]));
+        let stamp = Stamp::from_shapes(vec![ring], &palette()).unwrap();
+        let raster = stamp.raster(18);
+        assert_eq!(raster.size(), UVec2::new(18, 18));
+        let set = raster.pixels().iter().filter(|p| p.is_some()).count();
+        // A ring 2 pixels wide around a 16-pixel square.
+        assert_eq!(set, 18 * 18 - 14 * 14);
     }
 }

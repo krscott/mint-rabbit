@@ -136,7 +136,7 @@ shapes in that layer.
 _Avoid_: Active layer, current color
 
 **Stamp**:
-A saved group of shapes in the user's stamp library; placing it copies its
+A saved group of shapes in the user's Stamp Library; placing it copies its
 shapes into a layer with no link back, mapping each of its colors to a palette
 entry the user picks.
 _Avoid_: Preset, brush, symbol
@@ -144,7 +144,7 @@ _Avoid_: Preset, brush, symbol
 **Stamp Library**:
 The user's own collection of stamps, shared by all their projects and kept
 outside any of them.
-_Avoid_: Stamp folder, asset library
+_Avoid_: Asset library, stamp set
 
 ### Views
 

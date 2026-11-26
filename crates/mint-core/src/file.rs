@@ -801,25 +801,10 @@ pub fn save_stamp(stamp: &Stamp, path: &Path) -> Result<(), StampFileError> {
         shapes: stamp.shapes().iter().map(shape_file).collect(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(2))?;
-    let io = |e| StampFileError::Io(path.to_owned(), e);
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
-    std::io::Write::write_all(&mut tmp, text.as_bytes()).map_err(io)?;
-    tmp.as_file().sync_all().map_err(io)?;
-    match tmp.persist_noclobber(path) {
-        Ok(_) => {}
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(StampFileError::Exists(path.to_owned()));
-        }
-        Err(e) => return Err(io(e.error)),
-    }
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    write_file(path, text.as_bytes(), false).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => StampFileError::Exists(path.to_owned()),
+        _ => StampFileError::Io(path.to_owned(), e),
+    })
 }
 
 /// Reads the stamp file at `path`.
@@ -853,6 +838,13 @@ pub fn load_stamp(path: &Path) -> Result<Stamp, StampFileError> {
 /// ones for the umask. A failed write removes the new file and leaves the
 /// old one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_file(path, bytes, true)
+}
+
+/// [`write_atomic`], or with `replace` false, the same into a new file
+/// only, failing with [`std::io::ErrorKind::AlreadyExists`] if `path`
+/// exists.
+fn write_file(path: &Path, bytes: &[u8], replace: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -867,7 +859,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    if replace {
+        tmp.persist(path).map_err(|e| e.error)?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|e| e.error)?;
+    }
     // The file is in place; a directory that can't be synced only loses
     // durability, so it isn't an error.
     if let Ok(d) = std::fs::File::open(dir) {

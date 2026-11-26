@@ -57,34 +57,34 @@ pub fn check_name(name: &str) -> Result<&str, String> {
 pub struct Entry {
     /// The file's name without its extension.
     pub name: String,
+    path: PathBuf,
     /// The stamp, or why its file couldn't be read.
     pub stamp: Result<Arc<Stamp>, String>,
     thumbnail: Option<TextureHandle>,
 }
 
 impl Entry {
-    /// The stamp's image in its own colors, drawn the first time it is
-    /// asked for.
+    /// The image of `stamp`, this entry's, in its own colors, drawn the
+    /// first time it is asked for.
     pub fn thumbnail(&mut self, ctx: &egui::Context, stamp: &Stamp) -> TextureHandle {
-        self.thumbnail
-            .get_or_insert_with(|| {
-                let raster = stamp.raster(THUMBNAIL_SIDE);
-                let size = raster.size();
-                let pixels = raster
-                    .pixels()
-                    .iter()
-                    .map(|p| match p {
-                        Some(i) => {
-                            let c = stamp.colors()[usize::from(i.0)];
-                            Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
-                        }
-                        None => Color32::TRANSPARENT,
-                    })
-                    .collect();
-                let image = ColorImage::new([size.x as usize, size.y as usize], pixels);
-                ctx.load_texture("stamp", image, TextureOptions::NEAREST)
-            })
-            .clone()
+        let handle = self.thumbnail.get_or_insert_with(|| {
+            let raster = stamp.raster(THUMBNAIL_SIDE);
+            let size = raster.size();
+            let pixels = raster
+                .pixels()
+                .iter()
+                .map(|p| match p {
+                    Some(i) => {
+                        let c = stamp.colors()[usize::from(i.0)];
+                        Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+                    }
+                    None => Color32::TRANSPARENT,
+                })
+                .collect();
+            let image = ColorImage::new([size.x as usize, size.y as usize], pixels);
+            ctx.load_texture("stamp", image, TextureOptions::NEAREST)
+        });
+        handle.clone()
     }
 }
 
@@ -94,6 +94,8 @@ pub struct Library {
     dir: Result<PathBuf, String>,
     /// By name, ignoring case.
     entries: Vec<Entry>,
+    /// Why the folder couldn't be read, when it exists.
+    problem: Option<String>,
 }
 
 impl Library {
@@ -101,6 +103,7 @@ impl Library {
         let mut library = Self {
             dir,
             entries: Vec::new(),
+            problem: None,
         };
         library.scan();
         library
@@ -108,6 +111,11 @@ impl Library {
 
     pub fn dir(&self) -> Result<&Path, String> {
         self.dir.as_deref().map_err(Clone::clone)
+    }
+
+    /// Why the stamps can't be listed, if they can't.
+    pub fn problem(&self) -> Option<String> {
+        self.dir().err().or_else(|| self.problem.clone())
     }
 
     pub fn entries_mut(&mut self) -> &mut [Entry] {
@@ -118,9 +126,15 @@ impl Library {
     /// stamps.
     pub fn scan(&mut self) {
         self.entries.clear();
+        self.problem = None;
         let Ok(dir) = &self.dir else { return };
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
+        let read = match std::fs::read_dir(dir) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.problem = Some(format!("{}: {e}", dir.display()));
+                return;
+            }
         };
         for item in read.flatten() {
             let path = item.path();
@@ -136,6 +150,7 @@ impl Library {
                 stamp: file::load_stamp(&path)
                     .map(Arc::new)
                     .map_err(|e| e.to_string()),
+                path,
                 thumbnail: None,
             });
         }
@@ -148,9 +163,19 @@ impl Library {
         self.entries.iter().any(|e| e.name == name)
     }
 
+    /// The file a new stamp named `name` goes in.
     fn path(&self, name: &str) -> Result<PathBuf, String> {
         let name = check_name(name)?;
         Ok(self.dir()?.join(format!("{name}.{STAMP_EXTENSION}")))
+    }
+
+    /// The file of the listed stamp named exactly `name`.
+    fn existing(&self, name: &str) -> Result<PathBuf, String> {
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.path.clone())
+            .ok_or_else(|| format!("There's no stamp named {name:?}"))
     }
 
     /// Saves `stamp` as a new stamp named `name`, creating the folder if
@@ -167,14 +192,21 @@ impl Library {
         result
     }
 
-    /// Renames stamp `from` to `to`, unless a stamp has that name.
+    /// Renames stamp `from` to `to`, unless another file has that name.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
-        let (old, new) = (self.path(from)?, self.path(to)?);
-        // A link fails if `new` exists, where a rename would replace it.
-        let result = match std::fs::hard_link(&old, &new) {
-            Ok(()) => std::fs::remove_file(&old).map_err(|e| format!("{}: {e}", old.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(taken(to)),
-            Err(e) => Err(format!("Couldn't rename {}: {e}", old.display())),
+        let (old, new) = (self.existing(from)?, self.path(to)?);
+        // Persisting a temporary path renames without replacing. One that
+        // fails must be kept, or dropping it would delete the stamp.
+        let fail = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => taken(to),
+            _ => format!("Couldn't rename {}: {e}", old.display()),
+        };
+        let result = match tempfile::TempPath::try_from_path(&old) {
+            Ok(temp) => temp.persist_noclobber(&new).map_err(|e| {
+                let _ = e.path.keep();
+                fail(e.error)
+            }),
+            Err(e) => Err(fail(e)),
         };
         self.scan();
         result
@@ -182,7 +214,7 @@ impl Library {
 
     /// Removes stamp `name`'s file.
     pub fn delete(&mut self, name: &str) -> Result<(), String> {
-        let path = self.path(name)?;
+        let path = self.existing(name)?;
         let result = std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()));
         self.scan();
         result
@@ -213,13 +245,6 @@ impl Choice {
     fn entry(palette: &Palette, i: PaletteIndex) -> Self {
         Self::Entry(i, palette.colors()[usize::from(i.0)])
     }
-}
-
-/// For each of `stamp`'s colors, the palette entry it matches exactly, if
-/// every color has one.
-pub fn exact_choices(stamp: &Stamp, palette: &Palette) -> Option<Vec<Choice>> {
-    let entries = stamp.exact_entries(palette)?;
-    Some(entries.iter().map(|&i| Choice::entry(palette, i)).collect())
 }
 
 /// For each of `stamp`'s colors, the nearest palette entry, or a new one if
@@ -260,9 +285,13 @@ pub struct Placing {
 
 impl Placing {
     /// `stamp` named `name`, its colors chosen already if each matches a
-    /// palette entry exactly.
+    /// palette entry exactly: the first of that color.
     pub fn new(name: String, stamp: Arc<Stamp>, palette: &Palette) -> Self {
-        let choices = exact_choices(&stamp, palette);
+        let choices = stamp
+            .colors()
+            .iter()
+            .map(|&c| Some(Choice::entry(palette, palette.find(c)?)))
+            .collect();
         Self {
             name,
             stamp,
@@ -271,24 +300,27 @@ impl Placing {
     }
 
     /// The choices, if each entry chosen still has the color it was chosen
-    /// with, or else exact matches if there are some for every color. With
-    /// neither, the choices are dropped, to be made again.
+    /// with; otherwise they are dropped, to be made again.
     pub fn current(&mut self, palette: &Palette) -> Option<Vec<Choice>> {
         let holds = |c: &Choice| match *c {
             Choice::Entry(i, color) => palette.colors().get(usize::from(i.0)) == Some(&color),
             Choice::New => true,
         };
         if !self.choices.as_ref().is_some_and(|c| c.iter().all(holds)) {
-            self.choices = exact_choices(&self.stamp, palette);
+            self.choices = None;
         }
         self.choices.clone()
     }
 
-    /// Adds a palette entry for each distinct color chosen as new, and
-    /// returns the entry each stamp color becomes. On success, the choices
-    /// name those entries from then on.
+    /// Chooses `entries` of `palette`, one per stamp color, from now on.
+    pub fn choose(&mut self, palette: &Palette, entries: &[PaletteIndex]) {
+        self.choices = Some(entries.iter().map(|&i| Choice::entry(palette, i)).collect());
+    }
+
+    /// Adds a palette entry to `project` for each distinct color `choices`
+    /// make new, and returns the entry each stamp color becomes.
     pub fn resolve(
-        &mut self,
+        &self,
         project: &mut Project,
         choices: &[Choice],
     ) -> Result<Vec<PaletteIndex>, PaletteError> {
@@ -309,8 +341,6 @@ impl Placing {
             };
             entries.push(entry);
         }
-        let palette = project.palette();
-        self.choices = Some(entries.iter().map(|&i| Choice::entry(palette, i)).collect());
         Ok(entries)
     }
 }
@@ -390,6 +420,13 @@ mod tests {
             .collect();
         assert_eq!(names, ["Eye left"]);
 
+        // Names are taken as they are: deleting " Eye left" leaves
+        // "Eye left".
+        std::fs::copy(root.join("Eye left.ron"), root.join(" Eye left.ron")).unwrap();
+        library.scan();
+        library.delete(" Eye left").unwrap();
+        assert!(root.join("Eye left.ron").is_file() && !root.join(" Eye left.ron").exists());
+
         // Other files are ignored, and broken stamps listed with why.
         std::fs::write(root.join("notes.txt"), "").unwrap();
         std::fs::write(root.join("broken.ron"), "(").unwrap();
@@ -415,13 +452,15 @@ mod tests {
         );
         placing.choices = Some(nearest.clone());
         assert_eq!(placing.current(&palette), Some(nearest));
-        // Moved entries drop the choices.
-        let swapped = Palette::from_colors([BLUE, RED]).unwrap();
+        // Moved entries drop the choices, even where other entries match
+        // exactly, since the user may have chosen otherwise.
+        let swapped = Palette::from_colors([GREEN, BLUE, RED]).unwrap();
         assert_eq!(placing.current(&swapped), None);
-        // Exact matches are taken again without asking.
-        let exact = Palette::from_colors([GREEN, BLUE]).unwrap();
+        assert_eq!(placing.current(&palette), None);
+        // A new stamp takes exact matches without asking.
+        let exact = Placing::new("s".into(), s, &swapped);
         assert_eq!(
-            placing.current(&exact),
+            exact.choices,
             Some(vec![
                 Choice::Entry(PaletteIndex(1), BLUE),
                 Choice::Entry(PaletteIndex(0), GREEN)
@@ -451,7 +490,8 @@ mod tests {
         let entries = placing.resolve(&mut project, &choices).unwrap();
         assert_eq!(entries, [PaletteIndex(1), PaletteIndex(2), PaletteIndex(2)]);
         assert_eq!(project.palette().colors(), [BLUE, RED, GREEN]);
-        // From then on, placing reuses them.
+        // Chosen, placing reuses them from then on.
+        placing.choose(project.palette(), &entries);
         assert_eq!(
             placing.current(project.palette()),
             Some(vec![

@@ -25,13 +25,14 @@ decomp… opens another checkout.
 The thumbnails above the Texture View choose the texture it shows and, for a
 texture with several, the variant. Paint in it with the tools at its left:
 Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R) for shapes,
-Pencil (N), Eraser (Shift+E), and Fill (G) for pixels, and Stamp (S). Painting goes on the
-picked layer, which must be visible and unlocked, in the picked palette color
-and the style set in the bar above the view. A vector layer holds shapes; a
-raster layer holds pixels, and Pen, Ellipse, and Rectangle paint their finished
-shape into it. Tools that don't fit the picked layer are disabled. With the
-Select tool and shapes picked, that bar shows and changes their style instead,
-and can recolor, duplicate, reorder, and move them to another layer.
+Pencil (N), Eraser (Shift+E), and Fill (G) for pixels, and Stamp (S).
+Painting goes on the picked layer, which must be visible and unlocked, in the
+picked palette color and the style set in the bar above the view. A vector
+layer holds shapes; a raster layer holds pixels, and Pen, Ellipse, and
+Rectangle paint their finished shape into it. Tools that don't fit the picked
+layer are disabled. With the Select tool and shapes picked, that bar shows and
+changes their style instead, and can recolor, duplicate, reorder, and move them
+to another layer.
 
 The panel at the right holds the palette and the layers of the variant shown.
 An imported image arrives as a locked raster layer named Base. Pixels no
@@ -93,7 +94,8 @@ picks the shape under a click, and Enter, Escape, and Delete work as over the
 Texture View. In either mode, scroll to zoom. The view under the pointer shows
 what the tool paints around it, and the Ghost Cursor shows the same at the
 pointer's matching point in the other view, on every part of the model that
-shows that texture point; View > Ghost Cursor in the other view turns it off.
+shows that texture point (for a stamp, the box around it); View > Ghost Cursor
+in the other view turns it off.
 
 A project saves as a folder (File > Save, Save as). The File menu's exports
 either replace the imported villager's texture set in the decomp, after which

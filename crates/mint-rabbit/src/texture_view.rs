@@ -28,8 +28,6 @@ const BRUSH_TOLERANCE: f32 = 0.25;
 const GUIDE_MARGIN: f32 = 16.0;
 /// How far outside the image a mirror line's handles sit, in screen points.
 const GUIDE_REACH: f32 = 9.0;
-/// The key of the edit that places a stamp, palette entries and all.
-const STAMP_EDIT: &str = "stamp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -1792,6 +1790,23 @@ fn edit_picked_layer<T>(
     continuous: Option<&str>,
     f: impl FnOnce(&mut Layer) -> T,
 ) -> Result<T, String> {
+    let prepare = |_: &mut Project| Ok(());
+    edit_prepared_layer(editor, selection, r, tool, continuous, prepare, |l, ()| {
+        f(l)
+    })
+}
+
+/// [`edit_picked_layer`], after the project edit `prepare`, such as adding
+/// palette entries, in the same step; `f` takes what `prepare` returns.
+fn edit_prepared_layer<P, T>(
+    editor: &mut Editor,
+    selection: &mut Selection,
+    r: VariantRef,
+    tool: Tool,
+    continuous: Option<&str>,
+    prepare: impl FnOnce(&mut Project) -> Result<P, String>,
+    f: impl FnOnce(&mut Layer, P) -> T,
+) -> Result<T, String> {
     drawable(editor.project(), r, selection)?;
     let layers = editor.project().variant(r).layers();
     let layer = if layers.is_empty() {
@@ -1809,22 +1824,25 @@ fn edit_picked_layer<T>(
         let tool = tool.label().to_lowercase();
         return Err(format!("The {tool} doesn't draw on {kind} layers."));
     }
-    let edit = |v: &mut mint_core::Variant| {
-        if v.layers().is_empty() {
-            let first = if tool.works_on(LayerKind::Vector) {
-                Layer::new("Layer 1")
-            } else {
-                Layer::raster("Layer 1", Raster::clear(v.size()))
-            };
-            v.insert_layer(0, first);
-        }
-        f(&mut v.layers_mut()[layer])
+    let edit = |project: &mut Project| {
+        let prepared = prepare(project)?;
+        let edit = |v: &mut mint_core::Variant| {
+            if v.layers().is_empty() {
+                let first = if tool.works_on(LayerKind::Vector) {
+                    Layer::new("Layer 1")
+                } else {
+                    Layer::raster("Layer 1", Raster::clear(v.size()))
+                };
+                v.insert_layer(0, first);
+            }
+            f(&mut v.layers_mut()[layer], prepared)
+        };
+        project.edit_variant(r, edit).map_err(|e| e.to_string())
     };
     let out = match continuous {
-        Some(key) => editor.edit_variant_continuous(key, r, edit),
-        None => editor.edit_variant(r, edit),
-    };
-    let out = out.map_err(|e| e.to_string())?;
+        Some(key) => editor.edit_continuous(key, edit),
+        None => editor.edit(edit),
+    }?;
     selection.layer = layer;
     Ok(out)
 }
@@ -1937,37 +1955,34 @@ fn place_stamp(canvas: Canvas<'_>, r: VariantRef, p: Vec2) {
     let Some(choices) = placing.current(editor.project().palette()) else {
         return;
     };
-    let before = placing.choices.clone();
-    let entries = editor.edit_continuous(STAMP_EDIT, |project| placing.resolve(project, &choices));
-    let placed = entries.map_err(|e| e.to_string()).and_then(|entries| {
+    let resolve = |project: &mut Project| {
+        placing
+            .resolve(project, &choices)
+            .map_err(|e| e.to_string())
+    };
+    let place = |l: &mut Layer, entries: Vec<PaletteIndex>| {
         let shapes = placing.stamp.placed(p, &entries);
-        edit_picked_layer(editor, selection, r, Tool::Stamp, Some(STAMP_EDIT), |l| {
-            let painted = l.edit_raster(|raster| {
-                for s in &shapes {
-                    raster.paint_shape(s);
-                }
-            });
-            if painted.is_some() {
-                return None;
+        let painted = l.edit_raster(|raster| {
+            for s in &shapes {
+                raster.paint_shape(s);
             }
-            let start = l.shapes().len();
-            for s in shapes {
-                l.insert_shape(l.shapes().len(), s);
-            }
-            Some(start..l.shapes().len())
-        })
-    });
-    match placed {
-        Ok(shapes) => {
-            editor.end_gesture();
+        });
+        if painted.is_some() {
+            return (entries, None);
+        }
+        let start = l.shapes().len();
+        for s in shapes {
+            l.insert_shape(l.shapes().len(), s);
+        }
+        (entries, Some(start..l.shapes().len()))
+    };
+    match edit_prepared_layer(editor, selection, r, Tool::Stamp, None, resolve, place) {
+        Ok((entries, shapes)) => {
+            placing.choose(editor.project().palette(), &entries);
             selection.shapes = shapes.into_iter().flatten().collect();
             selection.anchor = None;
         }
-        Err(why) => {
-            editor.revert_gesture(STAMP_EDIT);
-            placing.choices = before;
-            *message = Some(why);
-        }
+        Err(why) => *message = Some(why),
     }
 }
 

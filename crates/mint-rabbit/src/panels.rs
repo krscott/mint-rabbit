@@ -14,7 +14,13 @@ use crate::scene;
 use crate::texture_view::{self, Paint, Selection, Tool};
 
 /// Most colors an Animal Crossing villager's palette holds.
-pub const AC_PALETTE: usize = 16;
+const AC_PALETTE: usize = 16;
+
+/// Most colors the project's export target allows in its palette, if it
+/// sets a limit below the palette's own.
+pub fn palette_limit(project: &mint_core::Project) -> Option<usize> {
+    (project.target().id == mint_ac::TARGET).then_some(AC_PALETTE)
+}
 
 /// What the style bar's layer menu does.
 const TO_LAYER: &str = "Move to another layer";
@@ -114,10 +120,10 @@ pub fn palette(
     }
     ui.horizontal(|ui| {
         ui.strong("Palette");
-        if project.target().id == mint_ac::TARGET {
-            let text = format!("{} of {AC_PALETTE} colors", colors.len());
+        if let Some(limit) = palette_limit(project) {
+            let text = format!("{} of {limit} colors", colors.len());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if colors.len() > AC_PALETTE {
+                if colors.len() > limit {
                     ui.colored_label(Color32::from_rgb(255, 170, 90), text);
                 } else {
                     ui.weak(text);

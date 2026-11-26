@@ -12,6 +12,7 @@ lucide-icons = "1.78.0"
 mint-ac = { version = "0.1.0", path = "../mint-ac" }
 mint-core = { version = "0.1.0", path = "../mint-core" }
 rfd = "0.18.0"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true
@@ -19,4 +20,3 @@ workspace = true
 [dev-dependencies]
 png = "0.18.1"
 pollster = "1.0.3"
-tempfile = "3.27.0"

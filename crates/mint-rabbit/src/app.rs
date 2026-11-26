@@ -55,6 +55,9 @@ const STAMP_THUMBNAIL: egui::Vec2 = egui::vec2(48.0, 40.0);
 /// Most height the Stamp Library's thumbnails take before they scroll.
 const STAMPS_HEIGHT: f32 = 150.0;
 
+/// Most height the stamp colors dialog's rows take before they scroll.
+const STAMP_COLORS_HEIGHT: f32 = 360.0;
+
 pub struct Options {
     pub decomp: Option<PathBuf>,
     /// Game version the decomp was built for, such as `GAFE01_00`.
@@ -775,7 +778,10 @@ impl App {
         };
         let mut picked = doc.selection.shapes.clone();
         picked.sort_unstable();
-        let shapes = picked.iter().map(|&s| layer.shapes()[s].clone()).collect();
+        let shapes = picked
+            .iter()
+            .filter_map(|&s| layer.shapes().get(s).cloned())
+            .collect();
         match Stamp::from_shapes(shapes, project.palette()) {
             Ok(stamp) => {
                 self.dialog = Some(Dialog::SaveStamp {
@@ -1097,7 +1103,7 @@ impl App {
             .as_ref()
             .filter(|_| self.tool == Tool::Stamp)
             .map(|p| p.name.clone());
-        let missing = self.library.dir().err();
+        let missing = self.library.problem();
         let mut action = None;
         let header = egui::CollapsingHeader::new(egui::RichText::new("Stamps").strong())
             .id_salt("stamps")
@@ -1807,8 +1813,13 @@ impl App {
     }
 
     fn rename_stamp_dialog(&mut self, ctx: &egui::Context, from: String, mut name: String) {
-        let problem = self.stamp_name_problem(&name);
-        let choice = modal(ctx, "Rename stamp", "Rename", problem.is_none(), |ui| {
+        // The name it has needs no complaint, but renames nothing.
+        let unchanged = name.trim() == from;
+        let problem = (!unchanged)
+            .then(|| self.stamp_name_problem(&name))
+            .flatten();
+        let enabled = !unchanged && problem.is_none();
+        let choice = modal(ctx, "Rename stamp", "Rename", enabled, |ui| {
             ui.label(format!("A new name for {from}."));
             Self::stamp_name_field(ui, &mut name, problem.as_deref())
         });
@@ -1838,53 +1849,57 @@ impl App {
         let project = doc.editor.project();
         let palette = project.palette().colors();
         let added = stamps::new_entries(&placing.stamp, &choices);
-        let choice = modal(ctx, "Stamp colors", "Place", true, |ui| {
+        let choice = modal(ctx, "Stamp colors", "Use", true, |ui| {
             ui.label(format!(
                 "The palette entry each color of {} becomes.",
                 placing.name
             ));
-            egui::Grid::new("stamp colors")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
+            // Many colors scroll, keeping the buttons in view.
+            egui::ScrollArea::vertical()
+                .id_salt("stamp colors")
+                .max_height(STAMP_COLORS_HEIGHT)
                 .show(ui, |ui| {
-                    for (color, choice) in placing.stamp.colors().iter().zip(&mut choices) {
-                        let shown = scene::display_color(project, *color);
-                        panels::swatch(ui, shown, false).on_hover_text(format!(
-                            "Stamp color #{:02X}{:02X}{:02X}, alpha {}",
-                            color.r, color.g, color.b, color.a
-                        ));
-                        ui.horizontal_wrapped(|ui| {
-                            for (i, &c) in palette.iter().enumerate() {
-                                let index = PaletteIndex(i as u8);
-                                let picked = matches!(*choice, Choice::Entry(j, _) if j == index);
-                                let shown = scene::display_color(project, c);
-                                if panels::swatch(ui, shown, picked)
-                                    .on_hover_text(format!("Entry {i}"))
-                                    .clicked()
-                                {
-                                    *choice = Choice::Entry(index, c);
-                                }
-                            }
-                            if ui
-                                .selectable_label(*choice == Choice::New, "New")
-                                .on_hover_text("Add the stamp color to the palette")
-                                .clicked()
-                            {
-                                *choice = Choice::New;
+                    egui::Grid::new("stamp colors")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for (color, choice) in placing.stamp.colors().iter().zip(&mut choices) {
+                                let shown = scene::display_color(project, *color);
+                                panels::swatch(ui, shown, false).on_hover_text(format!(
+                                    "Stamp color #{:02X}{:02X}{:02X}, alpha {}",
+                                    color.r, color.g, color.b, color.a
+                                ));
+                                ui.horizontal_wrapped(|ui| {
+                                    for (i, &c) in palette.iter().enumerate() {
+                                        let index = PaletteIndex(i as u8);
+                                        let picked =
+                                            matches!(*choice, Choice::Entry(j, _) if j == index);
+                                        let shown = scene::display_color(project, c);
+                                        if panels::swatch(ui, shown, picked)
+                                            .on_hover_text(format!("Entry {i}"))
+                                            .clicked()
+                                        {
+                                            *choice = Choice::Entry(index, c);
+                                        }
+                                    }
+                                    if ui
+                                        .selectable_label(*choice == Choice::New, "New")
+                                        .on_hover_text("Add the stamp color to the palette")
+                                        .clicked()
+                                    {
+                                        *choice = Choice::New;
+                                    }
+                                });
+                                ui.end_row();
                             }
                         });
-                        ui.end_row();
-                    }
                 });
-            if project.target().id == mint_ac::TARGET && palette.len() + added > panels::AC_PALETTE
+            if let Some(limit) = panels::palette_limit(project)
+                && palette.len() + added > limit
             {
                 ui.colored_label(
                     WARNING,
-                    format!(
-                        "This makes {} of {} colors",
-                        palette.len() + added,
-                        panels::AC_PALETTE
-                    ),
+                    format!("This makes {} of {limit} colors", palette.len() + added),
                 );
             }
             false
