@@ -12,8 +12,6 @@ use mint_core::{Palette, PaletteError, PaletteIndex, Project, Rgba8, Stamp};
 /// Longest stamp name, in bytes, leaving room in a file name for the
 /// extension.
 const MAX_NAME: usize = 200;
-/// Most pixels a side of a stamp's thumbnail image has.
-const THUMBNAIL_SIDE: u32 = 64;
 
 /// The library's folder: `mint-rabbit/stamps` in the XDG data directory,
 /// `$XDG_DATA_HOME` or else `~/.local/share`.
@@ -64,11 +62,16 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The image of `stamp`, this entry's, in its own colors, drawn the
-    /// first time it is asked for.
-    pub fn thumbnail(&mut self, ctx: &egui::Context, stamp: &Stamp) -> TextureHandle {
+    /// The image of `stamp`, this entry's, in its own colors, at most
+    /// `max_side` pixels a side, drawn the first time it is asked for.
+    pub fn thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        stamp: &Stamp,
+        max_side: u32,
+    ) -> TextureHandle {
         let handle = self.thumbnail.get_or_insert_with(|| {
-            let raster = stamp.raster(THUMBNAIL_SIDE);
+            let raster = stamp.raster(max_side);
             let size = raster.size();
             let pixels = raster
                 .pixels()

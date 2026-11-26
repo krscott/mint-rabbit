@@ -316,11 +316,16 @@ fn ghost(
 
 /// Opens `dir` in the desktop's file manager.
 fn open_folder(dir: &Path) -> Result<(), String> {
-    let child = std::process::Command::new("xdg-open")
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = std::process::Command::new(opener)
         .arg(dir)
         .spawn()
-        .map_err(|e| format!("Couldn't open {} with xdg-open: {e}", dir.display()))?;
-    // Reaped once it exits, which xdg-open does as soon as it hands over.
+        .map_err(|e| format!("Couldn't open {} with {opener}: {e}", dir.display()))?;
+    // Reaped once it exits, which the opener does as soon as it hands over.
     std::thread::spawn(move || {
         let mut child = child;
         let _ = child.wait();
@@ -1131,7 +1136,11 @@ impl App {
                                         Ok(stamp) => {
                                             let picked = armed.as_ref() == Some(&name);
                                             let r = thumbnail(ui, STAMP_THUMBNAIL, picked, |ctx| {
-                                                entry.thumbnail(ctx, &stamp)
+                                                // As many pixels as it shows, so
+                                                // nothing drawn is dropped.
+                                                let side = STAMP_THUMBNAIL.min_elem()
+                                                    * ctx.pixels_per_point();
+                                                entry.thumbnail(ctx, &stamp, side as u32)
                                             });
                                             let hover = match &ready {
                                                 Ok(()) => format!("{name}\nClick to place it"),
@@ -1181,7 +1190,8 @@ impl App {
                         });
                     });
             });
-        let id = ui.make_persistent_id("stamps");
+        // The header keeps its state under its own id.
+        let id = header.header_response.id;
         let open =
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
                 .is_open();
