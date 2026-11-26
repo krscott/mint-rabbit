@@ -5,8 +5,9 @@ use glam::{Affine2, UVec2, Vec2};
 
 use crate::{Palette, PaletteIndex, Raster, Rgba8, Shape, Style};
 
-/// Farthest a stamp's shapes may reach from its origin, in texels: far past
-/// any texture's size, and near enough that placing never overflows.
+/// Farthest a stamp's points, curve controls, and stroke widths may reach
+/// from its origin, in texels: far past any texture's size, and near enough
+/// that drawing and placing never overflow.
 const MAX_REACH: f32 = 65536.0;
 
 /// A group of shapes with its own colors: each shape's color is an index
@@ -59,8 +60,7 @@ impl Stamp {
         if let Some(i) = used.iter().position(|u| !u) {
             return Err(StampError::UnusedColor(i));
         }
-        let (min, max) = bounds(&shapes).ok_or(StampError::NoShapes)?;
-        if min.min_element() < -MAX_REACH || max.max_element() > MAX_REACH {
+        if !shapes.iter().all(within_reach) {
             return Err(StampError::TooFar);
         }
         Ok(Self { colors, shapes })
@@ -156,9 +156,11 @@ impl Stamp {
         for s in &self.shapes {
             let mut s = s.clone();
             s.transform(fit);
-            // Down to a pixel wide, so thin strokes still show.
-            if let Style::Stroke { width, closed } = s.style() {
-                let width = (width * scale).max(width.min(1.0));
+            // Scaled down to no less than a pixel, so thin strokes show.
+            if let Style::Stroke { width, closed } = s.style()
+                && scale < 1.0
+            {
+                let width = (width * scale).max(1.0);
                 s.set_style(Style::Stroke { width, closed })
                     .expect("a positive width");
             }
@@ -166,6 +168,22 @@ impl Stamp {
         }
         raster
     }
+}
+
+/// Whether `shape`'s points, curve controls, and stroke width are within
+/// [`MAX_REACH`] of the origin; never for a value that isn't a number.
+fn within_reach(shape: &Shape) -> bool {
+    let near = |v: f32| v.abs() <= MAX_REACH;
+    let width = match shape.style() {
+        Style::Fill => 0.0,
+        Style::Stroke { width, .. } => width,
+    };
+    near(width)
+        && shape.anchors().iter().all(|a| {
+            [a.point, a.point + a.handle_in, a.point + a.handle_out]
+                .iter()
+                .all(|p| near(p.x) && near(p.y))
+        })
 }
 
 fn bounds(shapes: &[Shape]) -> Option<(Vec2, Vec2)> {
@@ -260,6 +278,22 @@ mod tests {
             Stamp::new(vec![red], vec![square(Vec2::splat(2e38), 1.0, 0)]),
             Err(StampError::TooFar)
         );
+        // Handles out of reach, though the point is near.
+        let far = Anchor::smooth(Vec2::ZERO, Vec2::new(1e5, 0.0));
+        let shape = Shape::new(vec![far], Style::Fill, PaletteIndex(0)).unwrap();
+        assert_eq!(
+            Stamp::new(vec![red], vec![shape.clone()]),
+            Err(StampError::TooFar)
+        );
+        // Shapes whose middle overflows are refused, not shifted to NaN.
+        let mut other = shape;
+        other.transform(Affine2::from_translation(Vec2::new(-3e38, 0.0)));
+        let opposite = square(Vec2::new(3e38, 0.0), 1.0, 0);
+        let palette = Palette::from_colors([red]).unwrap();
+        assert_eq!(
+            Stamp::from_shapes(vec![other, opposite], &palette),
+            Err(StampError::TooFar)
+        );
     }
 
     #[test]
@@ -290,20 +324,23 @@ mod tests {
         // A ring 2 pixels wide around a 16-pixel square.
         assert_eq!(set, 18 * 18 - 14 * 14);
 
-        // A 1-texel outline 200 texels across stays a pixel wide.
-        let mut thin = square(Vec2::ZERO, 200.0, 0);
-        thin.set_style(Style::Stroke {
-            width: 1.0,
-            closed: true,
-        })
-        .unwrap();
-        let stamp = Stamp::from_shapes(vec![thin], &palette()).unwrap();
-        let set = stamp
-            .raster(64)
-            .pixels()
-            .iter()
-            .filter(|p| p.is_some())
-            .count();
-        assert!(set > 4 * 50, "{set} pixels set");
+        // Outlines thinner than a texel, 200 texels across, stay a pixel
+        // wide.
+        for width in [1.0, 0.5] {
+            let mut thin = square(Vec2::splat(0.25), 200.0, 0);
+            thin.set_style(Style::Stroke {
+                width,
+                closed: true,
+            })
+            .unwrap();
+            let stamp = Stamp::from_shapes(vec![thin], &palette()).unwrap();
+            let set = stamp
+                .raster(64)
+                .pixels()
+                .iter()
+                .filter(|p| p.is_some())
+                .count();
+            assert!(set > 4 * 50, "width {width}: {set} pixels set");
+        }
     }
 }

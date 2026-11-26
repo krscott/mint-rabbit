@@ -60,8 +60,6 @@ const STAMP_COLORS_HEIGHT: f32 = 360.0;
 /// Height of the stamp colors dialog without its rows, which the window
 /// keeps room for.
 const STAMP_COLORS_ROOM: f32 = 180.0;
-/// Height of one of the stamp colors dialog's rows.
-const STAMP_ROW: f32 = 26.0;
 
 pub struct Options {
     pub decomp: Option<PathBuf>,
@@ -1855,16 +1853,18 @@ impl App {
         let palette = project.palette().colors();
         let added = stamps::new_entries(&placing.stamp, &choices);
         let choice = modal(ctx, "Stamp colors", "Use", true, |ui| {
-            ui.label(format!(
-                "The palette entry each color of {} becomes.",
-                placing.name
-            ));
-            // Many colors scroll, keeping the buttons in view.
+            // Many colors, or a long name, scroll, keeping the buttons in
+            // view.
             let room = ui.ctx().content_rect().height() - STAMP_COLORS_ROOM;
+            let row = ui.spacing().interact_size.y;
             egui::ScrollArea::vertical()
                 .id_salt("stamp colors")
-                .max_height(room.clamp(STAMP_ROW, STAMP_COLORS_HEIGHT))
+                .max_height(room.clamp(row, STAMP_COLORS_HEIGHT))
                 .show(ui, |ui| {
+                    ui.label(format!(
+                        "The palette entry each color of {} becomes.",
+                        placing.name
+                    ));
                     egui::Grid::new("stamp colors")
                         .num_columns(2)
                         .spacing([12.0, 6.0])
