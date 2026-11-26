@@ -24,8 +24,8 @@ decomp… opens another checkout.
 
 The thumbnails above the Texture View choose the texture it shows and, for a
 texture with several, the variant. Paint in it with the tools at its left:
-Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R) for shapes, and
-Pencil (N), Eraser (Shift+E), and Fill (G) for pixels. Painting goes on the
+Select (V), Pen (P), Brush (B), Ellipse (E), and Rectangle (R) for shapes,
+Pencil (N), Eraser (Shift+E), and Fill (G) for pixels, and Stamp (S). Painting goes on the
 picked layer, which must be visible and unlocked, in the picked palette color
 and the style set in the bar above the view. A vector layer holds shapes; a
 raster layer holds pixels, and Pen, Ellipse, and Rectangle paint their finished
@@ -38,6 +38,18 @@ An imported image arrives as a locked raster layer named Base. Pixels no
 visible layer covers show and export as the first palette entry. Double-click a
 layer's name to rename it, or right-click it to rename, duplicate, copy to
 other variants, rasterize, or delete it.
+
+Stamps are saved groups of shapes, kept in the Stamp Library: one RON file per
+stamp in `$XDG_DATA_HOME/mint-rabbit/stamps` (File > Open stamp folder), shared
+by every project and easy to copy or version. With shapes picked, Edit > Save
+as stamp… or the stamp button in the style bar saves them with their colors
+under a name. The Stamps section at the bottom of the dock lists them; it reads
+the folder again when opened, and right-clicking a stamp renames or deletes it.
+Clicking a stamp picks the Stamp tool (S), first asking which palette entry,
+or new entry, each stamp color becomes, unless each matches an entry exactly.
+Each click in either view then places a copy centered under the pointer, at
+the texel size it was saved at, as one undo step: on a vector layer as shapes,
+picked so the style bar can edit them, and on a raster layer as pixels.
 
 Under the layers, Modifiers lists the picked layer's modifiers, which change
 what it shows and exports without changing what it holds. Mirror reflects the

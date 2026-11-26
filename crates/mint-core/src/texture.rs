@@ -70,6 +70,25 @@ impl Palette {
         usize::from(index.0) < self.entries.len()
     }
 
+    /// The first entry of exactly `color`.
+    #[must_use]
+    pub fn find(&self, color: Rgba8) -> Option<PaletteIndex> {
+        let i = self.entries.iter().position(|&c| c == color)?;
+        Some(PaletteIndex(i as u8))
+    }
+
+    /// The entry nearest `color` by squared distance between their RGBA
+    /// values, the first of those as near; `None` if the palette is empty.
+    #[must_use]
+    pub fn nearest(&self, color: Rgba8) -> Option<PaletteIndex> {
+        let distance = |c: Rgba8| -> u32 {
+            let d = |a: u8, b: u8| u32::from(a.abs_diff(b)).pow(2);
+            d(c.r, color.r) + d(c.g, color.g) + d(c.b, color.b) + d(c.a, color.a)
+        };
+        let i = (0..self.entries.len()).min_by_key(|&i| distance(self.entries[i]))?;
+        Some(PaletteIndex(i as u8))
+    }
+
     pub(crate) fn set(&mut self, index: PaletteIndex, color: Rgba8) {
         self.entries[usize::from(index.0)] = color;
     }
@@ -966,6 +985,29 @@ mod tests {
 
     fn px(r: &Raster) -> Vec<Option<u8>> {
         r.pixels().iter().map(|p| p.map(|i| i.0)).collect()
+    }
+
+    #[test]
+    fn the_nearest_entry_is_the_first_of_the_closest() {
+        let palette = Palette::from_colors([
+            Rgba8::new(0, 0, 0, 255),
+            Rgba8::new(200, 0, 0, 255),
+            Rgba8::new(0, 0, 200, 255),
+            Rgba8::new(200, 0, 0, 255),
+        ])
+        .unwrap();
+        let nearest = |r, b, a| palette.nearest(Rgba8::new(r, 0, b, a));
+        assert_eq!(nearest(180, 10, 255), Some(PaletteIndex(1)));
+        assert_eq!(nearest(150, 150, 255), Some(PaletteIndex(1)));
+        assert_eq!(nearest(10, 0, 255), Some(PaletteIndex(0)));
+        // Alpha counts like any channel.
+        assert_eq!(nearest(0, 0, 0), Some(PaletteIndex(0)));
+        assert_eq!(
+            palette.find(Rgba8::new(200, 0, 0, 255)),
+            Some(PaletteIndex(1))
+        );
+        assert_eq!(palette.find(Rgba8::new(1, 0, 0, 255)), None);
+        assert_eq!(Palette::default().nearest(Rgba8::new(0, 0, 0, 0)), None);
     }
 
     #[test]

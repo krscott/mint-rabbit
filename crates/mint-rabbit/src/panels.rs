@@ -14,7 +14,7 @@ use crate::scene;
 use crate::texture_view::{self, Paint, Selection, Tool};
 
 /// Most colors an Animal Crossing villager's palette holds.
-const AC_PALETTE: usize = 16;
+pub const AC_PALETTE: usize = 16;
 
 /// What the style bar's layer menu does.
 const TO_LAYER: &str = "Move to another layer";
@@ -83,7 +83,7 @@ impl<'a> Target<'a> {
     }
 }
 
-fn swatch(ui: &mut egui::Ui, color: Rgba8, picked: bool) -> egui::Response {
+pub fn swatch(ui: &mut egui::Ui, color: Rgba8, picked: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::click());
     ui.painter().rect_filled(
         rect,
@@ -900,7 +900,7 @@ fn fill_or_stroke(ui: &mut egui::Ui, fill: bool) -> Option<bool> {
 
 /// Says whose style the bar shows, at one width so the controls after it
 /// stay where they are when it changes.
-fn bar_label(ui: &mut egui::Ui, text: &str, hover: &str) {
+pub fn bar_label(ui: &mut egui::Ui, text: &str, hover: &str) {
     let size = [46.0, ui.spacing().interact_size.y];
     ui.add_sized(size, egui::Label::new(RichText::new(text).weak()))
         .on_hover_text(hover);
@@ -913,12 +913,13 @@ fn stroke_width(value: &mut f32) -> egui::DragValue<'_> {
         .suffix(" px")
 }
 
-/// With the Select tool and shapes picked, their style and what else can be
-/// done to them; otherwise the style new shapes are painted in. A drawing
-/// tool picks each shape it adds, and still shows the style of the next.
-pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool: Tool) {
+/// With the Select or Stamp tool and shapes picked, their style and what
+/// else can be done to them; otherwise the style new shapes are painted in.
+/// A drawing tool picks each shape it adds, and still shows the style of the
+/// next. Returns whether saving the picked shapes as a stamp was asked for.
+pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool: Tool) -> bool {
     let layer = t.selection.layer;
-    let picked = if tool == Tool::Select {
+    let picked = if matches!(tool, Tool::Select | Tool::Stamp) {
         t.selection.shapes.clone()
     } else {
         Vec::new()
@@ -927,21 +928,25 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool:
         bar_label(ui, "Tip", "The pencil and eraser tip");
         ui.add(stroke_width(&mut paint.width))
             .on_hover_text("Tip width, rounded to whole pixels");
-        return;
+        return false;
     }
     if tool == Tool::Fill {
         bar_label(ui, "Fill", "The fill tool");
         ui.weak("Fills the joined pixels of one color, on the picked layer only");
-        return;
+        return false;
     }
     let Some(&first) = picked.first() else {
+        if tool == Tool::Stamp {
+            ui.weak("Click to place the stamp, in its own style");
+            return false;
+        }
         bar_label(ui, "New", "The style new shapes are painted in");
         if let Some(fill) = fill_or_stroke(ui, paint.fill) {
             paint.fill = fill;
         }
         ui.add(stroke_width(&mut paint.width))
             .on_hover_text("Stroke width, for strokes and the brush");
-        return;
+        return false;
     };
     let count = match picked.len() {
         1 => "1 picked shape".to_owned(),
@@ -1001,6 +1006,7 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool:
     if icon_button(ui, Icon::Copy, true, "Duplicate").clicked() {
         duplicate(t);
     }
+    let save = icon_button(ui, Icon::Stamp, true, "Save as stamp…").clicked();
     let count = t.layers()[layer].shapes().len();
     let mut sorted = picked.clone();
     sorted.sort_unstable();
@@ -1076,6 +1082,7 @@ pub fn style_bar(ui: &mut egui::Ui, t: &mut Target<'_>, paint: &mut Paint, tool:
             .on_hover_text(TO_LAYER)
             .on_disabled_hover_text(TO_LAYER);
     });
+    save
 }
 
 /// Restyles each of the `picked` shapes with `restyle` of its own style, as

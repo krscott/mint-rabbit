@@ -141,6 +141,11 @@ shapes into a layer with no link back, mapping each of its colors to a palette
 entry the user picks.
 _Avoid_: Preset, brush, symbol
 
+**Stamp Library**:
+The user's own collection of stamps, shared by all their projects and kept
+outside any of them.
+_Avoid_: Stamp folder, asset library
+
 ### Views
 
 **Model View**:

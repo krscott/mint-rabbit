@@ -10,6 +10,7 @@ mod picker;
 mod previews;
 mod render;
 mod scene;
+mod stamps;
 mod surface;
 mod texture_view;
 

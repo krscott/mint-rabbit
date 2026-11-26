@@ -1,5 +1,6 @@
 //! Saving and loading projects as a directory: `project.ron` holds
-//! everything except images, which sit beside it as PNG files.
+//! everything except images, which sit beside it as PNG files. A stamp is
+//! one RON file whose shapes are written as a project's are.
 //!
 //! Raster layers are 8-bit grayscale-and-alpha PNGs: a pixel's gray value is
 //! its palette index, and alpha 0 marks a pixel the layer doesn't set.
@@ -18,8 +19,8 @@ use crate::texture::LayerContent;
 use crate::{
     AlphaMode, Anchor, Axes, Corner, ExportTarget, HalfPoint, Layer, Material, Mesh, Mirror, Model,
     Modifier, ModifierKind, NodeId, Palette, PaletteIndex, Pose, Project, Radial, Raster, Rgba8,
-    RgbaImage, Shape, Slot, Style, Texture, TextureContent, TextureId, Transform, Triangle, Turns,
-    Variant, Vertex, Wrap,
+    RgbaImage, Shape, ShapeError, Slot, Stamp, StampError, Style, Texture, TextureContent,
+    TextureId, Transform, Triangle, Turns, Variant, Vertex, Wrap,
 };
 
 /// The project file inside a project directory.
@@ -29,6 +30,10 @@ const IMAGE_DIR: &str = "textures";
 const MAX_TEXTURE_SIDE: u32 = 8192;
 /// Version of the file layout this build reads and writes.
 const FORMAT: u32 = 1;
+/// The extension of a stamp file.
+pub const STAMP_EXTENSION: &str = "ron";
+/// Version of the stamp file layout this build reads and writes.
+const STAMP_FORMAT: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
@@ -78,6 +83,24 @@ pub enum LoadError {
     Texture(#[from] crate::TextureError),
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StampFileError {
+    #[error("{0} already exists")]
+    Exists(PathBuf),
+    #[error("{0}: {1}")]
+    Io(PathBuf, std::io::Error),
+    #[error("{0}: {1}")]
+    Ron(PathBuf, Box<ron::error::SpannedError>),
+    #[error("could not write the stamp file: {0}")]
+    Encode(#[from] ron::Error),
+    #[error("{0}: stamp format {1} is not supported; this build reads format {STAMP_FORMAT}")]
+    Format(PathBuf, u32),
+    #[error("{0}: {1}")]
+    Shape(PathBuf, ShapeError),
+    #[error("{0}: {1}")]
+    Stamp(PathBuf, StampError),
 }
 
 #[derive(Deserialize)]
@@ -231,6 +254,14 @@ struct ShapeFile {
     style: StyleFile,
     /// Point, incoming handle, and outgoing handle of each anchor.
     anchors: Vec<[[f32; 2]; 3]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StampFile {
+    format: u32,
+    colors: Vec<[u8; 4]>,
+    /// Colors index `colors`.
+    shapes: Vec<ShapeFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -761,6 +792,59 @@ fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     }
 }
 
+/// Writes `stamp` to a new file at `path`, all at once, never replacing a
+/// file already there.
+pub fn save_stamp(stamp: &Stamp, path: &Path) -> Result<(), StampFileError> {
+    let file = StampFile {
+        format: STAMP_FORMAT,
+        colors: stamp.colors().iter().map(|c| c.to_array()).collect(),
+        shapes: stamp.shapes().iter().map(shape_file).collect(),
+    };
+    let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(2))?;
+    let io = |e| StampFileError::Io(path.to_owned(), e);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes()).map_err(io)?;
+    tmp.as_file().sync_all().map_err(io)?;
+    match tmp.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StampFileError::Exists(path.to_owned()));
+        }
+        Err(e) => return Err(io(e.error)),
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Reads the stamp file at `path`.
+pub fn load_stamp(path: &Path) -> Result<Stamp, StampFileError> {
+    let text = std::fs::read_to_string(path).map_err(|e| StampFileError::Io(path.to_owned(), e))?;
+    let ron_error = |e| StampFileError::Ron(path.to_owned(), Box::new(e));
+    let version: Version = ron::from_str(&text).map_err(ron_error)?;
+    if version.format != STAMP_FORMAT {
+        return Err(StampFileError::Format(path.to_owned(), version.format));
+    }
+    let file: StampFile = ron::from_str(&text).map_err(ron_error)?;
+    let shapes = file
+        .shapes
+        .into_iter()
+        .map(shape)
+        .collect::<Result<_, _>>()
+        .map_err(|e| StampFileError::Shape(path.to_owned(), e))?;
+    let colors = file
+        .colors
+        .into_iter()
+        .map(|[r, g, b, a]| Rgba8::new(r, g, b, a))
+        .collect();
+    Stamp::new(colors, shapes).map_err(|e| StampFileError::Stamp(path.to_owned(), e))
+}
+
 /// Replaces the file at `path` with `bytes` all at once: they are written
 /// to a new, uniquely named file beside it (never one already there, such as
 /// a planted link), synced, and renamed over it, and the directory is
@@ -1241,6 +1325,89 @@ mod tests {
             Err(LoadError::Project(
                 crate::ProjectError::MissingPaletteEntry { index: 1, .. }
             ))
+        ));
+    }
+
+    fn stamp() -> Stamp {
+        let curve = Shape::new(
+            vec![
+                Anchor::smooth(Vec2::new(1.0, 2.0), Vec2::new(0.5, -0.25)),
+                Anchor::corner(Vec2::new(4.0, 3.5)),
+            ],
+            Style::Stroke {
+                width: 1.5,
+                closed: false,
+            },
+            PaletteIndex(1),
+        )
+        .unwrap();
+        let dot = Shape::new(
+            vec![Anchor::corner(Vec2::new(-2.0, 0.0))],
+            Style::Fill,
+            PaletteIndex(0),
+        )
+        .unwrap();
+        Stamp::new(
+            vec![Rgba8::new(10, 20, 30, 255), Rgba8::new(200, 100, 0, 128)],
+            vec![curve, dot],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stamps_save_then_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Eye.ron");
+        save_stamp(&stamp(), &path).unwrap();
+        assert_eq!(load_stamp(&path).unwrap(), stamp());
+        // Nothing but the stamp is left behind.
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn saving_a_stamp_never_replaces_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Eye.ron");
+        std::fs::write(&path, "mine").unwrap();
+        assert!(matches!(
+            save_stamp(&stamp(), &path),
+            Err(StampFileError::Exists(p)) if p == path
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn loading_a_stamp_checks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Eye.ron");
+        save_stamp(&stamp(), &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::write(&path, text.replace("format: 1", "format: 2")).unwrap();
+        assert!(matches!(
+            load_stamp(&path),
+            Err(StampFileError::Format(_, 2))
+        ));
+
+        let one_color = text.replace("(10, 20, 30, 255),", "");
+        assert_ne!(one_color, text);
+        std::fs::write(&path, one_color).unwrap();
+        assert!(matches!(
+            load_stamp(&path),
+            Err(StampFileError::Stamp(
+                _,
+                StampError::MissingColor { index: 1, len: 1 }
+            ))
+        ));
+
+        let no_width = text.replace("width: 1.5", "width: 0.0");
+        assert_ne!(no_width, text);
+        std::fs::write(&path, no_width).unwrap();
+        assert!(matches!(
+            load_stamp(&path),
+            Err(StampFileError::Shape(_, ShapeError::BadWidth))
         ));
     }
 }

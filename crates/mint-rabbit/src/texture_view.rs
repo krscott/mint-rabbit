@@ -14,6 +14,7 @@ use mint_core::{
 use crate::editor::Editor;
 use crate::previews::{Previews, checkerboard};
 use crate::scene;
+use crate::stamps::Placing;
 
 /// Pointer distance, in screen points, within which handles and outlines
 /// are hit.
@@ -27,6 +28,8 @@ const BRUSH_TOLERANCE: f32 = 0.25;
 const GUIDE_MARGIN: f32 = 16.0;
 /// How far outside the image a mirror line's handles sit, in screen points.
 const GUIDE_REACH: f32 = 9.0;
+/// The key of the edit that places a stamp, palette entries and all.
+const STAMP_EDIT: &str = "stamp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -38,10 +41,11 @@ pub enum Tool {
     Pencil,
     Eraser,
     Fill,
+    Stamp,
 }
 
 impl Tool {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Select,
         Self::Pen,
         Self::Brush,
@@ -50,6 +54,7 @@ impl Tool {
         Self::Pencil,
         Self::Eraser,
         Self::Fill,
+        Self::Stamp,
     ];
 
     pub fn label(self) -> &'static str {
@@ -62,6 +67,7 @@ impl Tool {
             Self::Pencil => "Pencil",
             Self::Eraser => "Eraser",
             Self::Fill => "Fill",
+            Self::Stamp => "Stamp",
         }
     }
 
@@ -77,14 +83,15 @@ impl Tool {
             Self::Pencil => key(Key::N),
             Self::Eraser => KeyboardShortcut::new(Modifiers::SHIFT, Key::E),
             Self::Fill => key(Key::G),
+            Self::Stamp => key(Key::S),
         }
     }
 
-    /// Whether the tool draws on a layer of `kind`. The shape tools paint
-    /// their finished shape into a raster layer's pixels.
+    /// Whether the tool draws on a layer of `kind`. The shape tools and
+    /// Stamp paint their shapes into a raster layer's pixels.
     pub fn works_on(self, kind: LayerKind) -> bool {
         match self {
-            Self::Select | Self::Pen | Self::Ellipse | Self::Rectangle => true,
+            Self::Select | Self::Pen | Self::Ellipse | Self::Rectangle | Self::Stamp => true,
             Self::Brush => kind == LayerKind::Vector,
             Self::Pencil | Self::Eraser | Self::Fill => kind == LayerKind::Raster,
         }
@@ -291,6 +298,8 @@ pub struct Frame<'a> {
     /// Whether the pointer is over the Model View, whose keys reach the
     /// tools too.
     pub model_hovered: bool,
+    /// The stamp the Stamp tool places, once one is chosen.
+    pub stamp: Option<&'a mut Placing>,
 }
 
 /// A view the tools take pointer input from.
@@ -479,6 +488,7 @@ impl TextureView {
                 None,
                 f.tool,
                 f.paint,
+                f.stamp.as_deref(),
             );
         }
     }
@@ -531,6 +541,7 @@ impl TextureView {
             message,
             ghost,
             model_hovered,
+            stamp,
             ..
         } = f;
         if tool != Tool::Pen && !self.pen.is_empty() {
@@ -551,6 +562,7 @@ impl TextureView {
             selection,
             paint,
             message,
+            stamp,
         };
         // A drag, by the primary button only, starts where the button went
         // down.
@@ -642,7 +654,18 @@ impl TextureView {
 
         let cursor = pointer.or(ghost);
         let project = canvas.editor.project();
-        self.overlay(ui, project, r, canvas.selection, at, cursor, tool, paint);
+        let stamp = canvas.stamp.as_deref();
+        self.overlay(
+            ui,
+            project,
+            r,
+            canvas.selection,
+            at,
+            cursor,
+            tool,
+            paint,
+            stamp,
+        );
     }
 
     /// Input from the Model View, already in the space of `r`, the variant
@@ -799,8 +822,8 @@ impl TextureView {
         }
     }
 
-    /// A click of `tool` at `p`: a pen anchor, a brush dot, pixels, or a
-    /// pick. `reach` is how near, in texels, a click finds what it's near.
+    /// A click of `tool` at `p`: a pen anchor, a brush dot, pixels, a
+    /// stamp, or a pick. `reach` is how near, in texels, a click finds what it's near.
     fn click(
         &mut self,
         canvas: Canvas<'_>,
@@ -817,6 +840,7 @@ impl TextureView {
             Tool::Pencil | Tool::Eraser | Tool::Fill => {
                 press_pixels(canvas, r, tool, p, None);
             }
+            Tool::Stamp => place_stamp(canvas, r, p),
             Tool::Ellipse | Tool::Rectangle => {}
         }
     }
@@ -854,9 +878,13 @@ impl TextureView {
                     width: paint.width,
                 })
             }
-            // A fill acts at once, where the press began.
+            // A fill or stamp acts at once, where the press began.
             Tool::Fill => {
                 press_pixels(canvas, r, tool, p, None);
+                None
+            }
+            Tool::Stamp => {
+                place_stamp(canvas, r, p);
                 None
             }
             Tool::Ellipse | Tool::Rectangle => Some(Drag::Box {
@@ -899,6 +927,7 @@ impl TextureView {
         cursor: Option<Vec2>,
         tool: Tool,
         paint: Paint,
+        stamp: Option<&Placing>,
     ) {
         let painter = ui.painter_at(at.view);
         let layers = project.variant(r).layers();
@@ -1001,6 +1030,17 @@ impl TextureView {
                 Stroke::new(3.0, Color32::from_black_alpha(150)),
             );
             painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::WHITE));
+        }
+        // Where the stamp would go, light on dark like the ring.
+        if tool == Tool::Stamp
+            && let (Some(p), Some(placing)) = (cursor, stamp)
+        {
+            let entries = vec![PaletteIndex(0); placing.stamp.colors().len()];
+            for s in placing.stamp.placed(p, &entries) {
+                let o = s.outline();
+                line(&o, Stroke::new(3.0, Color32::from_black_alpha(150)));
+                line(&o, Stroke::new(1.0, Color32::WHITE));
+            }
         }
         // The pen's path in progress. Other drawings are already in the
         // layer.
@@ -1154,11 +1194,11 @@ fn take_keyboard(ui: &egui::Ui, editor: &mut Editor) {
 
 /// The radius, in texels, of what `tool` paints around the cursor: half
 /// the width of a stroke, or nothing for a fill or a point. Select paints
-/// nothing.
+/// nothing, and a stamp has a footprint of its own.
 pub fn footprint(tool: Tool, paint: Paint) -> Option<f32> {
     let stroke = paint.width / 2.0;
     match tool {
-        Tool::Select => None,
+        Tool::Select | Tool::Stamp => None,
         Tool::Brush | Tool::Pencil | Tool::Eraser => Some(stroke),
         Tool::Pen | Tool::Ellipse | Tool::Rectangle if !paint.fill => Some(stroke),
         Tool::Pen | Tool::Ellipse | Tool::Rectangle | Tool::Fill => Some(0.0),
@@ -1436,6 +1476,7 @@ pub struct Canvas<'a> {
     pub selection: &'a mut Selection,
     pub paint: Paint,
     pub message: &'a mut Option<String>,
+    pub stamp: Option<&'a mut Placing>,
 }
 
 impl Canvas<'_> {
@@ -1445,6 +1486,7 @@ impl Canvas<'_> {
             selection: self.selection,
             paint: self.paint,
             message: self.message,
+            stamp: self.stamp.as_deref_mut(),
         }
     }
 }
@@ -1641,6 +1683,7 @@ fn redraw(canvas: Canvas<'_>, drag: &mut Drag, r: VariantRef) {
         selection,
         paint,
         message,
+        ..
     } = canvas;
     let (tool, anchors, style, before) = match drag {
         Drag::Brush { runs, before } => (
@@ -1724,7 +1767,7 @@ fn finish_drag(editor: &mut Editor, drag: Drag, selection: &mut Selection, r: Va
 }
 
 /// Whether new shapes can go on the selected layer, or why not.
-fn drawable(project: &Project, r: VariantRef, selection: &Selection) -> Result<(), String> {
+pub fn drawable(project: &Project, r: VariantRef, selection: &Selection) -> Result<(), String> {
     match project.variant(r).layers().get(selection.layer) {
         Some(l) if l.locked => Err(format!("{} is locked; unlock it to draw on it.", l.name)),
         Some(l) if !l.visible => Err(format!("{} is hidden; show it to draw on it.", l.name)),
@@ -1802,6 +1845,7 @@ fn press_pixels(
         selection,
         paint,
         message,
+        ..
     } = canvas;
     let value = pixel_value(tool, paint);
     // A click off the texture paints nothing, so it adds no first layer
@@ -1843,6 +1887,7 @@ fn add_shape(canvas: Canvas<'_>, r: VariantRef, tool: Tool, anchors: Vec<Anchor>
         selection,
         paint,
         message,
+        ..
     } = canvas;
     let shape = match Shape::new(anchors, paint.style(closed), paint.color) {
         Ok(s) => s,
@@ -1864,6 +1909,65 @@ fn add_shape(canvas: Canvas<'_>, r: VariantRef, tool: Tool, anchors: Vec<Anchor>
             selection.anchor = None;
         }
         Err(why) => *message = Some(why),
+    }
+}
+
+/// Places the Stamp tool's stamp at `p` on top of the picked layer, or into
+/// its pixels, as [`add_shape`] adds a shape, and picks what it placed. The
+/// palette entries its colors were chosen to become are added in the same
+/// step. A click off the texture places nothing. Choices whose entries have
+/// changed are dropped, for the app to ask for again.
+fn place_stamp(canvas: Canvas<'_>, r: VariantRef, p: Vec2) {
+    let Canvas {
+        editor,
+        selection,
+        message,
+        stamp,
+        ..
+    } = canvas;
+    let Some(placing) = stamp else { return };
+    let size = editor.project().variant(r).size().as_vec2();
+    if p.cmplt(Vec2::ZERO).any() || p.cmpge(size).any() {
+        return;
+    }
+    if let Err(why) = drawable(editor.project(), r, selection) {
+        *message = Some(why);
+        return;
+    }
+    let Some(choices) = placing.current(editor.project().palette()) else {
+        return;
+    };
+    let before = placing.choices.clone();
+    let entries = editor.edit_continuous(STAMP_EDIT, |project| placing.resolve(project, &choices));
+    let placed = entries.map_err(|e| e.to_string()).and_then(|entries| {
+        let shapes = placing.stamp.placed(p, &entries);
+        edit_picked_layer(editor, selection, r, Tool::Stamp, Some(STAMP_EDIT), |l| {
+            let painted = l.edit_raster(|raster| {
+                for s in &shapes {
+                    raster.paint_shape(s);
+                }
+            });
+            if painted.is_some() {
+                return None;
+            }
+            let start = l.shapes().len();
+            for s in shapes {
+                l.insert_shape(l.shapes().len(), s);
+            }
+            Some(start..l.shapes().len())
+        })
+    });
+    match placed {
+        Ok(shapes) => {
+            editor.end_gesture();
+            selection.shapes = shapes.into_iter().flatten().collect();
+            selection.anchor = None;
+        }
+        Err(why) => {
+            editor.revert_gesture(STAMP_EDIT);
+            placing.choices = before;
+            *message = Some(why);
+        }
     }
 }
 
@@ -2030,6 +2134,7 @@ mod tests {
             selection: Box::leak(Box::default()),
             paint: PAINT,
             message: Box::leak(Box::default()),
+            stamp: None,
         }
     }
 
@@ -2374,6 +2479,7 @@ mod tests {
                 selection: &mut selection,
                 paint,
                 message: &mut message,
+                stamp: None,
             };
             let pressed = press_pixels(canvas, r, tool, margin, None);
             assert_eq!(pressed, None, "{tool:?}");
@@ -2391,12 +2497,132 @@ mod tests {
             selection: &mut selection,
             paint: wide,
             message: &mut message,
+            stamp: None,
         };
         let pressed = press_pixels(canvas, r, Tool::Pencil, margin, None);
         assert_eq!(pressed, Some(0));
         let layers = editor.project().variant(r).layers();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].kind(), LayerKind::Raster);
+    }
+
+    #[test]
+    fn a_stamp_from_another_palette_places_as_one_step() {
+        use crate::stamps::Choice;
+        const RED: Rgba8 = Rgba8::new(255, 0, 0, 255);
+        let black = Rgba8::new(0, 0, 0, 255);
+        // A 2x2 red square saved from a project whose palette is black, red.
+        let anchors = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+            .map(|(x, y)| Anchor::corner(Vec2::new(x, y)))
+            .to_vec();
+        let square = Shape::new(anchors, Style::Fill, PaletteIndex(1)).unwrap();
+        let source = Palette::from_colors([black, RED]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("square.ron");
+        let saved = mint_core::Stamp::from_shapes(vec![square], &source).unwrap();
+        mint_core::file::save_stamp(&saved, &path).unwrap();
+        let stamp = std::sync::Arc::new(mint_core::file::load_stamp(&path).unwrap());
+
+        // Placed into a project whose palette is only black, red becoming a
+        // new entry.
+        let (mut editor, r) = layerless();
+        let mut placing = Placing::new("square".into(), stamp, editor.project().palette());
+        assert_eq!(placing.choices, None);
+        placing.choices = Some(vec![Choice::New]);
+        let (mut selection, mut message) = (Selection::default(), None);
+        let mut place = |editor: &mut Editor, placing: &mut Placing, at: Vec2| {
+            let canvas = Canvas {
+                editor,
+                selection: &mut selection,
+                paint: PAINT,
+                message: &mut message,
+                stamp: Some(placing),
+            };
+            place_stamp(canvas, r, at);
+        };
+        // Centered on the corner (2, 2) nearest the click.
+        place(&mut editor, &mut placing, Vec2::new(2.3, 1.6));
+        assert_eq!(editor.project().palette().colors(), [black, RED]);
+        let pixels: Vec<u8> = editor
+            .project()
+            .variant(r)
+            .rasterize()
+            .pixels()
+            .iter()
+            .map(|p| p.0)
+            .collect();
+        #[rustfmt::skip]
+        assert_eq!(pixels, [
+            0, 0, 0, 0,
+            0, 1, 1, 0,
+            0, 1, 1, 0,
+            0, 0, 0, 0,
+        ]);
+        // Placing again reuses the entry it added.
+        assert_eq!(
+            placing.choices,
+            Some(vec![Choice::Entry(PaletteIndex(1), RED)])
+        );
+        place(&mut editor, &mut placing, Vec2::new(0.9, 1.0));
+        assert_eq!(editor.project().palette().len(), 2);
+        assert_eq!(editor.project().variant(r).layers()[0].shapes().len(), 2);
+
+        // One undo step each, the first taking its palette entry with it.
+        editor.undo();
+        editor.undo();
+        assert_eq!(editor.project().palette().colors(), [black]);
+        assert!(editor.project().variant(r).layers().is_empty());
+        // Its choice then names an entry that's gone, so placing waits for
+        // the colors to be chosen again.
+        place(&mut editor, &mut placing, Vec2::new(2.0, 2.0));
+        assert_eq!(placing.choices, None);
+        assert!(editor.project().variant(r).layers().is_empty());
+    }
+
+    #[test]
+    fn a_stamp_paints_into_a_raster_layer() {
+        let (mut editor, r) = layerless();
+        editor
+            .edit_variant(r, |v| {
+                v.insert_layer(0, Layer::raster("px", Raster::clear(v.size())));
+            })
+            .unwrap();
+        let dot = Shape::new(
+            vec![Anchor::corner(Vec2::new(0.5, 0.5))],
+            Style::Stroke {
+                width: 1.0,
+                closed: false,
+            },
+            PaletteIndex(0),
+        )
+        .unwrap();
+        let stamp = mint_core::Stamp::from_shapes(vec![dot], editor.project().palette()).unwrap();
+        let mut placing = Placing::new(
+            "dot".into(),
+            std::sync::Arc::new(stamp),
+            editor.project().palette(),
+        );
+        let (mut selection, mut message) = (Selection::default(), None);
+        let canvas = Canvas {
+            editor: &mut editor,
+            selection: &mut selection,
+            paint: PAINT,
+            message: &mut message,
+            stamp: Some(&mut placing),
+        };
+        // On the pixel under the pointer.
+        place_stamp(canvas, r, Vec2::new(3.2, 1.1));
+        let layer = &editor.project().variant(r).layers()[0];
+        let set: Vec<usize> = layer
+            .raster_pixels()
+            .unwrap()
+            .pixels()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.map(|_| i))
+            .collect();
+        assert_eq!(set, [3 + 4]);
+        assert!(selection.shapes.is_empty());
     }
 
     #[test]
