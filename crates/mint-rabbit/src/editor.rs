@@ -18,11 +18,13 @@ const UNDO_LIMIT: usize = 200;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gesture {
     None,
-    /// Edits until the gesture ends undo as one step; `recorded` once that
-    /// step is on the undo stack. `key` names the control making them.
+    /// Edits until the gesture ends undo as one step. `key` names the
+    /// control making them. `recorded` once that step is on the undo stack,
+    /// holding whether rolling it back leaves changes unsaved: there were
+    /// some before it, or it was saved partway.
     Open {
         key: u64,
-        recorded: bool,
+        recorded: Option<bool>,
     },
 }
 
@@ -78,6 +80,13 @@ impl Editor {
     pub fn saved(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.dirty = false;
+        if let Gesture::Open {
+            recorded: Some(dirty),
+            ..
+        } = &mut self.gesture
+        {
+            *dirty = true;
+        }
     }
 
     /// Applies `f` to the project as an undoable step of its own. If it
@@ -98,9 +107,11 @@ impl Editor {
     ) -> Result<T, E> {
         let key = hash(key);
         if !matches!(self.gesture, Gesture::Open { key: open, .. } if open == key) {
+            // Another control's edit ends the open one.
+            self.end_gesture();
             self.gesture = Gesture::Open {
                 key,
-                recorded: false,
+                recorded: None,
             };
         }
         self.apply(f)
@@ -136,9 +147,11 @@ impl Editor {
         };
         if self.project != before {
             match &mut self.gesture {
-                Gesture::Open { recorded: true, .. } => {}
+                Gesture::Open {
+                    recorded: Some(_), ..
+                } => {}
                 Gesture::Open { recorded, .. } => {
-                    *recorded = true;
+                    *recorded = Some(self.dirty);
                     let redo = std::mem::take(&mut self.redo);
                     self.push_undo(before);
                     self.gesture_redo = redo;
@@ -156,13 +169,16 @@ impl Editor {
     /// cleared; then ends whatever edit is open.
     pub fn revert_gesture(&mut self, key: impl Hash) {
         let key = hash(key);
-        if matches!(self.gesture, Gesture::Open { key: open, recorded: true } if open == key)
+        if let Gesture::Open {
+            key: open,
+            recorded: Some(dirty),
+        } = self.gesture
+            && open == key
             && let Some(before) = self.undo.pop()
         {
             self.project = before;
             self.redo = std::mem::take(&mut self.gesture_redo);
-            // Saved mid-edit, the file may hold what was reverted.
-            self.dirty = true;
+            self.dirty = dirty;
             self.generation += 1;
         }
         self.end_gesture();
@@ -172,14 +188,24 @@ impl Editor {
     pub fn end_gesture(&mut self) {
         self.gesture = Gesture::None;
         self.gesture_redo.clear();
+        self.trim_undo();
     }
 
+    /// Records the project as it was before an edit. While a continuous
+    /// edit is open, its step may still be rolled back, so the oldest step
+    /// stays until it ends.
     fn push_undo(&mut self, before: Project) {
         self.undo.push(before);
+        self.redo.clear();
+        if self.gesture == Gesture::None {
+            self.trim_undo();
+        }
+    }
+
+    fn trim_undo(&mut self) {
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
-        self.redo.clear();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -310,6 +336,24 @@ mod tests {
         e.redo();
         assert_eq!(current(&e), 1);
 
+        // Rolled back, it leaves the project as clean as it was, unless it
+        // was saved partway.
+        e.saved(PathBuf::from("p"));
+        e.edit_continuous("drag", |p| {
+            p.set_palette_color(PaletteIndex(0), Rgba8::new(8, 0, 0, 255))
+        })
+        .unwrap();
+        assert!(e.dirty());
+        e.revert_gesture("drag");
+        assert!(!e.dirty());
+        e.edit_continuous("drag", |p| {
+            p.set_palette_color(PaletteIndex(0), Rgba8::new(8, 0, 0, 255))
+        })
+        .unwrap();
+        e.saved(PathBuf::from("p"));
+        e.revert_gesture("drag");
+        assert!(e.dirty());
+
         // Another control's edit is only ended, not rolled back.
         e.edit_continuous("name", |p| {
             p.set_palette_color(PaletteIndex(0), Rgba8::new(7, 0, 0, 255))
@@ -319,6 +363,47 @@ mod tests {
         assert_eq!(current(&e), 7);
         e.undo();
         assert_eq!(current(&e), 1);
+    }
+
+    #[test]
+    fn a_reverted_edit_at_the_undo_limit_keeps_the_oldest_step() {
+        let mut e = editor();
+        for r in 1..=u8::try_from(UNDO_LIMIT).unwrap() {
+            red(&mut e, r);
+        }
+        e.edit_continuous("drag", |p| {
+            p.set_palette_color(PaletteIndex(0), Rgba8::new(0, 1, 0, 255))
+        })
+        .unwrap();
+        e.revert_gesture("drag");
+        let mut steps = 0;
+        while e.can_undo() {
+            e.undo();
+            steps += 1;
+        }
+        assert_eq!(steps, UNDO_LIMIT);
+        assert_eq!(current(&e), 0);
+    }
+
+    #[test]
+    fn continuous_edits_by_turns_keep_to_the_undo_limit() {
+        let mut e = editor();
+        for r in 1..=u8::try_from(UNDO_LIMIT).unwrap() {
+            red(&mut e, r);
+        }
+        for g in 0..50u8 {
+            e.edit_continuous(g % 2, |p| {
+                p.set_palette_color(PaletteIndex(0), Rgba8::new(0, g, 1, 255))
+            })
+            .unwrap();
+        }
+        e.end_gesture();
+        let mut steps = 0;
+        while e.can_undo() {
+            e.undo();
+            steps += 1;
+        }
+        assert_eq!(steps, UNDO_LIMIT);
     }
 
     #[test]
