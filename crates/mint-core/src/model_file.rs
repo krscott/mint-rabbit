@@ -104,7 +104,7 @@ pub enum ModelFileError {
         "{0} isn't a model file, so its images aren't written beside it; send the model to a model file again"
     )]
     NoModelFile(PathBuf),
-    #[error("the model file is larger than a model file may be ({MAX_FILE_BYTES} bytes)")]
+    #[error("the model file is over the {MAX_FILE_BYTES}-byte limit")]
     TooLarge,
     #[error("{0} exists and isn't a PNG image; move it, or choose another model file path")]
     NotPng(PathBuf),
@@ -268,10 +268,9 @@ fn check_replaceable(
 }
 
 const GLB_MAGIC: &[u8] = b"glTF";
-/// Smallest ratio of a node's thinnest to its widest model-space scale, by
-/// the measure `encode` uses, for which a model file keeps positions to
-/// about a tenth of a unit.
-const MIN_SCALE_RATIO: f32 = 1e-4;
+/// How far, in model units, a vertex may move through a model file, which
+/// holds model-space positions as f32.
+const POSITION_TOLERANCE: f32 = 0.01;
 /// Largest model file read, far above any villager's.
 const MAX_FILE_BYTES: u64 = 256 << 20;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -295,6 +294,9 @@ pub fn write(
         .map(|p| uri(&p.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
     let bytes = encode(project, &uris, units)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ModelFileError::TooLarge);
+    }
     // So a model file is never replaced by one this can't read back.
     decode(project, &bytes, units).map_err(|e| ModelFileError::NotReadable(Box::new(e)))?;
     write_pngs(project, &images, variants)?;
@@ -502,6 +504,7 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
     let locals = model.local_matrices(project.pose());
     let world = model.compose(&locals);
     let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
+    let to_local: Vec<Mat4> = world.iter().map(Mat4::inverse).collect();
 
     // The skeleton, posed, with translations in the file's units. The
     // inverse bind matrices come from the transforms as written, so they
@@ -521,23 +524,6 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             .collect::<Vec<_>>(),
     );
     let ibms: Vec<Mat4> = written_world.iter().map(Mat4::inverse).collect();
-    for (id, m) in model.ids().zip(&world) {
-        // The file holds model-space positions as f32, so an axis squashed
-        // far below the others loses its coordinates there. |det| over the
-        // widest column cubed is 1 for a uniform scale and falls as one
-        // axis thins, however the pose has turned it.
-        let m3 = Mat3::from_mat4(*m);
-        let widest = [m3.x_axis, m3.y_axis, m3.z_axis]
-            .map(Vec3::length)
-            .into_iter()
-            .fold(0.0, f32::max);
-        if m3.determinant().abs() < widest.powi(3) * MIN_SCALE_RATIO {
-            return Err(ModelFileError::Unwritable {
-                node: model.node(id).name.clone(),
-                problem: "it's scaled far thinner along one axis than another, beyond a model file's precision",
-            });
-        }
-    }
     for id in model.ids() {
         let i = id.index();
         let (sc, r, t) = written[i];
@@ -548,7 +534,7 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             || det == 0.0
             || !ibms[i].is_finite()
             || !normals[i].is_finite()
-            || !world[i].inverse().is_finite()
+            || !to_local[i].is_finite()
         {
             return Err(ModelFileError::Unwritable {
                 node: model.node(id).name.clone(),
@@ -585,6 +571,15 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                     return Err(ModelFileError::Unwritable {
                         node: model.node(id).name.clone(),
                         problem: "a vertex's position, normal, or UV isn't a finite number",
+                    });
+                }
+                // Mapped back as reading does, so a vertex too far out or
+                // under too small a scale for f32 is refused, not moved.
+                let back = to_local[f.index()].transform_point3(p / s);
+                if (back - v.position).abs().max_element() > POSITION_TOLERANCE {
+                    return Err(ModelFileError::Unwritable {
+                        node: model.node(id).name.clone(),
+                        problem: "a vertex wouldn't keep its position, as it's too far out or under too small a scale",
                     });
                 }
                 run.push(verts.add(f, p, direction(n), c.uv));
@@ -1708,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thin_node_keeps_its_vertices_or_is_refused() {
+    fn a_thin_or_tiny_node_keeps_its_vertices_or_is_refused() {
         let p = project(Vec3::new(1e-2, 1.0, 1.0), meshes(), &["body"]);
         let read = round_trip(&p);
         let before = &p.model().node(NodeId(1)).mesh.as_ref().unwrap().vertices;
@@ -1717,16 +1712,21 @@ mod tests {
         let (a, b) = (before.last().unwrap(), after.last().unwrap());
         assert!((b.normal.length() - 1.0).abs() < 1e-5, "{}", b.normal);
         assert!(
-            (b.position - a.position).abs().max_element() < 1e-2,
+            (b.position - a.position).abs().max_element() <= POSITION_TOLERANCE,
             "{} came back as {}",
             a.position,
             b.position
         );
-        let p = project(Vec3::new(1e-5, 1.0, 1.0), meshes(), &["body"]);
-        assert!(matches!(
-            encode(&p, &["body.png".into()], UNITS),
-            Err(ModelFileError::Unwritable { node, .. }) if node == "child"
-        ));
+        for scale in [Vec3::new(1e-5, 1.0, 1.0), Vec3::splat(1e-5)] {
+            let p = project(scale, meshes(), &["body"]);
+            assert!(
+                matches!(
+                    encode(&p, &["body.png".into()], UNITS),
+                    Err(ModelFileError::Unwritable { node, .. }) if node == "child"
+                ),
+                "{scale}"
+            );
+        }
     }
 
     #[test]
