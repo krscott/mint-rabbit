@@ -55,6 +55,11 @@ fn assert_normals_close(a: &Project, b: &Project, label: &str) {
             .collect()
     };
     for (x, y) in normals(a).into_iter().zip(normals(b)) {
+        // A normal comes back as it was, or, if it can't be told from
+        // another written the same, at the target length.
+        if y == x {
+            continue;
+        }
         if x == glam::Vec3::ZERO {
             // A few AC normals are zero, which stays zero.
             assert_eq!(y, x, "{label}");

@@ -796,9 +796,9 @@ impl App {
     }
 
     /// Writes the model to a model file at `path`, links the project to
-    /// it, and takes the model as the file holds it (normals at the
-    /// target's length, each triangle on the deepest node of its corners),
-    /// as one undo step, for Replace model and later reads to start from.
+    /// it, and takes the model as the file holds it (each triangle on the
+    /// deepest node of its corners), as one undo step, for Replace model
+    /// and later reads to start from.
     fn send_to(&mut self, path: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
         let sent = ModelFilePath::new(path).and_then(|path| {
@@ -814,7 +814,9 @@ impl App {
             Ok(sent) => sent,
             Err(e) => return self.fail(e.to_string()),
         };
-        doc.watch.known(watch::stamp(path.as_path()));
+        // Read again once it settles, in case another program wrote it
+        // since; a file as written reads back as the model now is.
+        doc.watch.known(None);
         let shown = path.as_path().display().to_string();
         doc.editor.set_model_file(path);
         match doc.editor.edit(|p| p.set_meshes(meshes)) {
@@ -851,8 +853,16 @@ impl App {
         let busy = self.dialog.is_some()
             || self.texture_view.dragging()
             || ctx.input(|i| i.pointer.any_down());
-        if !busy && doc.watch.poll(watch::stamp(path.as_path()), Instant::now()) {
-            self.reload_model_file();
+        if busy || !doc.watch.poll(watch::stamp(path.as_path()), Instant::now()) {
+            return;
+        }
+        let path = path.clone();
+        let shown = path.as_path().display();
+        match doc.read_model_file(&path) {
+            // Unchanged, as a file this wrote, says nothing.
+            Ok(false) => {}
+            Ok(true) => self.tell(format!("Read the model from {shown}")),
+            Err(e) => self.fail(format!("Couldn't read {shown}: {e}")),
         }
     }
 

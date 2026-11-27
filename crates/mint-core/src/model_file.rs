@@ -271,10 +271,6 @@ const GLB_MAGIC: &[u8] = b"glTF";
 /// How far, in model units, a vertex may move through a model file, which
 /// holds model-space positions as f32.
 const POSITION_TOLERANCE: f32 = 0.01;
-/// How far a normal may turn or stretch through a model file. Far below the
-/// difference between AC's normals and the target length they come back
-/// at, so those still come back at it.
-const NORMAL_TOLERANCE: f32 = 1e-4;
 /// Largest model file read, far above any villager's.
 const MAX_FILE_BYTES: u64 = 256 << 20;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -493,84 +489,80 @@ fn normal_matrix(m: Mat4) -> Mat3 {
     Mat3::from_mat4(m).inverse().transpose()
 }
 
-/// How far apart `a` and `b` are along the axis they differ most on, the
-/// measure a model file's roundoff is checked by.
-fn off(a: Vec3, b: Vec3) -> f32 {
-    (a - b).abs().max_element()
+/// The bits of `v` as a model file holds them, with -0.0 as 0.0.
+fn bits(v: Vec3) -> [u32; 3] {
+    // Adding zero turns -0.0 into 0.0.
+    v.to_array().map(|f| (f + 0.0).to_bits())
 }
 
-/// The vertices of a model, by the node each follows and the cell of
-/// [`POSITION_TOLERANCE`] its position falls in, in that node's space; for
-/// finding those a read vertex lies within roundoff of.
-struct Previous(HashMap<(NodeId, Cell), Vec<(Vec3, Vec3)>>);
+/// Where a model file puts a vertex that follows `f`, given each node's
+/// posed `world` matrix and the `normals` matrix of each: its position in
+/// the file's units, and its normal before it's made a direction.
+fn posed(world: &[Mat4], normals: &[Mat3], f: NodeId, v: &Vertex, s: f32) -> (Vec3, Vec3) {
+    (
+        world[f.index()].transform_point3(v.position) * s,
+        normals[f.index()] * v.normal,
+    )
+}
 
-/// A cube of [`POSITION_TOLERANCE`] on a side, by its corner's multiple of
-/// it on each axis.
-type Cell = [i64; 3];
+/// A project's vertices, by the node each follows and the position a model
+/// file written from the project holds for it, each with the normal the
+/// file holds, its position, and its normal: for giving back exactly the
+/// vertices of a file read unedited.
+struct Written(HashMap<(NodeId, [u32; 3]), Vec<WrittenVertex>>);
 
-impl Previous {
-    fn new(model: &Model) -> Self {
-        Self::from_vertices(model.meshes().enumerate().flat_map(|(owner, mesh)| {
+/// The bits of the normal a model file holds for a vertex, then the
+/// vertex's position and normal.
+type WrittenVertex = ([u32; 3], Vec3, Vec3);
+
+impl Written {
+    fn new(project: &Project, units: Units) -> Self {
+        let model = project.model();
+        let world = model.world_matrices(project.pose());
+        let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
+        let mut written: HashMap<_, Vec<_>> = HashMap::new();
+        for (owner, mesh) in model.meshes().enumerate() {
             let owner = NodeId(owner as u32);
-            mesh.into_iter()
-                .flat_map(|m| &m.vertices)
-                .map(move |v| (v.followed(owner), v.position, v.normal))
-        }))
-    }
-
-    fn from_vertices(vertices: impl IntoIterator<Item = (NodeId, Vec3, Vec3)>) -> Self {
-        let mut cells: HashMap<_, Vec<_>> = HashMap::new();
-        for (node, position, normal) in vertices {
-            cells
-                .entry((node, Self::cell(position)))
-                .or_default()
-                .push((position, normal));
+            for v in mesh.into_iter().flat_map(|m| &m.vertices) {
+                let f = v.followed(owner);
+                let (p, n) = posed(&world, &normals, f, v, units.meters_per_unit);
+                written.entry((f, bits(p))).or_default().push((
+                    bits(direction(n)),
+                    v.position,
+                    v.normal,
+                ));
+            }
         }
-        Self(cells)
+        Self(written)
     }
 
-    fn cell(p: Vec3) -> Cell {
-        // Saturating, so a non-finite position still names a cell.
-        p.to_array()
-            .map(|c| (c / POSITION_TOLERANCE).floor() as i64)
-    }
-
-    /// A read vertex's position and normal, following `node`; or the
-    /// position of the nearest previous vertex following it, and the
-    /// normal of one, where they differ by no more than a model file's
-    /// roundoff, so a model file nobody edited reads back as the model the
-    /// last read gave.
-    fn keep_unmoved(&self, node: NodeId, position: Vec3, normal: Vec3) -> (Vec3, Vec3) {
-        let [x, y, z] = Self::cell(position);
-        let steps = [-1i64, 0, 1];
-        let near: Vec<(Vec3, Vec3)> = steps
-            .iter()
-            .flat_map(|dx| steps.iter().map(move |dy| (dx, dy)))
-            .flat_map(|(dx, dy)| steps.iter().map(move |dz| (dx, dy, dz)))
-            .filter_map(|(dx, dy, dz)| {
-                let cell = [
-                    x.saturating_add(*dx),
-                    y.saturating_add(*dy),
-                    z.saturating_add(*dz),
-                ];
-                self.0.get(&(node, cell))
-            })
-            .flatten()
-            .filter(|(p, _)| off(*p, position) <= POSITION_TOLERANCE)
-            .copied()
-            .collect();
-        let Some(&(p, _)) = near
-            .iter()
-            .min_by(|a, b| off(a.0, position).total_cmp(&off(b.0, position)))
-        else {
-            return (position, normal);
+    /// The position and normal of a vertex following `node` that a model
+    /// file holds at `position` with `normal`, read as `read`: those of the
+    /// project's vertex the file holds exactly as it was written, so a file
+    /// read back unedited gives the project as it was, however often it is
+    /// written and read. A normal that isn't as written keeps its read
+    /// value, and so does whatever is written for project vertices that
+    /// differ there.
+    fn unedited(
+        &self,
+        node: NodeId,
+        position: Vec3,
+        normal: Vec3,
+        read: (Vec3, Vec3),
+    ) -> (Vec3, Vec3) {
+        let Some(written) = self.0.get(&(node, bits(position))) else {
+            return read;
         };
-        let n = near
-            .iter()
-            .map(|&(_, n)| n)
-            .find(|&n| off(n, normal) <= NORMAL_TOLERANCE)
-            .unwrap_or(normal);
-        (p, n)
+        let only = |mut all: Box<dyn Iterator<Item = (Vec3, Vec3)> + '_>| {
+            let first = all.next()?;
+            all.all(|v| v == first).then_some(first)
+        };
+        let normal = bits(normal);
+        if written.iter().any(|w| w.0 == normal) {
+            let same = written.iter().filter(|w| w.0 == normal);
+            return only(Box::new(same.map(|w| (w.1, w.2)))).unwrap_or(read);
+        }
+        only(Box::new(written.iter().map(|w| (w.1, Vec3::ZERO)))).map_or(read, |(p, _)| (p, read.1))
     }
 }
 
@@ -669,11 +661,10 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             for c in t.corners {
                 let v = mesh.vertices[c.vertex as usize];
                 let f = v.followed(id);
-                let p = world[f.index()].transform_point3(v.position) * s;
-                // Checked before normalizing, which turns NaN into zero. A
-                // zero normal, which a few AC vertices have, stays zero
-                // rather than taking a made-up direction.
-                let n = normals[f.index()] * v.normal;
+                // The normal is checked before normalizing, which turns NaN
+                // into zero. A zero normal, which a few AC vertices have,
+                // stays zero rather than taking a made-up direction.
+                let (p, n) = posed(&world, &normals, f, &v, s);
                 if !(p.is_finite() && n.is_finite() && c.uv.is_finite()) {
                     return Err(ModelFileError::Unwritable {
                         node: model.node(id).name.clone(),
@@ -1072,7 +1063,7 @@ fn decode(
 
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut welds: Vec<HashMap<(u32, [u32; 6]), u32>> = vec![HashMap::new(); model.nodes().len()];
-    let previous = Previous::new(model);
+    let written = Written::new(project, units);
     for node in gltf.nodes().filter(|n| in_scene[n.index()]) {
         let Some(mesh) = node.mesh() else { continue };
         let object = node
@@ -1269,10 +1260,14 @@ fn decode(
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
                     // Checked before normalizing, which turns NaN into zero.
                     let n = to_local_normal[id.index()] * (nm * normals[v]);
-                    let (position, normal) = previous.keep_unmoved(
+                    let (position, normal) = written.unedited(
                         id,
-                        to_local[id.index()].transform_point3(p),
-                        direction(n) * units.normal_length,
+                        positions[v],
+                        normals[v],
+                        (
+                            to_local[id.index()].transform_point3(p),
+                            direction(n) * units.normal_length,
+                        ),
                     );
                     let local = (id, position, normal, uvs[v]);
                     if !(local.1.is_finite() && n.is_finite() && local.3.is_finite()) {
@@ -1499,38 +1494,58 @@ mod tests {
     }
 
     #[test]
-    fn only_roundoff_is_undone() {
+    fn only_vertices_as_written_read_back_as_they_were() {
         let node = NodeId(1);
-        // Just below a cell's edge, so roundoff crosses into the next.
-        let at = Vec3::new(1.0, 2.0, POSITION_TOLERANCE * 300.0 - 0.001);
-        let previous = Previous::from_vertices([(node, at, Vec3::Z)]);
-        let keep = |p, n| previous.keep_unmoved(node, p, n);
-        // Up to the tolerance on every axis at once.
-        let nudged = at + Vec3::splat(POSITION_TOLERANCE * 0.9);
-        assert_eq!(keep(nudged, Vec3::Z * 1.000_01), (at, Vec3::Z));
-        let moved = at + Vec3::X * 0.5;
-        assert_eq!(keep(moved, Vec3::Z), (moved, Vec3::Z));
-        let turned = Vec3::new(0.0, 0.1, 1.0);
-        assert_eq!(keep(nudged, turned), (at, turned));
-        // Only vertices following the same node count.
-        assert_eq!(
-            previous.keep_unmoved(NodeId::ROOT, nudged, Vec3::Z),
-            (nudged, Vec3::Z)
-        );
+        let (file, normal) = (Vec3::new(0.1, 0.2, 0.3), Vec3::Z);
+        let (at, facing) = (Vec3::new(100.0, 200.0, 300.0), Vec3::Z * 0.9);
+        let written = Written(HashMap::from([(
+            (node, bits(file)),
+            vec![(bits(normal), at, facing)],
+        )]));
+        let read = (at + Vec3::X * 1e-4, Vec3::Z);
+        assert_eq!(written.unedited(node, file, normal, read), (at, facing));
+        // A normal turned in the file keeps its read value.
+        let turned = Vec3::new(0.0, 0.1, 1.0).normalize();
+        assert_eq!(written.unedited(node, file, turned, read), (at, read.1));
+        // Any move, however small, keeps the read position.
+        let moved = file + Vec3::X * f32::EPSILON;
+        assert_eq!(written.unedited(node, moved, normal, read), read);
+        assert_eq!(written.unedited(NodeId::ROOT, file, normal, read), read);
+        // So does a file position written for vertices at different places.
+        let mut shared = written;
+        shared
+            .0
+            .values_mut()
+            .next()
+            .unwrap()
+            .push((bits(normal), at * 2.0, facing));
+        assert_eq!(shared.unedited(node, file, normal, read), read);
     }
 
     #[test]
-    fn normals_come_back_at_the_target_length() {
+    fn edited_normals_come_back_at_the_target_length() {
         let p = sample();
         let units = Units {
             normal_length: 0.5,
             ..UNITS
         };
         let bytes = encode(&p, &["body.png".into()], units).unwrap();
-        let meshes = decode(&p, &bytes, units).unwrap();
-        for v in &meshes[1].as_ref().unwrap().vertices {
+        // Read for a project whose normals face the other way, as if the
+        // file's had been turned.
+        let mut turned = meshes();
+        for v in turned.iter_mut().flat_map(|m| &mut m.vertices) {
+            v.normal = -v.normal;
+        }
+        let q = project(Vec3::ONE, turned, &["body"]);
+        let read = decode(&q, &bytes, units).unwrap();
+        for v in &read[1].as_ref().unwrap().vertices {
             assert!((v.normal.length() - 0.5).abs() < 1e-5, "{}", v.normal);
         }
+        // Unedited, they come back as they were.
+        assert_eq!(
+            decode(&p, &bytes, units).unwrap()[1],
+            p.model().meshes().nth(1).unwrap().cloned()
+        );
     }
 
     #[test]
