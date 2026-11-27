@@ -493,42 +493,89 @@ fn normal_matrix(m: Mat4) -> Mat3 {
     Mat3::from_mat4(m).inverse().transpose()
 }
 
+/// How far apart `a` and `b` are along the axis they differ most on, the
+/// measure a model file's roundoff is checked by.
+fn off(a: Vec3, b: Vec3) -> f32 {
+    (a - b).abs().max_element()
+}
+
+/// The vertices of a model, by the node each follows and the cell of
+/// [`POSITION_TOLERANCE`] its position falls in, in that node's space; for
+/// finding those a read vertex lies within roundoff of.
+struct Previous(HashMap<(NodeId, Cell), Vec<(Vec3, Vec3)>>);
+
+/// A cube of [`POSITION_TOLERANCE`] on a side, by its corner's multiple of
+/// it on each axis.
+type Cell = [i64; 3];
+
+impl Previous {
+    fn new(model: &Model) -> Self {
+        Self::from_vertices(model.meshes().enumerate().flat_map(|(owner, mesh)| {
+            let owner = NodeId(owner as u32);
+            mesh.into_iter()
+                .flat_map(|m| &m.vertices)
+                .map(move |v| (v.followed(owner), v.position, v.normal))
+        }))
+    }
+
+    fn from_vertices(vertices: impl IntoIterator<Item = (NodeId, Vec3, Vec3)>) -> Self {
+        let mut cells: HashMap<_, Vec<_>> = HashMap::new();
+        for (node, position, normal) in vertices {
+            cells
+                .entry((node, Self::cell(position)))
+                .or_default()
+                .push((position, normal));
+        }
+        Self(cells)
+    }
+
+    fn cell(p: Vec3) -> Cell {
+        // Saturating, so a non-finite position still names a cell.
+        p.to_array()
+            .map(|c| (c / POSITION_TOLERANCE).floor() as i64)
+    }
+
+    /// A read vertex's position and normal, following `node`; or the
+    /// position of the nearest previous vertex following it, and the
+    /// normal of one, where they differ by no more than a model file's
+    /// roundoff, so a model file nobody edited reads back as the model the
+    /// last read gave.
+    fn keep_unmoved(&self, node: NodeId, position: Vec3, normal: Vec3) -> (Vec3, Vec3) {
+        let [x, y, z] = Self::cell(position);
+        let steps = [-1i64, 0, 1];
+        let near: Vec<(Vec3, Vec3)> = steps
+            .iter()
+            .flat_map(|dx| steps.iter().map(move |dy| (dx, dy)))
+            .flat_map(|(dx, dy)| steps.iter().map(move |dz| (dx, dy, dz)))
+            .filter_map(|(dx, dy, dz)| {
+                let cell = [
+                    x.saturating_add(*dx),
+                    y.saturating_add(*dy),
+                    z.saturating_add(*dz),
+                ];
+                self.0.get(&(node, cell))
+            })
+            .flatten()
+            .filter(|(p, _)| off(*p, position) <= POSITION_TOLERANCE)
+            .copied()
+            .collect();
+        let Some(&(p, _)) = near
+            .iter()
+            .min_by(|a, b| off(a.0, position).total_cmp(&off(b.0, position)))
+        else {
+            return (position, normal);
+        };
+        let n = near
+            .iter()
+            .map(|&(_, n)| n)
+            .find(|&n| off(n, normal) <= NORMAL_TOLERANCE)
+            .unwrap_or(normal);
+        (p, n)
+    }
+}
+
 /// The unit direction of finite `n`, or zero for zero. Scaled to its
 /// largest part first, so a very long or short vector doesn't round to zero.
-/// The position and normal of each vertex of `model`, by the node it
-/// follows, in that node's space.
-fn previous_vertices(model: &Model) -> Vec<Vec<(Vec3, Vec3)>> {
-    let mut by_node = vec![Vec::new(); model.nodes().len()];
-    for (owner, mesh) in model.meshes().enumerate() {
-        for v in mesh.iter().flat_map(|m| &m.vertices) {
-            let followed = v.followed(NodeId(owner as u32));
-            by_node[followed.index()].push((v.position, v.normal));
-        }
-    }
-    by_node
-}
-
-/// A read vertex's position and normal, or those of the nearest of the
-/// `previous` vertices following the same node where they differ by no
-/// more than a model file's roundoff, so reading back a model file that
-/// wasn't edited gives the model exactly as it was.
-fn keep_unmoved(previous: &[(Vec3, Vec3)], position: Vec3, normal: Vec3) -> (Vec3, Vec3) {
-    let near = previous
-        .iter()
-        .filter(|(p, _)| p.distance(position) <= POSITION_TOLERANCE);
-    let Some(&(p, _)) = near
-        .clone()
-        .min_by(|a, b| a.0.distance(position).total_cmp(&b.0.distance(position)))
-    else {
-        return (position, normal);
-    };
-    let n = near
-        .map(|&(_, n)| n)
-        .find(|n| n.distance(normal) <= NORMAL_TOLERANCE)
-        .unwrap_or(normal);
-    (p, n)
-}
-
 fn direction(n: Vec3) -> Vec3 {
     (n / n.abs().max_element().max(f32::MIN_POSITIVE)).normalize_or_zero()
 }
@@ -1025,7 +1072,7 @@ fn decode(
 
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut welds: Vec<HashMap<(u32, [u32; 6]), u32>> = vec![HashMap::new(); model.nodes().len()];
-    let previous = previous_vertices(model);
+    let previous = Previous::new(model);
     for node in gltf.nodes().filter(|n| in_scene[n.index()]) {
         let Some(mesh) = node.mesh() else { continue };
         let object = node
@@ -1222,8 +1269,8 @@ fn decode(
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
                     // Checked before normalizing, which turns NaN into zero.
                     let n = to_local_normal[id.index()] * (nm * normals[v]);
-                    let (position, normal) = keep_unmoved(
-                        &previous[id.index()],
+                    let (position, normal) = previous.keep_unmoved(
+                        id,
                         to_local[id.index()].transform_point3(p),
                         direction(n) * units.normal_length,
                     );
@@ -1453,17 +1500,23 @@ mod tests {
 
     #[test]
     fn only_roundoff_is_undone() {
-        let at = Vec3::new(1.0, 2.0, 3.0);
-        let previous = [(at, Vec3::Z)];
-        let nudged = at + Vec3::X * 0.001;
-        assert_eq!(
-            keep_unmoved(&previous, nudged, Vec3::Z * 1.000_01),
-            previous[0]
-        );
+        let node = NodeId(1);
+        // Just below a cell's edge, so roundoff crosses into the next.
+        let at = Vec3::new(1.0, 2.0, POSITION_TOLERANCE * 300.0 - 0.001);
+        let previous = Previous::from_vertices([(node, at, Vec3::Z)]);
+        let keep = |p, n| previous.keep_unmoved(node, p, n);
+        // Up to the tolerance on every axis at once.
+        let nudged = at + Vec3::splat(POSITION_TOLERANCE * 0.9);
+        assert_eq!(keep(nudged, Vec3::Z * 1.000_01), (at, Vec3::Z));
         let moved = at + Vec3::X * 0.5;
-        assert_eq!(keep_unmoved(&previous, moved, Vec3::Z), (moved, Vec3::Z));
+        assert_eq!(keep(moved, Vec3::Z), (moved, Vec3::Z));
         let turned = Vec3::new(0.0, 0.1, 1.0);
-        assert_eq!(keep_unmoved(&previous, nudged, turned), (at, turned));
+        assert_eq!(keep(nudged, turned), (at, turned));
+        // Only vertices following the same node count.
+        assert_eq!(
+            previous.keep_unmoved(NodeId::ROOT, nudged, Vec3::Z),
+            (nudged, Vec3::Z)
+        );
     }
 
     #[test]

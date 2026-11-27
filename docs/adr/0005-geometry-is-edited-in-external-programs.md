@@ -43,8 +43,9 @@ nodes' meshes.
 - Positions are scaled by a factor the export target gives (AC: 0.001 m per
   unit), so a model is a usable size in meters.
 - A vertex that reads back within the file's roundoff of where the project
-  has it keeps the project's exact position and normal, so reading a file
-  nobody edited changes nothing, however often it is sent and read.
+  has it keeps the project's exact position and normal, so once a model has
+  been read back, reading a file nobody edited changes nothing, however
+  often it is sent and read.
 - Added geometry shares its node's textures, such as the body atlas; a
   separate texture per added mesh needs target support first.
 - Blender's glTF importer must merge vertices, or it splits the welded mesh
