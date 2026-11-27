@@ -14,8 +14,12 @@
 //! file can't change: each triangle belongs to the deepest node among its
 //! corners', and corners that follow another node become seam vertices. Only
 //! the file's default scene is read, and of it only meshes; images and
-//! animations are ignored. The file is untrusted: anything it says that
-//! can't be read safely is refused with an error naming the object.
+//! animations are ignored. The file is untrusted: anything in it that can't
+//! be read safely is refused, and errors about one object name it.
+//!
+//! The path of a model file comes from a project file, which may be shared,
+//! so writing replaces only a `.glb` model file and the PNGs written beside
+//! it, never a file of another kind.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,6 +37,50 @@ use crate::{
 /// The extension of a model file.
 pub const EXTENSION: &str = "glb";
 
+/// The absolute path of a model file: valid UTF-8, so a project file can
+/// store it, ending in `.glb`, with its directory's links resolved, so it
+/// compares with a project directory's resolved path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelFilePath(PathBuf);
+
+impl ModelFilePath {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ModelFileError> {
+        let path: PathBuf = path.into();
+        let bad = |problem| ModelFileError::BadPath {
+            path: path.clone(),
+            problem,
+        };
+        if !path.is_absolute() {
+            return Err(bad("it isn't absolute"));
+        }
+        if path.to_str().is_none() {
+            return Err(bad("it isn't valid UTF-8"));
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some(EXTENSION) {
+            return Err(bad("it doesn't end in .glb"));
+        }
+        let name = path.file_name().ok_or_else(|| bad("it has no file name"))?;
+        let resolved = match path.parent().map(Path::canonicalize) {
+            Some(Ok(dir)) => dir.join(name),
+            _ => path.clone(),
+        };
+        if resolved.to_str().is_none() {
+            return Err(bad("its directory isn't valid UTF-8"));
+        }
+        Ok(Self(resolved))
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.to_str().expect("checked when made")
+    }
+}
+
 /// How an export target's model units map to a model file's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Units {
@@ -49,8 +97,17 @@ pub enum ModelFileError {
     Io(PathBuf, std::io::Error),
     #[error("{0}: {1}")]
     Png(PathBuf, png::EncodingError),
+    #[error("model file path {path}: {problem}")]
+    BadPath {
+        path: PathBuf,
+        problem: &'static str,
+    },
     #[error("{0} exists and isn't a glTF binary file; choose another path")]
     NotModelFile(PathBuf),
+    #[error("{0} isn't a model file, so its images aren't written beside it")]
+    NoModelFile(PathBuf),
+    #[error("{0} is larger than a model file may be ({MAX_FILE_BYTES} bytes)")]
+    TooLarge(PathBuf),
     #[error("{0} exists and isn't a PNG image; move it, or choose another model file path")]
     NotPng(PathBuf),
     #[error("two nodes are named {0:?}; a model file names each bone after its node")]
@@ -59,6 +116,8 @@ pub enum ModelFileError {
         "can't read the model file as glTF: {0}; export it as glTF Binary (.glb) without compression"
     )]
     Gltf(#[from] gltf::Error),
+    #[error("the model file is malformed glTF")]
+    Unreadable,
     #[error("the model file's default scene has no meshes")]
     NoMesh,
     #[error("the model file's nodes form a loop rather than a tree")]
@@ -66,7 +125,7 @@ pub enum ModelFileError {
     #[error("the model file keeps its data in a separate file; export it as glTF Binary (.glb)")]
     ExternalData,
     #[error(
-        "object {0:?} isn't skinned; give it an Armature modifier and put each vertex in one bone's vertex group"
+        "object {0:?} isn't skinned; give it an Armature modifier and put each vertex in one bone's vertex group, or delete it or leave it out of the export"
     )]
     Unskinned(String),
     #[error("object {object:?} uses bone {bone:?}, which the project has no node for")]
@@ -91,7 +150,7 @@ pub enum ModelFileError {
         known: String,
     },
     #[error(
-        "object {object:?} has {count} vertices weighted to no bone or to more than one, such as one at ({x:.3}, {y:.3}, {z:.3}); weight each vertex to exactly one bone",
+        "object {object:?} has {count} vertices weighted to no bone or to more than one, such as one at ({x:.3}, {y:.3}, {z:.3}) in glTF coordinates (Y up); weight each vertex to exactly one bone",
         x = .at.x, y = .at.y, z = .at.z
     )]
     VertexBones {
@@ -103,9 +162,9 @@ pub enum ModelFileError {
 }
 
 /// The name of each of `project`'s materials in a model file: the name of
-/// its texture, made unique with the material's index where two meet.
-#[must_use]
-pub fn material_names(project: &Project) -> Vec<String> {
+/// its texture, made unique where two meet with a number counting up from
+/// the material's index.
+fn material_names(project: &Project) -> Vec<String> {
     let mut taken = HashSet::new();
     project
         .materials()
@@ -126,7 +185,7 @@ pub fn material_names(project: &Project) -> Vec<String> {
 }
 
 /// `name` with every character but ASCII letters, digits, `-`, `_`, and
-/// spaces replaced, so it is safe in a file name.
+/// spaces replaced, so it is safe in a file name and holds no dot.
 fn file_safe(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -140,24 +199,17 @@ fn file_safe(name: &str) -> String {
 }
 
 /// Where the image of each of `project`'s textures goes beside the model
-/// file at `path`: `<stem>.<texture>.png`, with the texture's index added
-/// where two names meet.
+/// file at `path`: `<stem>.<index>-<texture>.png`. The last part before
+/// `.png` holds no dot, so no two textures or stems share an image.
 #[must_use]
-pub fn image_paths(project: &Project, path: &Path) -> Vec<PathBuf> {
+pub fn image_paths(project: &Project, path: &ModelFilePath) -> Vec<PathBuf> {
+    let path = path.as_path();
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let mut taken = HashSet::new();
     project
         .textures()
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            let mut name = format!("{stem}.{}.png", file_safe(&t.name));
-            if taken.contains(&name) {
-                name = format!("{stem}.{}.{i}.png", file_safe(&t.name));
-            }
-            taken.insert(name.clone());
-            path.with_file_name(name)
-        })
+        .map(|(i, t)| path.with_file_name(format!("{stem}.{i}-{}.png", file_safe(&t.name))))
         .collect()
 }
 
@@ -183,11 +235,13 @@ fn check_replaceable(
     error: fn(PathBuf) -> ModelFileError,
 ) -> Result<(), ModelFileError> {
     use std::io::Read as _;
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(error(path.to_owned())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(ModelFileError::Io(path.to_owned(), e)),
-    };
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| ModelFileError::Io(path.to_owned(), e))?;
     let mut head = vec![0; magic.len()];
     match file.read_exact(&mut head) {
         Ok(()) if head == magic => Ok(()),
@@ -196,6 +250,8 @@ fn check_replaceable(
 }
 
 const GLB_MAGIC: &[u8] = b"glTF";
+/// Largest model file read, far above any villager's.
+const MAX_FILE_BYTES: u64 = 256 << 20;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Writes `project`'s model to the model file at `path` and the images its
@@ -203,30 +259,31 @@ const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 /// for it. Refuses to replace a file that isn't a model file or a PNG.
 pub fn write(
     project: &Project,
-    path: &Path,
+    path: &ModelFilePath,
     variants: &[usize],
     units: Units,
 ) -> Result<(), ModelFileError> {
-    check_replaceable(path, GLB_MAGIC, ModelFileError::NotModelFile)?;
+    let file = path.as_path();
+    check_replaceable(file, GLB_MAGIC, ModelFileError::NotModelFile)?;
     let uris: Vec<String> = image_paths(project, path)
         .iter()
         .map(|p| uri(&p.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
     let bytes = encode(project, &uris, units)?;
-    write_images(project, path, variants)?;
-    write_atomic(path, &bytes).map_err(|e| ModelFileError::Io(path.to_owned(), e))
+    write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))?;
+    write_images(project, path, variants)
 }
 
-/// Writes the images the model file at `path` shows for `project`'s
-/// textures, each in the variant `variants` gives for it; external
-/// textures show their preview, whatever `variants` gives. Refuses to
-/// replace a file that isn't a PNG.
+/// Writes the images the model file at `path`, which must exist, shows for
+/// `project`'s textures, each in the variant `variants` gives for it;
+/// external textures show their preview, whatever `variants` gives.
+/// Refuses to replace a file that isn't a PNG.
 ///
 /// Panics unless `variants` has one entry per texture, each a variant of a
 /// painted texture.
 pub fn write_images(
     project: &Project,
-    path: &Path,
+    path: &ModelFilePath,
     variants: &[usize],
 ) -> Result<(), ModelFileError> {
     assert_eq!(
@@ -234,6 +291,11 @@ pub fn write_images(
         project.textures().len(),
         "one variant per texture"
     );
+    let file = path.as_path();
+    if !std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
+        return Err(ModelFileError::NoModelFile(file.to_owned()));
+    }
+    check_replaceable(file, GLB_MAGIC, ModelFileError::NoModelFile)?;
     let images = image_paths(project, path);
     for image in &images {
         check_replaceable(image, PNG_MAGIC, ModelFileError::NotPng)?;
@@ -374,7 +436,8 @@ impl Vertices {
             self.positions.push(position.to_array());
             self.normals.push(normal.to_array());
             self.uvs.push(uv.to_array());
-            self.joints.push(node.0 as u16);
+            self.joints
+                .push(u16::try_from(node.0).expect("JOINTS_0 holds node ids below 65536"));
             self.positions.len() as u32 - 1
         })
     }
@@ -414,6 +477,8 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                 let v = mesh.vertices[c.vertex as usize];
                 let f = v.followed(id);
                 let p = world[f.index()].transform_point3(v.position) * s;
+                // A zero normal, which a few AC vertices have, stays zero
+                // rather than taking a made-up direction.
                 let n = (normals[f.index()] * v.normal).normalize_or_zero();
                 run.push(verts.add(f, p, n, c.uv));
             }
@@ -492,7 +557,8 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
         .iter()
         .map(|m| {
             let (scale, rotation, translation) = m.to_scale_rotation_translation();
-            (scale, rotation, translation * s)
+            // A sheared matrix gives a rotation that isn't unit length.
+            (scale, rotation.normalize(), translation * s)
         })
         .collect();
     let written_world = model.compose(
@@ -623,10 +689,25 @@ fn glb(mut json: Vec<u8>, mut bin: Vec<u8>) -> Vec<u8> {
 /// the file was written with.
 pub fn read(
     project: &Project,
-    path: &Path,
+    path: &ModelFilePath,
     units: Units,
 ) -> Result<Vec<Option<Mesh>>, ModelFileError> {
-    let bytes = std::fs::read(path).map_err(|e| ModelFileError::Io(path.to_owned(), e))?;
+    use std::io::Read as _;
+    let file = path.as_path();
+    let io = |e| ModelFileError::Io(file.to_owned(), e);
+    let meta = std::fs::metadata(file).map_err(io)?;
+    if !meta.is_file() {
+        return Err(ModelFileError::NotModelFile(file.to_owned()));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .map_err(io)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ModelFileError::TooLarge(file.to_owned()));
+    }
     decode(project, &bytes, units)
 }
 
@@ -740,7 +821,10 @@ fn decode(
     bytes: &[u8],
     units: Units,
 ) -> Result<Vec<Option<Mesh>>, ModelFileError> {
-    let gltf = gltf::Gltf::from_slice(bytes)?;
+    // The gltf crate panics on some malformed files, such as a short header
+    // or a primitive naming a missing accessor, before returning an error.
+    let gltf = std::panic::catch_unwind(|| gltf::Gltf::from_slice(bytes))
+        .map_err(|_| ModelFileError::Unreadable)??;
     let blob = gltf.blob.as_deref().unwrap_or_default();
     if gltf
         .buffers()
@@ -828,17 +912,28 @@ fn decode(
                 ibms
             }
         };
-        // Each joint's bind-space-to-file matrix and project node, or the
-        // bone's name where the project has no such node.
-        let joints: Vec<Result<(Mat4, NodeId), String>> = skin
+        // Each joint's bind-space-to-file matrix, its normal matrix, and its
+        // project node, or the bone's name where the project has no such
+        // node.
+        let joints: Vec<Result<(Mat4, Mat3, NodeId), String>> = skin
             .joints()
             .zip(&ibms)
             .map(|(jn, ibm)| {
                 let name = jn.name().unwrap_or_default();
                 let id = by_name.get(name).copied().ok_or_else(|| name.to_owned())?;
-                Ok((global[jn.index()] * *ibm, id))
+                let m = global[jn.index()] * *ibm;
+                Ok((m, normal_matrix(m), id))
             })
             .collect();
+        for (m, _, id) in joints.iter().flatten() {
+            let det = m.determinant();
+            if !m.is_finite() || !det.is_finite() || det == 0.0 {
+                return Err(malformed(&format!(
+                    "skin: bone {:?} is scaled to nothing or isn't a finite transform",
+                    model.node(*id).name
+                )));
+            }
+        }
 
         for prim in mesh.primitives() {
             if prim.mode() != gltf::mesh::Mode::Triangles {
@@ -875,11 +970,26 @@ fn decode(
                 "vertex positions",
             )?;
             checked(gltf::Semantic::Normals, POSITION_KINDS, "normals")?;
-            checked(gltf::Semantic::TexCoords(0), UV_KINDS, "UV map")?;
+            // The UV map the material's texture names, by default the first.
+            let uv_set = prim
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .map_or(0, |t| t.tex_coord());
+            checked(gltf::Semantic::TexCoords(uv_set), UV_KINDS, "UV map")?;
             let mut sets = 0;
+            let vertex_count = attribute(&prim, &gltf::Semantic::Positions)
+                .expect("checked above")
+                .count();
             while let Some(j) = attribute(&prim, &gltf::Semantic::Joints(sets)) {
                 check_accessor(&j, JOINT_KINDS, blob.len(), &object, "bone list")?;
                 checked(gltf::Semantic::Weights(sets), WEIGHT_KINDS, "bone weights")?;
+                let w = attribute(&prim, &gltf::Semantic::Weights(sets)).expect("checked above");
+                if j.count() != vertex_count || w.count() != vertex_count {
+                    return Err(malformed(
+                        "skin: its bone lists and vertices differ in number",
+                    ));
+                }
                 sets += 1;
             }
             if let Some(i) = prim.indices() {
@@ -898,7 +1008,7 @@ fn decode(
                 .map(Vec3::from)
                 .collect();
             let uvs: Vec<Vec2> = reader
-                .read_tex_coords(0)
+                .read_tex_coords(uv_set)
                 .ok_or_else(|| missing("UV map"))?
                 .into_f32()
                 .map(Vec2::from)
@@ -920,6 +1030,11 @@ fn decode(
                     .take(positions.len())
                 {
                     for (j, w) in j.into_iter().zip(w) {
+                        if !(w.is_finite() && w >= 0.0) {
+                            return Err(malformed(
+                                "skin: a bone weight is negative or not a number",
+                            ));
+                        }
                         if w > 0.0 {
                             weighted[v] += 1;
                             bone[v] = Some(j as usize);
@@ -951,7 +1066,7 @@ fn decode(
                 for (c, &v) in corners.iter_mut().zip(tri) {
                     let v = v as usize;
                     let j = bone[v].expect("checked above");
-                    let (m, id) = joints
+                    let (m, nm, id) = joints
                         .get(j)
                         .cloned()
                         .unwrap_or_else(|| Err(format!("joint {j}")))
@@ -959,8 +1074,13 @@ fn decode(
                             object: object.clone(),
                             bone,
                         })?;
+                    if !(positions[v].is_finite() && normals[v].is_finite()) {
+                        return Err(malformed(
+                            "vertex: its position or normal isn't a finite number",
+                        ));
+                    }
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
-                    let n = normal_matrix(m) * normals[v];
+                    let n = nm * normals[v];
                     let local = (
                         id,
                         to_local[id.index()].transform_point3(p),
@@ -969,7 +1089,7 @@ fn decode(
                     );
                     if !(local.1.is_finite() && local.2.is_finite() && local.3.is_finite()) {
                         return Err(malformed(
-                            "vertex: its position, normal, or UV isn't a finite number, as from a bone scaled to zero",
+                            "vertex: its position, normal, or UV isn't a finite number in the model",
                         ));
                     }
                     *c = local;
@@ -1385,14 +1505,32 @@ mod tests {
     #[test]
     fn image_paths_sit_beside_the_file() {
         let p = project(Vec3::ONE, meshes(), &["body", "body"]);
+        let path = ModelFilePath::new("/nonexistent-dir/my cat.glb").unwrap();
         assert_eq!(
-            image_paths(&p, Path::new("/x/my cat.glb")),
+            image_paths(&p, &path),
             [
-                PathBuf::from("/x/my cat.body.png"),
-                PathBuf::from("/x/my cat.body.1.png")
+                PathBuf::from("/nonexistent-dir/my cat.0-body.png"),
+                PathBuf::from("/nonexistent-dir/my cat.1-body.png")
             ]
         );
-        assert_eq!(uri("my cat.body.png"), "my%20cat.body.png");
+        assert_eq!(uri("my cat.0-body.png"), "my%20cat.0-body.png");
+    }
+
+    #[test]
+    fn model_file_paths_are_absolute_utf8_glb_files() {
+        assert!(ModelFilePath::new("rel/m.glb").is_err());
+        assert!(ModelFilePath::new("/x/m.png").is_err());
+        assert!(ModelFilePath::new("/x/m").is_err());
+        // The directory resolves through links.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&real, real.join("link")).unwrap();
+        assert_eq!(
+            ModelFilePath::new(real.join("link/m.glb"))
+                .unwrap()
+                .as_path(),
+            real.join("m.glb")
+        );
     }
 
     #[test]
@@ -1418,9 +1556,15 @@ mod tests {
     fn writes_the_file_and_its_images_but_not_over_other_files() {
         let p = sample();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.glb");
+        let path = ModelFilePath::new(dir.path().join("m.glb")).unwrap();
+        let image = path.as_path().with_file_name("m.0-body.png");
+        // Images go only beside an existing model file.
+        assert!(matches!(
+            write_images(&p, &path, &[0]),
+            Err(ModelFileError::NoModelFile(_))
+        ));
         write(&p, &path, &[0], UNITS).unwrap();
-        assert!(dir.path().join("m.body.png").is_file());
+        assert!(image.is_file());
         let meshes = read(&p, &path, UNITS).unwrap();
         assert_eq!(
             summary(meshes.iter().map(Option::as_ref)),
@@ -1429,17 +1573,56 @@ mod tests {
         // Writing again replaces both.
         write(&p, &path, &[0], UNITS).unwrap();
 
-        let other = dir.path().join("notes.txt");
-        std::fs::write(&other, "keep me").unwrap();
+        let other = ModelFilePath::new(dir.path().join("notes.glb")).unwrap();
+        std::fs::write(other.as_path(), "keep me").unwrap();
         assert!(matches!(
             write(&p, &other, &[0], UNITS),
             Err(ModelFileError::NotModelFile(_))
         ));
-        std::fs::write(dir.path().join("m.body.png"), "keep me").unwrap();
         assert!(matches!(
-            write(&p, &path, &[0], UNITS),
+            write_images(&p, &other, &[0]),
+            Err(ModelFileError::NoModelFile(_))
+        ));
+        std::fs::write(&image, "keep me").unwrap();
+        assert!(matches!(
+            write_images(&p, &path, &[0]),
             Err(ModelFileError::NotPng(_))
         ));
-        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(other.as_path()).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&image).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn reading_refuses_what_isnt_a_regular_file() {
+        let p = sample();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d.glb")).unwrap();
+        let path = ModelFilePath::new(dir.path().join("d.glb")).unwrap();
+        assert!(matches!(
+            read(&p, &path, UNITS),
+            Err(ModelFileError::NotModelFile(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_glb_headers_are_errors_not_panics() {
+        let p = sample();
+        let mut short = b"glTF".to_vec();
+        short.extend_from_slice(&2u32.to_le_bytes());
+        short.extend_from_slice(&4u32.to_le_bytes());
+        assert!(decode(&p, &short, UNITS).is_err());
+    }
+
+    #[test]
+    fn bones_scaled_to_nothing_are_refused() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        let flat = edit_json(&bytes, |doc| {
+            doc["nodes"][1]["scale"] = json!([0.0, 0.0, 0.0]);
+        });
+        assert!(matches!(
+            decode(&p, &flat, UNITS),
+            Err(ModelFileError::Malformed { .. })
+        ));
     }
 }

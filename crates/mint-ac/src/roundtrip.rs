@@ -160,7 +160,7 @@ fn reimport(project: &Project, pose_file: &CFile) -> Project {
 /// `project` with its model sent to a model file and read back.
 fn through_model_file(project: &Project) -> Project {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("model.glb");
+    let path = model_file::ModelFilePath::new(dir.path().join("model.glb")).unwrap();
     let variants = vec![0; project.textures().len()];
     model_file::write(project, &path, &variants, crate::MODEL_FILE_UNITS).unwrap();
     let meshes = model_file::read(project, &path, crate::MODEL_FILE_UNITS).unwrap();

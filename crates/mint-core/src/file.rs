@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use glam::{Quat, UVec2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::model_file::ModelFilePath;
 use crate::texture::LayerContent;
 use crate::{
     AlphaMode, Anchor, Axes, Corner, ExportTarget, HalfPoint, Layer, Material, Mesh, Mirror, Model,
@@ -47,8 +48,6 @@ pub enum SaveError {
     Png(PathBuf, png::EncodingError),
     #[error("could not write the project file: {0}")]
     Ron(#[from] ron::Error),
-    #[error("the model file path {0} isn't valid UTF-8, so the project file can't store it")]
-    ModelFilePath(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +84,8 @@ pub enum LoadError {
     Texture(#[from] crate::TextureError),
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
+    #[error("the project's model file {0:?}: {1}")]
+    ModelFile(String, crate::model_file::ModelFileError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -290,7 +291,11 @@ enum StyleFile {
 /// one. It is stored relative to the project directory when it sits under
 /// that directory or its parent, so the two can move together, and absolute
 /// otherwise.
-pub fn save(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<(), SaveError> {
+pub fn save(
+    project: &Project,
+    model_file: Option<&ModelFilePath>,
+    dir: &Path,
+) -> Result<(), SaveError> {
     stage(project, model_file, dir)?.commit(dir)
 }
 
@@ -299,7 +304,7 @@ pub fn save(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<
 #[derive(Debug)]
 pub struct Loaded {
     pub project: Project,
-    pub model_file: Option<PathBuf>,
+    pub model_file: Option<ModelFilePath>,
 }
 
 /// A save whose images are written but whose project file is not.
@@ -313,7 +318,11 @@ struct Staged {
 }
 
 /// Writes the images of `project` into `dir` and prepares its project file.
-fn stage(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<Staged, SaveError> {
+fn stage(
+    project: &Project,
+    model_file: Option<&ModelFilePath>,
+    dir: &Path,
+) -> Result<Staged, SaveError> {
     // Load would refuse it; checked before anything is written.
     if let Some(t) = project
         .textures()
@@ -328,6 +337,7 @@ fn stage(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<Sta
     let previous = referenced_images(dir);
     let images = dir.join(IMAGE_DIR);
     std::fs::create_dir_all(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
+    let model_file = model_file.map(|p| stored_model_file(dir, p)).transpose()?;
     let linked =
         std::fs::symlink_metadata(&images).map_err(|e| SaveError::Io(images.clone(), e))?;
     if !linked.is_dir() {
@@ -412,10 +422,7 @@ fn stage(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<Sta
             .rotations()
             .map(|(id, q)| (id.0, q.to_array()))
             .collect(),
-        model_file: match model_file {
-            Some(p) => Some(stored_model_file(dir, p)?),
-            None => None,
-        },
+        model_file,
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(4))?;
     Ok(Staged {
@@ -596,11 +603,12 @@ pub fn load(dir: &Path) -> Result<Loaded, LoadError> {
     }
     let model_file = match file.model_file {
         // Against the directory's resolved path, as it was stored.
-        Some(p) => Some(normalize(
-            &dir.canonicalize()
-                .map_err(|e| LoadError::Io(dir.to_owned(), e))?
-                .join(p),
-        )),
+        Some(p) => {
+            let dir = dir
+                .canonicalize()
+                .map_err(|e| LoadError::Io(dir.to_owned(), e))?;
+            Some(ModelFilePath::new(dir.join(&p)).map_err(|e| LoadError::ModelFile(p, e))?)
+        }
         None => None,
     };
     let project = Project::new(
@@ -812,14 +820,14 @@ fn relative_inside(rel: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// How the project file stores the model file at absolute `path` for a
-/// project in `dir`: relative to `dir`'s resolved path when `path` sits
-/// under it or its parent, else absolute.
-fn stored_model_file(dir: &Path, path: &Path) -> Result<String, SaveError> {
+/// How the project file stores the model file at `path` for a project in
+/// `dir`: relative to `dir`'s resolved path when `path` sits under it or
+/// its parent, else absolute.
+fn stored_model_file(dir: &Path, path: &ModelFilePath) -> Result<String, SaveError> {
     let dir = dir
         .canonicalize()
         .map_err(|e| SaveError::Io(dir.to_owned(), e))?;
-    let path = normalize(path);
+    let path = path.as_path();
     let stored = if let Ok(inside) = path.strip_prefix(&dir) {
         inside.to_owned()
     } else if let Some(rest) = dir
@@ -828,29 +836,12 @@ fn stored_model_file(dir: &Path, path: &Path) -> Result<String, SaveError> {
     {
         Path::new("..").join(rest)
     } else {
-        path.clone()
+        path.to_owned()
     };
-    stored
-        .to_str()
-        .map(str::to_owned)
-        .ok_or(SaveError::ModelFilePath(path))
-}
-
-/// `path` with `.` and `..` components removed lexically.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push(c);
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
+    Ok(stored
+        .into_os_string()
+        .into_string()
+        .expect("parts of a UTF-8 path"))
 }
 
 /// Resolves an image path from the project file, which must stay inside
@@ -1209,46 +1200,51 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let (a, b) = (root.join("a/project"), root.join("b/project"));
+        std::fs::create_dir_all(root.join("a/blender")).unwrap();
         let p = sample();
         let stored = |dir: &Path| {
             let text = std::fs::read_to_string(dir.join(PROJECT_FILE)).unwrap();
             ron::from_str::<ProjectFile>(&text).unwrap().model_file
         };
+        let path = |p: &Path| ModelFilePath::new(p).unwrap();
 
         // Beside the project, relative, so the two move together.
-        let model = root.join("a/blender/model.glb");
+        let model = path(&root.join("a/blender/model.glb"));
         save(&p, Some(&model), &a).unwrap();
         assert_eq!(stored(&a).as_deref(), Some("../blender/model.glb"));
         let loaded = load(&a).unwrap();
         assert_eq!(loaded.project, p);
-        assert_eq!(loaded.model_file.as_deref(), Some(model.as_path()));
+        assert_eq!(loaded.model_file, Some(model));
         std::fs::rename(root.join("a"), root.join("b")).unwrap();
         assert_eq!(
             load(&b).unwrap().model_file,
-            Some(root.join("b/blender/model.glb"))
+            Some(path(&root.join("b/blender/model.glb")))
         );
 
         // Inside the project, plainly relative.
-        save(&p, Some(&b.join("m.glb")), &b).unwrap();
+        save(&p, Some(&path(&b.join("m.glb"))), &b).unwrap();
         assert_eq!(stored(&b).as_deref(), Some("m.glb"));
 
         // Elsewhere, absolute.
-        save(&p, Some(Path::new("/mnt/usb/m.glb")), &b).unwrap();
+        save(&p, Some(&path(Path::new("/mnt/usb/m.glb"))), &b).unwrap();
         assert_eq!(stored(&b).as_deref(), Some("/mnt/usb/m.glb"));
 
-        // Through a link, against the project's real place.
+        // Through a link, to the project or to the model file, against
+        // their real places.
         let link = root.join("link");
         std::os::unix::fs::symlink(root.join("b"), &link).unwrap();
         save(
             &p,
-            Some(&root.join("b/blender/model.glb")),
+            Some(&path(&root.join("b/blender/model.glb"))),
             &link.join("project"),
         )
         .unwrap();
         assert_eq!(stored(&b).as_deref(), Some("../blender/model.glb"));
+        save(&p, Some(&path(&link.join("project/m.glb"))), &b).unwrap();
+        assert_eq!(stored(&b).as_deref(), Some("m.glb"));
         assert_eq!(
             load(&link.join("project")).unwrap().model_file,
-            Some(root.join("b/blender/model.glb"))
+            Some(path(&b.join("m.glb")))
         );
     }
 
