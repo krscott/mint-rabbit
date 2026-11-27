@@ -107,8 +107,9 @@ Blender, File > Import > glTF 2.0 with **Merge Vertices** on, or the model
 arrives split at its UV seams, and **Pack Images** off, or Image > Reload
 won't see new paint. The model is posed as in the Model View and about 3 m
 tall. Weight each vertex fully to one bone, and keep to the existing
-materials; the bones can't change. Export it over the same file (File >
-Export > glTF 2.0), and mint-rabbit reads it again as one undo step; Reload
+materials; the bones can't change. Export it over the same file as glTF
+Binary (File > Export > glTF 2.0), and mint-rabbit reads it again as one undo
+step, also when the project opens after the file changed; Reload
 model file does so by hand, and a file it can't read leaves the project as it
 was and says why. Saving the project rewrites the PNGs. Copy model file path
 and Open model file folder help find the file from Blender.

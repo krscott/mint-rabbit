@@ -110,6 +110,14 @@ pub enum WriteError {
     #[error("no villager in the villager table is drawn on model {0}")]
     ModelNotInTable(String),
     #[error(
+        "the exported model {model} wouldn't draw texture set {texture_set} as it does now: {source}"
+    )]
+    Redraw {
+        model: String,
+        texture_set: String,
+        source: Box<ImportError>,
+    },
+    #[error(
         "texture set {0} already exists at {1}; replace it in place with write_texture_set, or choose a new name"
     )]
     Exists(String, PathBuf),
@@ -387,27 +395,52 @@ impl Decomp {
     }
 
     /// Checks that `export`'s model can replace the source of the model of
-    /// the same name: a villager in the table must be drawn on it, and the
-    /// export must define every array its file shares with other files (its
-    /// skeleton), so whatever refers to them still links. Returns the path
-    /// of that file.
+    /// the same name: a villager in the table must be drawn on it; the
+    /// exported model must load textures of the slots and sizes it loads
+    /// now, which every texture set drawn on it has, so that villager
+    /// imports from it with its own texture set; and the export must define
+    /// every array its file shares with other files (its skeleton), so
+    /// whatever refers to them still links. Returns the path of that file.
     pub fn check_model(&self, export: &Export) -> Result<PathBuf, WriteError> {
-        let model = export.textures.model();
-        if !self.villagers()?.iter().any(|v| v.model == model) {
-            return Err(WriteError::ModelNotInTable(model.to_owned()));
-        }
+        let model = export.model();
+        let v = self
+            .villagers()?
+            .into_iter()
+            .find(|v| v.model == model)
+            .ok_or_else(|| WriteError::ModelNotInTable(model.to_owned()))?;
+        self.check_sizes(&export.textures, &v)?;
         let rel = Self::model_path(model);
         let path = self.root.join(&rel);
         // A static array, such as a display list, is the file's own.
-        let shared = |file: CFile| -> BTreeSet<String> {
+        let shared = |file: &CFile| -> BTreeSet<String> {
             file.decls
-                .into_iter()
+                .iter()
                 .filter(|d| !d.is_static)
-                .map(|d| d.name)
+                .map(|d| d.name.clone())
                 .collect()
         };
-        let existing = shared(self.read(&rel)?);
-        let exported = shared(CFile::parse_str(&path, &export.model_c).map_err(ImportError::from)?);
+        let exported_file = CFile::parse_str(&path, &export.model_c).map_err(ImportError::from)?;
+        // Which textures the model loads follows from the materials its
+        // triangles use, such as where the body atlas starts.
+        let redraw = |source| WriteError::Redraw {
+            model: model.to_owned(),
+            texture_set: v.texture_set.clone(),
+            source: Box::new(source),
+        };
+        let tex = self.read(Self::texture_path(&v.texture_set))?;
+        let pose = self.read(POSE_FILE)?;
+        let redrawn = build_project(&exported_file, &tex, &pose, &v).map_err(redraw)?;
+        let loads = crate::export::texture_sizes(&redrawn);
+        if loads != export.textures.texture_sizes {
+            return Err(WriteError::TextureSizes {
+                model: model.to_owned(),
+                texture_set: v.texture_set.clone(),
+                expected: export.textures.texture_sizes.clone(),
+                actual: loads,
+            });
+        }
+        let existing = shared(&self.read(&rel)?);
+        let exported = shared(&exported_file);
         let missing: Vec<String> = existing.difference(&exported).cloned().collect();
         if !missing.is_empty() {
             return Err(WriteError::Symbols {

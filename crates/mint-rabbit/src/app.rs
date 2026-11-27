@@ -94,7 +94,7 @@ struct Doc {
     /// What `scene` was built from.
     scene_for: (u64, Vec<usize>),
     /// Whether the project could export now, as of an editor generation.
-    check: Option<(u64, Result<(), String>)>,
+    check: Option<(u64, Ready)>,
     /// Follows the editor's model file, when it has one.
     watch: Watch,
 }
@@ -212,7 +212,7 @@ enum Confirm {
     /// Replace unsaved changes with another project.
     Discard(Replace),
     /// Overwrite the texture set's source file in the decomp.
-    ReplaceInDecomp(mint_ac::TextureExport, PathBuf),
+    ReplaceTextureSet(mint_ac::TextureExport, PathBuf),
     /// Overwrite the model's source file in the decomp.
     ReplaceModel(mint_ac::Export, PathBuf),
     /// Save into a folder that holds another project.
@@ -223,12 +223,39 @@ enum Confirm {
     DeleteStamp(String),
 }
 
+/// The texture-only export of a project to the texture set it was imported
+/// from.
+fn export_texture_set(project: &Project) -> Result<mint_ac::TextureExport, String> {
+    mint_ac::imported_from(project)
+        .and_then(|i| mint_ac::export_textures(project, i.texture_set))
+        .map_err(|e| e.to_string())
+}
+
 /// The export of a project to the model and texture set it was imported
 /// from.
-fn export_imported(project: &Project) -> Result<mint_ac::Export, String> {
+fn export_model(project: &Project) -> Result<mint_ac::Export, String> {
     mint_ac::imported_from(project)
         .and_then(|i| mint_ac::export(project, i.model, i.texture_set))
         .map_err(|e| e.to_string())
+}
+
+/// Whether a project can export its texture set alone, and with its model,
+/// or why not.
+#[derive(Clone)]
+struct Ready {
+    textures: Result<(), String>,
+    model: Result<(), String>,
+}
+
+impl Ready {
+    fn of(project: &Project) -> Self {
+        let textures = export_texture_set(project).map(|_| ());
+        // The model's export holds the texture set's, so it fails first.
+        let model = textures
+            .clone()
+            .and_then(|()| export_model(project).map(|_| ()));
+        Self { textures, model }
+    }
 }
 
 /// The line at the bottom of the window: the last thing done or what
@@ -636,6 +663,16 @@ impl App {
         match mint_core::file::load(dir) {
             Ok(loaded) => {
                 self.set_doc(loaded.project, Some(dir.to_owned()), loaded.model_file);
+                // A model file changed since the last save, as in Blender
+                // while the project was closed, is read once it settles.
+                let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                let saved = modified(&dir.join(mint_core::file::PROJECT_FILE));
+                if let Some(doc) = &mut self.doc
+                    && let Some(m) = doc.editor.model_file()
+                    && modified(m.as_path()) > saved
+                {
+                    doc.watch = Watch::new(None);
+                }
                 self.tell(format!("Opened {}", dir.display()));
             }
             Err(e) => self.fail(e.to_string()),
@@ -683,10 +720,8 @@ impl App {
         doc.editor.saved(dir);
         match images {
             None | Some(Ok(())) => self.tell(saved),
-            Some(Err(ModelFileError::NoModelFile(path))) => self.tell(format!(
-                "{saved}; {} is missing, so its images weren't written",
-                path.display()
-            )),
+            // Reported, but saving succeeded.
+            Some(Err(e @ ModelFileError::NoModelFile(_))) => self.tell(format!("{saved}; {e}")),
             Some(Err(e)) => self.fail(format!(
                 "{saved}, but the model file's images couldn't be written: {e}"
             )),
@@ -795,20 +830,19 @@ impl App {
     }
 
     /// Asks to replace the imported texture set's source in the decomp.
-    fn export_in_place(&mut self) {
+    fn replace_texture_set(&mut self) {
         self.status = None;
         let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
-        let project = doc.editor.project();
-        let result = export_imported(project).and_then(|e| {
+        let result = export_texture_set(doc.editor.project()).and_then(|e| {
             decomp
-                .check_texture_set(&e.textures)
-                .map(|p| (e.textures, p))
+                .check_texture_set(&e)
+                .map(|p| (e, p))
                 .map_err(|e| e.to_string())
         });
         match result {
-            Ok((export, path)) => self.ask(Confirm::ReplaceInDecomp(export, path)),
+            Ok((export, path)) => self.ask(Confirm::ReplaceTextureSet(export, path)),
             Err(e) => self.fail(e),
         }
     }
@@ -819,7 +853,7 @@ impl App {
         let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
-        let result = export_imported(doc.editor.project()).and_then(|e| {
+        let result = export_model(doc.editor.project()).and_then(|e| {
             decomp
                 .check_model(&e)
                 .map(|p| (e, p))
@@ -882,20 +916,23 @@ impl App {
 
     /// Whether the open project can export now, or why not; `None` with no
     /// project open.
-    fn export_ready(&mut self) -> Option<Result<(), String>> {
+    fn export_ready(&mut self) -> Option<Ready> {
         // The picker holds the open decomp.
         let has_decomp = self.picker.is_some();
         let doc = self.doc.as_mut()?;
         let generation = doc.editor.generation();
         if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
-            let result = export_imported(doc.editor.project()).map(|_| ());
-            doc.check = Some((generation, result));
+            doc.check = Some((generation, Ready::of(doc.editor.project())));
         }
-        let (_, check) = doc.check.as_ref()?;
-        Some(match check {
-            Err(e) => Err(e.clone()),
-            Ok(()) if !has_decomp => Err("Open the decomp this project came from".into()),
-            Ok(()) => Ok(()),
+        let (_, ready) = doc.check.as_ref()?;
+        let decomp = || {
+            has_decomp
+                .then_some(())
+                .ok_or_else(|| "Open the decomp this project came from".to_owned())
+        };
+        Some(Ready {
+            textures: ready.textures.clone().and_then(|()| decomp()),
+            model: ready.model.clone().and_then(|()| decomp()),
         })
     }
 
@@ -1084,11 +1121,10 @@ impl App {
         }
         ui.separator();
         let ready = self.export_ready();
-        let can_export = matches!(ready, Some(Ok(())));
-        let why_not = match &ready {
-            Some(Err(e)) => e.as_str(),
-            _ => "No project is open",
-        };
+        let no_project = Err("No project is open".to_owned());
+        let textures = ready.as_ref().map_or(&no_project, |r| &r.textures);
+        let model_ready = ready.as_ref().map_or(&no_project, |r| &r.model);
+        let why_not = |r: &Result<(), String>| r.as_ref().err().cloned().unwrap_or_default();
         let imported = self.doc.as_ref().and_then(|d| {
             mint_ac::imported_from(d.editor.project())
                 .ok()
@@ -1102,25 +1138,34 @@ impl App {
             )
         };
         if ui
-            .add_enabled(can_export, egui::Button::new(named("texture set", set)))
+            .add_enabled(
+                textures.is_ok(),
+                egui::Button::new(named("texture set", set)),
+            )
             .on_hover_text("The villager's textures; other villagers on its model keep theirs")
-            .on_disabled_hover_text(why_not)
+            .on_disabled_hover_text(why_not(textures))
             .clicked()
         {
-            self.export_in_place();
+            self.replace_texture_set();
         }
         if ui
-            .add_enabled(can_export, egui::Button::new(named("model", model)))
+            .add_enabled(
+                model_ready.is_ok(),
+                egui::Button::new(named("model", model)),
+            )
             .on_hover_text("The geometry of every villager drawn on this model")
-            .on_disabled_hover_text(why_not)
+            .on_disabled_hover_text(why_not(model_ready))
             .clicked()
         {
             self.replace_model();
         }
         if ui
-            .add_enabled(can_export, egui::Button::new("Export new texture set…"))
+            .add_enabled(
+                textures.is_ok(),
+                egui::Button::new("Export new texture set…"),
+            )
             .on_hover_text("A new texture set, based on this villager, with the steps to add it")
-            .on_disabled_hover_text(why_not)
+            .on_disabled_hover_text(why_not(textures))
             .clicked()
         {
             self.dialog = Some(Dialog::ExportSet {
@@ -1256,19 +1301,24 @@ impl App {
         ui.horizontal(|ui| {
             let half = ui.available_width() * 0.5;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &ready {
-                    Some(Ok(())) => {
+                let problem = ready.as_ref().and_then(|r| match (&r.textures, &r.model) {
+                    (Err(e), _) => Some(format!("Can't export: {e}")),
+                    (Ok(()), Err(e)) => Some(format!("Can't export the model: {e}")),
+                    (Ok(()), Ok(())) => None,
+                });
+                match (&ready, problem) {
+                    (None, _) => {}
+                    (Some(_), None) => {
                         ui.label("Ready to export");
                     }
-                    Some(Err(e)) => {
-                        let text = egui::RichText::new(format!("Can't export: {e}")).color(WARNING);
+                    (Some(_), Some(problem)) => {
+                        let text = egui::RichText::new(problem).color(WARNING);
                         ui.scope(|ui| {
                             ui.set_max_width(half);
                             // Hovering a cut-off label shows all of it.
                             ui.add(egui::Label::new(text).truncate());
                         });
                     }
-                    None => {}
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let text = match &self.status {
@@ -1940,7 +1990,7 @@ impl App {
                 "The open project has unsaved changes.".to_owned(),
                 "Discard",
             ),
-            Confirm::ReplaceInDecomp(_, path) => (
+            Confirm::ReplaceTextureSet(_, path) => (
                 "Replace texture set?",
                 format!(
                     "This overwrites {}. Build the decomp with `python configure.py --non-matching && ninja` to see it.",
@@ -1953,7 +2003,7 @@ impl App {
                 format!(
                     "This overwrites {}, changing the geometry of every villager drawn on {}. Build the decomp with `python configure.py --non-matching && ninja` to see it.",
                     path.display(),
-                    export.textures.model()
+                    export.model()
                 ),
                 "Replace",
             ),
@@ -1990,7 +2040,7 @@ impl App {
             (None, confirm) => self.dialog = Some(Dialog::Confirm(confirm)),
             (Some(false), _) => {}
             (Some(true), Confirm::Discard(r)) => self.do_replace(r, ctx),
-            (Some(true), Confirm::ReplaceInDecomp(export, _)) => {
+            (Some(true), Confirm::ReplaceTextureSet(export, _)) => {
                 let result = self.decomp().map(|d| d.write_texture_set(&export));
                 self.wrote_to_decomp(result);
             }

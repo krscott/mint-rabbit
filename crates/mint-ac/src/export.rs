@@ -125,6 +125,14 @@ impl TextureSymbols {
     }
 }
 
+impl Export {
+    /// The model, such as `cat_1`.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.textures.model()
+    }
+}
+
 impl TextureExport {
     /// The model the textures are drawn on, such as `cat_1`.
     #[must_use]

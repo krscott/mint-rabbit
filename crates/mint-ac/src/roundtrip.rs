@@ -460,8 +460,6 @@ fn export_rasterizes_painted_layers() {
     assert_eq!(canonical(&p), canonical(&again));
 }
 
-/// A texture-only export replaces an existing texture set's source in a
-/// decomp, and only where the villager table will still link.
 fn write_file(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -490,6 +488,8 @@ fn synthetic_decomp(project: &Project) -> (tempfile::TempDir, Decomp) {
     (dir, decomp)
 }
 
+/// A texture-only export replaces an existing texture set's source in a
+/// decomp, and only where the villager table will still link.
 #[test]
 fn texture_export_replaces_a_texture_set_in_the_decomp() {
     use crate::{WriteError, export_textures};
@@ -601,6 +601,7 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
 fn model_export_replaces_a_model_in_the_decomp() {
     use crate::WriteError;
     use glam::Vec3;
+    use mint_core::MaterialId;
 
     let (mut p, _) = synthetic_project();
     let (dir, decomp) = synthetic_decomp(&p);
@@ -621,6 +622,48 @@ fn model_export_replaces_a_model_in_the_decomp() {
     assert!(matches!(
         decomp.write_model(&other),
         Err(WriteError::ModelNotInTable(model)) if model == "u_1"
+    ));
+    // A body texture no triangle uses moves where the model finds the
+    // others in the texture set.
+    let (body, moved_to) = {
+        let body = |offset| {
+            p.textures()
+                .iter()
+                .position(|t| t.name.ends_with(offset))
+                .unwrap()
+        };
+        let material = |texture| {
+            MaterialId(
+                p.materials()
+                    .iter()
+                    .position(|m| m.texture.index() == texture)
+                    .unwrap() as u32,
+            )
+        };
+        (material(body("0x000")), material(body("0x080")))
+    };
+    let mut unused = p.clone();
+    let mut meshes: Vec<_> = unused
+        .model()
+        .meshes()
+        .map(Option::<&Mesh>::cloned)
+        .collect();
+    for t in meshes.iter_mut().flatten().flat_map(|m| &mut m.triangles) {
+        if t.material == body {
+            t.material = moved_to;
+        }
+    }
+    unused.set_meshes(meshes).unwrap();
+    assert!(matches!(
+        decomp.write_model(&export(&unused, "t_1", "t_1").unwrap()),
+        Err(WriteError::Redraw { .. } | WriteError::TextureSizes { .. })
+    ));
+    // Other texture sets on the model load textures of the sizes it loads.
+    let mut resized = edited.clone();
+    resized.textures.texture_sizes[0].1 /= 2;
+    assert!(matches!(
+        decomp.write_model(&resized),
+        Err(WriteError::TextureSizes { .. })
     ));
     // The file shares an array the export would drop; its own arrays,
     // which nothing else can refer to, may change.
