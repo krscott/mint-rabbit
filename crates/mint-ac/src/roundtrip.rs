@@ -462,25 +462,42 @@ fn export_rasterizes_painted_layers() {
 
 /// A texture-only export replaces an existing texture set's source in a
 /// decomp, and only where the villager table will still link.
+fn write_file(root: &Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A decomp-shaped folder holding `project` as model and texture set
+/// `t_1`, the one villager in its table.
+fn synthetic_decomp(project: &Project) -> (tempfile::TempDir, Decomp) {
+    let dir = tempfile::tempdir().unwrap();
+    let full = export(project, "t_1", "t_1").unwrap();
+    write_file(dir.path(), "src/data/npc/model/mdl/t_1.c", &full.model_c);
+    write_file(dir.path(), "src/data/npc/npc_1_wait1.c", &synthetic_pose());
+    write_file(
+        dir.path(),
+        "src/data/npc/npc_draw_data.c",
+        &synthetic_table(),
+    );
+    write_file(
+        dir.path(),
+        "src/data/npc/model/tex/t_1.c",
+        &full.textures.texture_c,
+    );
+    std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
+    let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
+    (dir, decomp)
+}
+
 #[test]
 fn texture_export_replaces_a_texture_set_in_the_decomp() {
-    use crate::{Decomp, WriteError, export_textures};
+    use crate::{WriteError, export_textures};
     use mint_core::{Layer, PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
 
     let (mut p, _) = synthetic_project();
-    let dir = tempfile::tempdir().unwrap();
-    let write = |rel: &str, text: &str| {
-        let path = dir.path().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    };
-    let full = export(&p, "t_1", "t_1").unwrap();
-    write("src/data/npc/model/mdl/t_1.c", &full.model_c);
-    write("src/data/npc/npc_1_wait1.c", &synthetic_pose());
-    write("src/data/npc/npc_draw_data.c", &synthetic_table());
-    write("src/data/npc/model/tex/t_1.c", &full.textures.texture_c);
-    std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
-    let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
+    let (dir, decomp) = synthetic_decomp(&p);
+    let write = |rel: &str, text: &str| write_file(dir.path(), rel, text);
 
     let r = VariantRef {
         texture: TextureId(0),
@@ -573,6 +590,52 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
         panic!("expected a symbol mismatch");
     };
     assert_eq!((missing, extra), (vec!["t_1_extra".to_owned()], vec![]));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("t_1_extra[] = { 0 };\n")
+    );
+}
+
+#[test]
+fn model_export_replaces_a_model_in_the_decomp() {
+    use crate::WriteError;
+    use glam::Vec3;
+
+    let (mut p, _) = synthetic_project();
+    let (dir, decomp) = synthetic_decomp(&p);
+    // Move one vertex, as an edit in another program would.
+    let mut meshes: Vec<_> = p.model().meshes().map(Option::<&Mesh>::cloned).collect();
+    let mesh = meshes.iter_mut().flatten().next().unwrap();
+    mesh.vertices[0].position += Vec3::new(0.0, 25.0, 0.0);
+    p.set_meshes(meshes).unwrap();
+
+    let edited = export(&p, "t_1", "t_1").unwrap();
+    let path = decomp.write_model(&edited).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited.model_c);
+    let v = decomp.villagers().unwrap().remove(0);
+    let again = decomp.import(&v).unwrap();
+    assert_eq!(canonical(&again), canonical(&p));
+
+    let other = export(&p, "u_1", "t_1").unwrap();
+    assert!(matches!(
+        decomp.write_model(&other),
+        Err(WriteError::ModelNotInTable(model)) if model == "u_1"
+    ));
+    // The file shares an array the export would drop; its own arrays,
+    // which nothing else can refer to, may change.
+    write_file(
+        dir.path(),
+        "src/data/npc/model/mdl/t_1.c",
+        &format!(
+            "{}static unsigned char t_1_own[] = {{ 0 }};\nunsigned char t_1_extra[] = {{ 0 }};\n",
+            edited.model_c
+        ),
+    );
+    let Err(WriteError::Symbols { missing, .. }) = decomp.write_model(&edited) else {
+        panic!("expected a symbol mismatch");
+    };
+    assert_eq!(missing, vec!["t_1_extra".to_owned()]);
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
@@ -828,13 +891,17 @@ fn every_built_villager_round_trips() {
                 decomp
                     .check_texture_set(&textures)
                     .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));
+                let full = export(&p, &v.model, &v.texture_set).unwrap();
+                decomp
+                    .check_model(&full)
+                    .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));
                 ok += 1;
             }
             Err(e) => refused.push((v.model.clone(), format!("{}: {e}", v.texture_set))),
         }
     }
     eprintln!(
-        "{ok} villagers round-trip, also through a model file, save and load, and could be replaced"
+        "{ok} villagers round-trip, also through a model file, save and load, and their textures and models could be replaced"
     );
     eprintln!(
         "triangles that move to another mesh through a model file: {}",

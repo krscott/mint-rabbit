@@ -51,11 +51,13 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(project: Project, path: Option<PathBuf>) -> Self {
+    /// An editor of `project`, opened from `path` and linked to
+    /// `model_file`, if they are known.
+    pub fn new(project: Project, path: Option<PathBuf>, model_file: Option<ModelFilePath>) -> Self {
         Self {
             project,
             path,
-            model_file: None,
+            model_file,
             undo: Vec::new(),
             redo: Vec::new(),
             gesture_redo: Vec::new(),
@@ -77,8 +79,13 @@ impl Editor {
         self.model_file.as_ref()
     }
 
-    pub fn set_model_file(&mut self, path: Option<ModelFilePath>) {
-        self.model_file = path;
+    /// Links the project to a model file. A new link is a change to save,
+    /// since the project file records it; undo leaves it alone.
+    pub fn set_model_file(&mut self, path: ModelFilePath) {
+        if self.model_file.as_ref() != Some(&path) {
+            self.model_file = Some(path);
+            self.dirty = true;
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -264,7 +271,7 @@ mod tests {
             Pose::default(),
         )
         .unwrap();
-        Editor::new(project, None)
+        Editor::new(project, None, None)
     }
 
     fn red(e: &mut Editor, r: u8) {
@@ -417,6 +424,22 @@ mod tests {
             steps += 1;
         }
         assert_eq!(steps, UNDO_LIMIT);
+    }
+
+    #[test]
+    fn a_new_model_file_link_is_unsaved_but_not_undone() {
+        let mut e = editor();
+        let dir = tempfile::tempdir().unwrap();
+        let path = ModelFilePath::new(dir.path().join("m.glb")).unwrap();
+        e.set_model_file(path.clone());
+        assert!(e.dirty());
+        assert!(!e.can_undo());
+        e.saved(PathBuf::from("p"));
+        e.set_model_file(path.clone());
+        assert!(!e.dirty());
+        red(&mut e, 1);
+        e.undo();
+        assert_eq!(e.model_file(), Some(&path));
     }
 
     #[test]

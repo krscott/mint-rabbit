@@ -246,6 +246,8 @@ impl Init {
 pub struct Decl {
     pub name: String,
     pub init: Init,
+    /// Declared `static`, so other files can't refer to it.
+    pub is_static: bool,
 }
 
 /// The declarations of one C file, in source order.
@@ -272,7 +274,6 @@ impl CFile {
     }
 
     /// Parses C source text that includes no files.
-    #[cfg(test)]
     pub fn parse_str(path: &Path, text: &str) -> Result<Self, CError> {
         let mut files = vec![path.to_owned()];
         let mut tokens = Vec::new();
@@ -520,11 +521,15 @@ impl Parser<'_> {
                 Tok::Punct(")" | "]" | "}") => depth -= 1,
                 Tok::Punct(";") if depth == 0 => statement_start = self.pos + 1,
                 Tok::Punct("=") if depth == 0 => {
-                    let name = self.declared_name(statement_start)?;
+                    let (name, is_static) = self.declared_name(statement_start)?;
                     self.pos += 1;
                     let init = self.init()?;
                     self.expect(";")?;
-                    decls.push(Decl { name, init });
+                    decls.push(Decl {
+                        name,
+                        init,
+                        is_static,
+                    });
                     statement_start = self.pos;
                     continue;
                 }
@@ -536,19 +541,23 @@ impl Parser<'_> {
     }
 
     /// The last identifier at bracket depth 0 between `start` and the `=`,
-    /// which skips attribute groups and array suffixes.
-    fn declared_name(&self, start: usize) -> Result<String, CError> {
+    /// which skips attribute groups and array suffixes, and whether the
+    /// declaration is `static`.
+    fn declared_name(&self, start: usize) -> Result<(String, bool), CError> {
         let mut depth = 0i32;
         let mut name = None;
+        let mut is_static = false;
         for t in &self.tokens[start..self.pos] {
             match &t.tok {
                 Tok::Punct("(" | "[") => depth += 1,
                 Tok::Punct(")" | "]") => depth -= 1,
+                Tok::Ident(s) if depth == 0 && s == "static" => is_static = true,
                 Tok::Ident(s) if depth == 0 && s != "__attribute__" => name = Some(s.clone()),
                 _ => {}
             }
         }
-        name.ok_or_else(|| self.error("declaration without a name"))
+        let name = name.ok_or_else(|| self.error("declaration without a name"))?;
+        Ok((name, is_static))
     }
 
     fn init(&mut self) -> Result<Init, CError> {

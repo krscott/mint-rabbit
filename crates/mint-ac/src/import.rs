@@ -1,5 +1,5 @@
 //! Reads villagers from a built decomp checkout as projects, and writes
-//! exported texture sets back into it.
+//! exported texture sets and models back into it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -10,12 +10,12 @@ use mint_core::{
     Project, Rgba8, RgbaImage, Slot, Texture, TextureId, Transform, Triangle, Variant, Vertex,
 };
 
-use crate::TextureExport;
 use crate::anim;
 use crate::c::{CError, CFile, Expr, Init};
 use crate::disc::{self, NamesError};
 use crate::gbi::{self, DrawState, RawVtx, TexSource};
 use crate::gx;
+use crate::{Export, TextureExport};
 use crate::{
     OPTION_MODEL, OPTION_TEXTURE_SET, SLOT_BODY, SLOT_CLOTHING, SLOT_EYES, SLOT_MOUTH, TARGET,
 };
@@ -107,6 +107,8 @@ pub enum ImportError {
 pub enum WriteError {
     #[error("texture set {0} is not in the villager table")]
     NotInTable(String),
+    #[error("no villager in the villager table is drawn on model {0}")]
+    ModelNotInTable(String),
     #[error(
         "texture set {0} already exists at {1}; replace it in place with write_texture_set, or choose a new name"
     )]
@@ -380,9 +382,59 @@ impl Decomp {
         Ok(path)
     }
 
+    fn model_path(model: &str) -> String {
+        format!("src/data/npc/model/mdl/{model}.c")
+    }
+
+    /// Checks that `export`'s model can replace the source of the model of
+    /// the same name: a villager in the table must be drawn on it, and the
+    /// export must define every array its file shares with other files (its
+    /// skeleton), so whatever refers to them still links. Returns the path
+    /// of that file.
+    pub fn check_model(&self, export: &Export) -> Result<PathBuf, WriteError> {
+        let model = export.textures.model();
+        if !self.villagers()?.iter().any(|v| v.model == model) {
+            return Err(WriteError::ModelNotInTable(model.to_owned()));
+        }
+        let rel = Self::model_path(model);
+        let path = self.root.join(&rel);
+        // A static array, such as a display list, is the file's own.
+        let shared = |file: CFile| -> BTreeSet<String> {
+            file.decls
+                .into_iter()
+                .filter(|d| !d.is_static)
+                .map(|d| d.name)
+                .collect()
+        };
+        let existing = shared(self.read(&rel)?);
+        let exported = shared(CFile::parse_str(&path, &export.model_c).map_err(ImportError::from)?);
+        let missing: Vec<String> = existing.difference(&exported).cloned().collect();
+        if !missing.is_empty() {
+            return Err(WriteError::Symbols {
+                path,
+                missing,
+                extra: exported.difference(&existing).cloned().collect(),
+            });
+        }
+        Ok(path)
+    }
+
+    /// Replaces the source of `export`'s model, after
+    /// [`Self::check_model`], so the next build draws every villager on that
+    /// model with the exported geometry. Returns the path written.
+    ///
+    /// As with [`Self::write_texture_set`], the decomp must then be
+    /// configured with `python configure.py --non-matching` to build it.
+    pub fn write_model(&self, export: &Export) -> Result<PathBuf, WriteError> {
+        let path = self.check_model(export)?;
+        mint_core::file::write_atomic(&path, export.model_c.as_bytes())
+            .map_err(|e| WriteError::Io(path.clone(), e))?;
+        Ok(path)
+    }
+
     /// Imports one villager as a project.
     pub fn import(&self, v: &VillagerRef) -> Result<Project, ImportError> {
-        let model_file = self.read(format!("src/data/npc/model/mdl/{}.c", v.model))?;
+        let model_file = self.read(Self::model_path(&v.model))?;
         let tex_file = self.read(Self::texture_path(&v.texture_set))?;
         let pose_file = self.read(POSE_FILE)?;
         build_project(&model_file, &tex_file, &pose_file, v)

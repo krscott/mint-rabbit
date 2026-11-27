@@ -13,6 +13,7 @@ mod scene;
 mod stamps;
 mod surface;
 mod texture_view;
+mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

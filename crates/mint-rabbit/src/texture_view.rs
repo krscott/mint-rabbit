@@ -2125,7 +2125,7 @@ mod tests {
             texture: TextureId(0),
             variant: 0,
         };
-        (Editor::new(project, None), r)
+        (Editor::new(project, None, None), r)
     }
 
     const PAINT: Paint = Paint {
