@@ -508,10 +508,9 @@ fn posed(world: &[Mat4], normals: &[Mat3], f: NodeId, v: &Vertex, s: f32) -> (Ve
     )
 }
 
-/// A project's vertices, by the node each follows and the position a model
-/// file written from the project holds for it, each with the normal the
-/// file holds, its position, and its normal: for giving back exactly the
-/// vertices of a file read unedited.
+/// The vertices a project's triangles use, by the node each follows and the
+/// position a model file written from the project holds for it: for giving
+/// back exactly the vertices of a file read unedited.
 struct Written(HashMap<(NodeId, [u32; 3]), Vec<WrittenVertex>>);
 
 /// A project vertex as a model file holds it.
@@ -542,8 +541,7 @@ impl Written {
             for c in mesh.triangles.iter().flat_map(|t| t.corners) {
                 used[c.vertex as usize] = true;
             }
-            let used = mesh.vertices.iter().zip(used).filter(|(_, u)| *u);
-            for (v, _) in used {
+            for (v, _) in mesh.vertices.iter().zip(used).filter(|(_, u)| *u) {
                 let f = v.followed(owner);
                 let (p, n) = posed(&world, &normals, f, v, units.meters_per_unit);
                 written
@@ -560,39 +558,40 @@ impl Written {
     }
 
     /// The position and normal of a vertex following `node` that a model
-    /// file holds at `position` with `normal`, read as `read`. Where the
-    /// file holds it exactly as writing the project would, and the skeleton
-    /// still carries it to about where the project has it, it takes the
-    /// project's position, and its normal too where that is as written and
-    /// the skeleton still turns it to about the project's direction; so
-    /// a file read back unedited gives the project as it was, however often
-    /// it is written and read, and any edit is read. A position written for
-    /// project vertices at different places, or a normal for different
-    /// normals, keeps its read value.
+    /// file holds at `position` with `normal`, which its joint turns to
+    /// `skinned`, read as `read`.
+    ///
+    /// - A position written for just one project position, which `read`
+    ///   lies within [`POSITION_TOLERANCE`] of, gives that back.
+    /// - A normal written for just one project normal, which the joint
+    ///   turns by no more than [`NORMAL_TOLERANCE`], gives that back.
+    /// - Anything else keeps its read value.
+    ///
+    /// So a file read back unedited gives the project as it was, however
+    /// often it is written and read, and any edit to its vertices or its
+    /// skeleton beyond the file's roundoff is read.
     fn unedited(
         &self,
         node: NodeId,
-        position: Vec3,
-        normal: Vec3,
+        (position, normal, skinned): (Vec3, Vec3, Vec3),
         read: (Vec3, Vec3),
     ) -> (Vec3, Vec3) {
         let Some(written) = self.0.get(&(node, bits(position))) else {
             return read;
         };
-        let Some(position) = only(written.iter().map(|w| w.position))
+        let position = only(written.iter().map(|w| w.position))
             .filter(|p| (*p - read.0).abs().max_element() <= POSITION_TOLERANCE)
-        else {
-            return read;
-        };
-        let normal = bits(normal);
-        let turned = direction(read.1);
+            .unwrap_or(read.0);
+        // Compared as the file holds it, where nothing magnifies roundoff.
+        let unturned = (direction(skinned) - normal).abs().max_element() <= NORMAL_TOLERANCE;
+        let normal_bits = bits(normal);
         let normal = only(
             written
                 .iter()
-                .filter(|w| w.normal_bits == normal)
+                .filter(|w| w.normal_bits == normal_bits)
                 .map(|w| w.normal),
         )
-        .filter(|n| (direction(*n) - turned).abs().max_element() <= NORMAL_TOLERANCE)
+        .filter(|_| unturned)
         .unwrap_or(read.1);
         (position, normal)
     }
@@ -1291,11 +1290,11 @@ fn decode(
                     }
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
                     // Checked before normalizing, which turns NaN into zero.
-                    let n = to_local_normal[id.index()] * (nm * normals[v]);
+                    let skinned = nm * normals[v];
+                    let n = to_local_normal[id.index()] * skinned;
                     let (position, normal) = written.unedited(
                         id,
-                        positions[v],
-                        normals[v],
+                        (positions[v], normals[v], skinned),
                         (
                             to_local[id.index()].transform_point3(p),
                             direction(n) * units.normal_length,
@@ -1536,28 +1535,40 @@ mod tests {
             normal: facing,
         };
         let written = Written(HashMap::from([((node, bits(file)), vec![vertex(at)])]));
+        let unturned = (file, normal, normal);
         let read = (at + Vec3::X * 1e-4, Vec3::Z);
-        assert_eq!(written.unedited(node, file, normal, read), (at, facing));
+        assert_eq!(written.unedited(node, unturned, read), (at, facing));
         // A normal turned in the file keeps its read value.
         let turned = Vec3::new(0.0, 0.1, 1.0).normalize();
-        assert_eq!(written.unedited(node, file, turned, read), (at, read.1));
+        assert_eq!(
+            written.unedited(node, (file, turned, turned), read),
+            (at, read.1)
+        );
         // Any move, however small, keeps the read position.
         let moved = file + Vec3::X * f32::EPSILON;
-        assert_eq!(written.unedited(node, moved, normal, read), read);
-        assert_eq!(written.unedited(NodeId::ROOT, file, normal, read), read);
-        // So does a vertex the skeleton carries elsewhere,
+        assert_eq!(written.unedited(node, (moved, normal, normal), read), read);
+        assert_eq!(written.unedited(NodeId::ROOT, unturned, read), read);
+        // So does a vertex the skeleton carries elsewhere, though its normal,
+        // unturned, is given back,
         let carried = (at * 2.0, Vec3::Z);
-        assert_eq!(written.unedited(node, file, normal, carried), carried);
-        // and a normal it turns where the vertex stays, as at a pivot.
+        assert_eq!(
+            written.unedited(node, unturned, carried),
+            (carried.0, facing)
+        );
+        // and a normal the joint turns where the vertex stays, as at a pivot.
         let pivoted = (read.0, Vec3::Y);
-        assert_eq!(written.unedited(node, file, normal, pivoted), (at, Vec3::Y));
-        // And a file position written for vertices at different places.
+        assert_eq!(
+            written.unedited(node, (file, normal, Vec3::Y), pivoted),
+            (at, Vec3::Y)
+        );
+        // A file position written for vertices at different places keeps
+        // its read value, while their one normal is given back.
         let mut shared = written;
         shared
             .0
             .values_mut()
             .for_each(|w| w.push(vertex(at + Vec3::X * 1e-3)));
-        assert_eq!(shared.unedited(node, file, normal, read), read);
+        assert_eq!(shared.unedited(node, unturned, read), (read.0, facing));
     }
 
     #[test]
@@ -1591,7 +1602,17 @@ mod tests {
             doc["nodes"][0]["scale"] = json!([2.0, 2.0, 2.0]);
         });
         let read = decode(&p, &scaled, UNITS).unwrap();
-        assert_ne!(read[1], p.model().meshes().nth(1).unwrap().cloned());
+        let positions = |m: Option<&Mesh>| -> Vec<Vec3> {
+            m.iter()
+                .flat_map(|m| m.vertices.iter().map(|v| v.position))
+                .collect()
+        };
+        let (before, after) = (
+            positions(p.model().meshes().nth(1).unwrap()),
+            positions(read[1].as_ref()),
+        );
+        assert_eq!(before.len(), after.len());
+        assert!(before.iter().zip(&after).all(|(b, a)| b != a), "{after:?}");
     }
 
     #[test]
