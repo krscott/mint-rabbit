@@ -119,6 +119,10 @@ struct ProjectFile {
     textures: Vec<TextureFile>,
     /// Display rotations as quaternions (x, y, z, w), by node.
     pose: BTreeMap<u32, [f32; 4]>,
+    /// The model file's path, relative to the project directory where it
+    /// can be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_file: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -393,6 +397,10 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
             .rotations()
             .map(|(id, q)| (id.0, q.to_array()))
             .collect(),
+        model_file: match project.model_file() {
+            Some(p) => Some(relative_to(&absolute(dir)?, p)),
+            None => None,
+        },
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new().depth_limit(4))?;
     Ok(Staged {
@@ -571,7 +579,13 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
     for (node, q) in file.pose {
         pose.set_rotation(NodeId(node), Quat::from_array(q));
     }
-    Ok(Project::new(
+    let model_file = match file.model_file {
+        Some(p) => Some(normalize(
+            &std::path::absolute(dir.join(p)).map_err(|e| LoadError::Io(dir.to_owned(), e))?,
+        )),
+        None => None,
+    };
+    let mut project = Project::new(
         ExportTarget {
             id: file.target.id,
             options: file.target.options,
@@ -581,7 +595,9 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
         textures,
         file.materials.into_iter().map(material).collect(),
         pose,
-    )?)
+    )?;
+    project.set_model_file(model_file);
+    Ok(project)
 }
 
 fn node_file(model: &Model, id: NodeId) -> NodeFile {
@@ -778,6 +794,47 @@ fn relative_inside(rel: &str) -> bool {
 
 /// Resolves an image path from the project file, which must stay inside
 /// the project directory, links included; returns its resolved path.
+/// `dir` made absolute, without resolving links.
+fn absolute(dir: &Path) -> Result<PathBuf, SaveError> {
+    std::path::absolute(dir).map_err(|e| SaveError::Io(dir.to_owned(), e))
+}
+
+/// `path` relative to directory `dir`, both absolute, or `path` itself when
+/// they share no root. Lexical, so a link in `dir` can make it wrong; the
+/// model file path it stores is only a convenience.
+fn relative_to(dir: &Path, path: &Path) -> PathBuf {
+    let (dir, path) = (normalize(dir), normalize(path));
+    let mut d = dir.components().peekable();
+    let mut p = path.components().peekable();
+    if d.peek() != p.peek() {
+        return path;
+    }
+    while d.peek().is_some() && d.peek() == p.peek() {
+        d.next();
+        p.next();
+    }
+    let mut out: PathBuf = d.map(|_| Component::ParentDir).collect();
+    out.extend(p);
+    out
+}
+
+/// `path` with `.` and `..` components removed lexically.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     if !relative_inside(rel) {
         return Err(LoadError::ImagePath(rel.to_owned()));
@@ -1125,6 +1182,24 @@ mod tests {
         // Saving again over the same directory works too.
         save(&p, dir.path()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), p);
+    }
+
+    #[test]
+    fn the_model_file_path_is_kept_relative_to_the_project() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (root.path().join("a/project"), root.path().join("b/project"));
+        let mut p = sample();
+        p.set_model_file(Some(root.path().join("a/blender/model.glb")));
+        save(&p, &a).unwrap();
+        let text = std::fs::read_to_string(a.join(PROJECT_FILE)).unwrap();
+        assert!(text.contains("\"../blender/model.glb\""), "{text}");
+        assert_eq!(load(&a).unwrap(), p);
+        // Moved with its project, the file is found beside it again.
+        std::fs::rename(root.path().join("a"), root.path().join("b")).unwrap();
+        assert_eq!(
+            load(&b).unwrap().model_file(),
+            Some(root.path().join("b/blender/model.glb").as_path())
+        );
     }
 
     fn images(dir: &Path) -> Vec<PathBuf> {

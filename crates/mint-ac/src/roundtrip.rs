@@ -4,7 +4,10 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use mint_core::{Model, NodeId, Palette, Project, Rgba8, TextureContent, Transform};
+use mint_core::{
+    Corner, Mesh, Model, NodeId, Palette, Project, Rgba8, TextureContent, Transform, Triangle,
+    Vertex, model_file,
+};
 
 use crate::c::CFile;
 use crate::import::{SPECIAL_NPC_MODELS, build_project, parse_villagers};
@@ -64,12 +67,13 @@ fn canonical(p: &Project) -> Canonical {
                         );
                         for c in t.corners {
                             let v = m.vertices[c.vertex as usize];
-                            let st = (c.uv * size * 32.0).round();
-                            let nrm = (v.normal * 127.0).round();
+                            // Adding zero turns -0.0, from float noise, into 0.0.
+                            let st = (c.uv * size * 32.0).round() + 0.0;
+                            let nrm = (v.normal * 127.0).round() + 0.0;
                             let _ = write!(
                                 s,
                                 " p{:?} n{:?} f{} st{:?}",
-                                v.position.round().to_array(),
+                                (v.position.round() + 0.0).to_array(),
                                 nrm.to_array(),
                                 v.followed(id).0,
                                 st.to_array()
@@ -113,6 +117,68 @@ fn reimport(project: &Project, pose_file: &CFile) -> Project {
     let tex = CFile::parse_str(Path::new("rt_1_tex.c"), &out.textures.texture_c).unwrap();
     let v = table_row(&out.textures.table_entry(None).unwrap());
     build_project(&model, &tex, pose_file, &v).unwrap()
+}
+
+/// `project` with its model sent to a model file and read back.
+fn through_model_file(project: &Project) -> Project {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.glb");
+    let variants = vec![0; project.textures().len()];
+    model_file::write(project, &path, &variants, crate::METERS_PER_UNIT).unwrap();
+    let model = model_file::read(project, &path, crate::METERS_PER_UNIT).unwrap();
+    let mut out = project.clone();
+    out.set_model(model).unwrap();
+    out
+}
+
+/// `project` with each triangle in the mesh of the deepest node its corners
+/// follow, as reading a model file places it, and how many triangles moved.
+fn by_deepest_corner(project: &Project) -> (Project, usize) {
+    let model = project.model();
+    let mut depth = vec![0usize; model.nodes().len()];
+    for id in model.ids() {
+        if let Some(p) = model.node(id).parent() {
+            depth[id.index()] = depth[p.index()] + 1;
+        }
+    }
+    let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
+    let mut moved = 0;
+    for id in model.ids() {
+        let Some(mesh) = &model.node(id).mesh else {
+            continue;
+        };
+        for t in &mesh.triangles {
+            let followed = t
+                .corners
+                .map(|c| mesh.vertices[c.vertex as usize].followed(id));
+            let owner = *followed
+                .iter()
+                .max_by_key(|f| (depth[f.index()], std::cmp::Reverse(f.0)))
+                .unwrap();
+            moved += usize::from(owner != id);
+            let out = meshes[owner.index()].get_or_insert_with(Mesh::default);
+            let corners = t.corners.map(|c| {
+                let v = mesh.vertices[c.vertex as usize];
+                let f = v.followed(id);
+                out.vertices.push(Vertex {
+                    follows: (f != owner).then_some(f),
+                    ..v
+                });
+                Corner {
+                    vertex: out.vertices.len() as u32 - 1,
+                    uv: c.uv,
+                }
+            });
+            out.triangles.push(Triangle { corners, ..*t });
+        }
+    }
+    let mut out = model.clone();
+    for (id, mesh) in model.ids().zip(meshes) {
+        out.node_mut(id).mesh = mesh;
+    }
+    let mut p = project.clone();
+    p.set_model(out).unwrap();
+    (p, moved)
 }
 
 /// Joints of the synthetic villager that have display lists: body (slot 0)
@@ -299,6 +365,14 @@ fn synthetic_villager_round_trips() {
 
     let again = reimport(&original, &pose);
     assert_eq!(canonical(&original), canonical(&again));
+}
+
+#[test]
+fn synthetic_villager_round_trips_through_a_model_file() {
+    let (original, pose) = synthetic_project();
+    let again = through_model_file(&original);
+    assert_eq!(canonical(&original), canonical(&again));
+    assert_eq!(canonical(&original), canonical(&reimport(&again, &pose)));
 }
 
 /// Export writes what the layers paint over the base layer, and hidden layers
@@ -675,6 +749,7 @@ fn every_built_villager_round_trips() {
     let decomp = Decomp::open(&root, "GAFE01_00").unwrap_or_else(|e| panic!("{e}"));
     let pose = CFile::read(&root.join("src/data/npc/npc_1_wait1.c"), &[]).unwrap();
     let mut refused = Vec::new();
+    let mut moved = Vec::new();
     let mut ok = 0;
     for v in decomp.villagers().unwrap() {
         match decomp.import(&v) {
@@ -683,6 +758,27 @@ fn every_built_villager_round_trips() {
                     canonical(&p),
                     canonical(&reimport(&p, &pose)),
                     "{}",
+                    v.texture_set
+                );
+                // A triangle whose corners all follow another node moves to
+                // that node's mesh.
+                let (expected, n) = by_deepest_corner(&p);
+                if n > 0 {
+                    moved.push(format!("{} ({n})", v.texture_set));
+                }
+                let sent = through_model_file(&p);
+                assert_eq!(
+                    canonical(&expected),
+                    canonical(&sent),
+                    "{} changed through a model file",
+                    v.texture_set
+                );
+                // Reading welds vertices the import kept apart, so the
+                // export may order its vertices differently.
+                assert_eq!(
+                    canonical(&expected),
+                    canonical(&reimport(&sent, &pose)),
+                    "{} exports differently after a model file",
                     v.texture_set
                 );
                 let dir = tempfile::tempdir().unwrap();
@@ -703,7 +799,13 @@ fn every_built_villager_round_trips() {
             Err(e) => refused.push((v.model.clone(), format!("{}: {e}", v.texture_set))),
         }
     }
-    eprintln!("{ok} villagers round-trip, save and load, and could be replaced");
+    eprintln!(
+        "{ok} villagers round-trip, also through a model file, save and load, and could be replaced"
+    );
+    eprintln!(
+        "triangles that move to another mesh through a model file: {}",
+        moved.join(", ")
+    );
     // Only these may fail: special NPC models the importer cannot represent,
     // and flg_12, whose 0x380-byte body texture is shorter than the 0x400
     // bytes the flg_1 model reads (the game reads past it).

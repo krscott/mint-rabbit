@@ -41,6 +41,11 @@ A mesh vertex that follows a node other than its mesh's node, so that meshes on
 neighboring nodes stay joined when posed.
 _Avoid_: Stitch vertex, shared vertex
 
+**Model File**:
+A copy of a project's model kept outside it for editing in another program;
+the project re-reads it whenever it changes.
+_Avoid_: glTF, Blender file, exchange file
+
 ### Painting
 
 **Palette**:

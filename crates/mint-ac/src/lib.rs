@@ -31,6 +31,10 @@ pub const OPTION_MODEL: &str = "model";
 /// imported from, such as `cat_2`.
 pub const OPTION_TEXTURE_SET: &str = "texture_set";
 
+/// Size in meters of one model unit in a model file, so a villager stands
+/// about 3 m tall there rather than 3 km.
+pub const METERS_PER_UNIT: f32 = 0.001;
+
 /// Texture slots of the AC villager target.
 pub const SLOT_BODY: &str = "body";
 pub const SLOT_EYES: &str = "eyes";

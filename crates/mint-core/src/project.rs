@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glam::UVec2;
@@ -49,6 +50,8 @@ pub struct Project {
     textures: Vec<Texture>,
     materials: Vec<Material>,
     pose: Pose,
+    /// Where the project's model file is, if it has one.
+    model_file: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -104,6 +107,43 @@ fn missing_color(
     colors.find(|&c| !palette.contains(c))
 }
 
+/// Checks that every reference in `model`'s meshes resolves, given the
+/// number of materials.
+fn check_model(model: &Model, materials: usize) -> Result<(), ProjectError> {
+    for node in model.nodes() {
+        let Some(mesh) = &node.mesh else { continue };
+        for v in &mesh.vertices {
+            if let Some(f) = v.follows
+                && !model.contains(f)
+            {
+                return Err(ProjectError::MissingFollowedNode {
+                    node: node.name.clone(),
+                    follows: f.0,
+                });
+            }
+        }
+        for t in &mesh.triangles {
+            if t.material.index() >= materials {
+                return Err(ProjectError::MissingMaterial {
+                    node: node.name.clone(),
+                    material: t.material.0,
+                });
+            }
+            if let Some(c) = t
+                .corners
+                .iter()
+                .find(|c| c.vertex as usize >= mesh.vertices.len())
+            {
+                return Err(ProjectError::MissingVertex {
+                    node: node.name.clone(),
+                    vertex: c.vertex,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Project {
     /// Builds a project, checking that every reference between its parts
     /// resolves.
@@ -138,37 +178,7 @@ impl Project {
                 });
             }
         }
-        for node in model.nodes() {
-            let Some(mesh) = &node.mesh else { continue };
-            for v in &mesh.vertices {
-                if let Some(f) = v.follows
-                    && !model.contains(f)
-                {
-                    return Err(ProjectError::MissingFollowedNode {
-                        node: node.name.clone(),
-                        follows: f.0,
-                    });
-                }
-            }
-            for t in &mesh.triangles {
-                if t.material.index() >= materials.len() {
-                    return Err(ProjectError::MissingMaterial {
-                        node: node.name.clone(),
-                        material: t.material.0,
-                    });
-                }
-                if let Some(c) = t
-                    .corners
-                    .iter()
-                    .find(|c| c.vertex as usize >= mesh.vertices.len())
-                {
-                    return Err(ProjectError::MissingVertex {
-                        node: node.name.clone(),
-                        vertex: c.vertex,
-                    });
-                }
-            }
-        }
+        check_model(&model, materials.len())?;
         Ok(Self {
             target,
             palette,
@@ -176,6 +186,7 @@ impl Project {
             textures,
             materials,
             pose,
+            model_file: None,
         })
     }
 
@@ -217,6 +228,29 @@ impl Project {
     #[must_use]
     pub fn pose(&self) -> &Pose {
         &self.pose
+    }
+
+    /// Replaces the model, checking that every reference in its meshes
+    /// resolves.
+    pub fn set_model(&mut self, model: Model) -> Result<(), ProjectError> {
+        check_model(&model, self.materials.len())?;
+        self.model = Arc::new(model);
+        Ok(())
+    }
+
+    /// The absolute path of the project's model file, if it has one.
+    #[must_use]
+    pub fn model_file(&self) -> Option<&Path> {
+        self.model_file.as_deref()
+    }
+
+    /// Sets where the project's model file is; `path` must be absolute.
+    pub fn set_model_file(&mut self, path: Option<PathBuf>) {
+        assert!(
+            path.as_deref().is_none_or(Path::is_absolute),
+            "model file paths are absolute: {path:?}"
+        );
+        self.model_file = path;
     }
 
     /// Panics if `r` is not a painted variant of this project.
