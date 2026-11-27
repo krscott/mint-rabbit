@@ -796,33 +796,32 @@ impl App {
     }
 
     /// Writes the model to a model file at `path`, links the project to
-    /// it, and reads it back, so the project holds the model as the file
-    /// does (normals at the target's length, each triangle on the deepest
-    /// node of its corners) for Replace model and later reads to start
-    /// from.
+    /// it, and takes the model as the file holds it (normals at the
+    /// target's length, each triangle on the deepest node of its corners),
+    /// as one undo step, for Replace model and later reads to start from.
     fn send_to(&mut self, path: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
         let sent = ModelFilePath::new(path).and_then(|path| {
-            model_file::write(
+            let meshes = model_file::write(
                 doc.editor.project(),
                 &path,
                 &doc.variants,
                 mint_ac::MODEL_FILE_UNITS,
             )?;
-            Ok(path)
+            Ok((path, meshes))
         });
-        let path = match sent {
-            Ok(path) => path,
+        let (path, meshes) = match sent {
+            Ok(sent) => sent,
             Err(e) => return self.fail(e.to_string()),
         };
-        let read = doc.read_model_file(&path);
+        doc.watch.known(watch::stamp(path.as_path()));
         let shown = path.as_path().display().to_string();
         doc.editor.set_model_file(path);
-        match read {
-            Ok(_) => self.tell(format!(
+        match doc.editor.edit(|p| p.set_meshes(meshes)) {
+            Ok(()) => self.tell(format!(
                 "Sent the model to {shown}; import it in Blender with Merge Vertices on and Pack Images off"
             )),
-            Err(e) => self.fail(format!("Sent the model to {shown}, but couldn't read it back: {e}")),
+            Err(e) => self.fail(format!("Sent the model to {shown}, but couldn't take it back: {e}")),
         }
     }
 

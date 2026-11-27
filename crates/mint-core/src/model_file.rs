@@ -277,15 +277,16 @@ const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Writes `project`'s model to the model file at `path` and the images its
 /// materials show beside it, each texture in the variant `variants` gives
-/// for it. Refuses, before writing anything, to replace a file that isn't
-/// a model file or a PNG, or to write a model file it can't read back;
-/// writes the model file last.
+/// for it, and returns the meshes [`read`] gives for that file. Refuses,
+/// before writing anything, to replace a file that isn't a model file or a
+/// PNG, or to write a model file it can't read back; writes the model file
+/// last.
 pub fn write(
     project: &Project,
     path: &ModelFilePath,
     variants: &[usize],
     units: Units,
-) -> Result<(), ModelFileError> {
+) -> Result<Vec<Option<Mesh>>, ModelFileError> {
     let file = path.as_path();
     check_replaceable(file, GLB_MAGIC, ModelFileError::NotModelFile)?;
     let images = image_paths(project, path);
@@ -298,9 +299,11 @@ pub fn write(
         return Err(ModelFileError::TooLarge);
     }
     // So a model file is never replaced by one this can't read back.
-    decode(project, &bytes, units).map_err(|e| ModelFileError::NotReadable(Box::new(e)))?;
+    let meshes =
+        decode(project, &bytes, units).map_err(|e| ModelFileError::NotReadable(Box::new(e)))?;
     write_pngs(project, &images, variants)?;
-    write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))
+    write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))?;
+    Ok(meshes)
 }
 
 /// Writes the images the model file at `path`, which must exist, shows for

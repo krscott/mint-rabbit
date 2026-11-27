@@ -658,8 +658,7 @@ fn model_export_replaces_a_model_in_the_decomp() {
         export(&unused, "t_1", "t_1"),
         Err(ExportError::Undrawn(name)) if name.ends_with("0x000")
     ));
-    // Nor may a model replace one whose texture sets it would load
-    // differently.
+    // Nor may a model replace one its texture set wouldn't import with,
     let mut moved = edited.clone();
     moved.model_c = edited
         .model_c
@@ -668,6 +667,18 @@ fn model_export_replaces_a_model_in_the_decomp() {
     let refused = decomp.write_model(&moved);
     assert!(
         matches!(refused, Err(WriteError::Redraw { .. })),
+        "{refused:?}"
+    );
+    // or one that would load its texture sets at other sizes.
+    let mut resized = edited.clone();
+    resized.model_c = edited.model_c.replace(
+        "anime_3_txt, G_IM_FMT_CI, 32, 32",
+        "anime_3_txt, G_IM_FMT_CI, 32, 16",
+    );
+    assert_ne!(resized.model_c, edited.model_c);
+    let refused = decomp.write_model(&resized);
+    assert!(
+        matches!(refused, Err(WriteError::ModelLoads { .. })),
         "{refused:?}"
     );
     // The file shares an array the export would drop; its own arrays,
