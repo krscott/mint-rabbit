@@ -118,6 +118,8 @@ pub enum ModelFileError {
     Unreadable,
     #[error("the model file's default scene has no meshes, or none with faces")]
     NoMesh,
+    #[error("node {node:?} can't go in a model file: {problem}")]
+    Unwritable { node: String, problem: &'static str },
     #[error("the project has {0} nodes; a model file holds at most 65536")]
     TooManyNodes(usize),
     #[error("the model file's nodes form a loop rather than a tree")]
@@ -201,7 +203,6 @@ fn file_safe(name: &str) -> String {
 /// Where the image of each of `project`'s textures goes beside the model
 /// file at `path`: `<stem>.<index>-<texture>.png`. The last part before
 /// `.png` holds no dot, so no two textures or stems share an image.
-#[must_use]
 fn image_paths(project: &Project, path: &ModelFilePath) -> Vec<PathBuf> {
     let path = path.as_path();
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -228,21 +229,25 @@ fn uri(name: &str) -> String {
 }
 
 /// Whether `path` is a regular file that starts with `magic`, or `None`
-/// when nothing is there.
+/// when nothing is there or the file is empty, which replacing loses
+/// nothing of.
 fn starts_with(path: &Path, magic: &[u8]) -> Result<Option<bool>, ModelFileError> {
     use std::io::Read as _;
     let io = |e| ModelFileError::Io(path.to_owned(), e);
     match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() == 0 => return Ok(None),
         Ok(m) if m.is_file() => {}
         Ok(_) => return Ok(Some(false)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io(e)),
     }
     let mut head = vec![0; magic.len()];
-    let file = std::fs::File::open(path).map_err(io)?;
-    Ok(Some(
-        file.take(magic.len() as u64).read_exact(&mut head).is_ok() && head == magic,
-    ))
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(Some(head == magic)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Some(false)),
+        Err(e) => Err(io(e)),
+    }
 }
 
 /// Fails unless `path` is missing or starts with `magic`, so writing never
@@ -477,7 +482,17 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
         return Err(ModelFileError::TooManyNodes(model.nodes().len()));
     }
     let s = units.meters_per_unit;
-    let world = model.world_matrices(project.pose());
+    let locals = model.local_matrices(project.pose());
+    for (id, m) in model.ids().zip(&locals) {
+        let det = m.determinant();
+        if !m.is_finite() || !det.is_finite() || det == 0.0 {
+            return Err(ModelFileError::Unwritable {
+                node: model.node(id).name.clone(),
+                problem: "its transform is scaled to nothing or isn't finite",
+            });
+        }
+    }
+    let world = model.compose(&locals);
     let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
 
     // Triangles in drawing order: one primitive per run of a node's
@@ -503,6 +518,12 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                 // A zero normal, which a few AC vertices have, stays zero
                 // rather than taking a made-up direction.
                 let n = (normals[f.index()] * v.normal).normalize_or_zero();
+                if !(p.is_finite() && n.is_finite() && c.uv.is_finite()) {
+                    return Err(ModelFileError::Unwritable {
+                        node: model.node(id).name.clone(),
+                        problem: "a vertex's position, normal, or UV isn't a finite number",
+                    });
+                }
                 run.push(verts.add(f, p, n, c.uv));
             }
         }
@@ -575,8 +596,7 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
     // The skeleton, posed, with translations in the file's units. The
     // inverse bind matrices come from the transforms as written, so they
     // cancel them exactly even where a node's matrix doesn't decompose.
-    let written: Vec<(Vec3, glam::Quat, Vec3)> = model
-        .local_matrices(project.pose())
+    let written: Vec<(Vec3, glam::Quat, Vec3)> = locals
         .iter()
         .map(|m| {
             let (scale, rotation, translation) = m.to_scale_rotation_translation();
@@ -1101,7 +1121,10 @@ fn decode(
                     let local = (
                         id,
                         to_local[id.index()].transform_point3(p),
-                        n.normalize_or_zero() * units.normal_length,
+                        // Scaled to its largest part first, so a very long or
+                        // short normal doesn't round to zero.
+                        (n / n.abs().max_element().max(f32::MIN_POSITIVE)).normalize_or_zero()
+                            * units.normal_length,
                         uvs[v],
                     );
                     if !(local.1.is_finite() && n.is_finite() && local.3.is_finite()) {
@@ -1620,6 +1643,41 @@ mod tests {
             Err(ModelFileError::NotPng(_))
         ));
         assert!(!path.as_path().exists());
+    }
+
+    #[test]
+    fn writing_refuses_a_node_scaled_to_nothing() {
+        let p = project(Vec3::new(1.0, 0.0, 1.0), meshes(), &["body"]);
+        assert!(matches!(
+            encode(&p, &["body.png".into()], UNITS),
+            Err(ModelFileError::Unwritable { node, .. }) if node == "child"
+        ));
+    }
+
+    #[test]
+    fn tiny_bone_scales_keep_their_normals() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        let thin = edit_json(&bytes, |doc| {
+            doc["nodes"][0]["scale"] = json!([1.0, 1.0, 1e-20]);
+        });
+        let meshes = decode(&p, &thin, UNITS).unwrap();
+        for v in &meshes[0].as_ref().unwrap().vertices {
+            assert!((v.normal.length() - 1.0).abs() < 1e-5, "{}", v.normal);
+        }
+    }
+
+    #[test]
+    fn an_empty_file_counts_as_missing() {
+        let p = sample();
+        let dir = tempfile::tempdir().unwrap();
+        let path = ModelFilePath::new(dir.path().join("m.glb")).unwrap();
+        std::fs::write(path.as_path(), "").unwrap();
+        assert!(matches!(
+            write_images(&p, &path, &[0]),
+            Err(ModelFileError::NoModelFile(_))
+        ));
+        write(&p, &path, &[0], UNITS).unwrap();
     }
 
     #[test]
