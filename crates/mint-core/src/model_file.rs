@@ -104,8 +104,8 @@ pub enum ModelFileError {
         "{0} isn't a model file, so its images aren't written beside it; send the model to a model file again"
     )]
     NoModelFile(PathBuf),
-    #[error("{0} is larger than a model file may be ({MAX_FILE_BYTES} bytes)")]
-    TooLarge(PathBuf),
+    #[error("the model file is larger than a model file may be ({MAX_FILE_BYTES} bytes)")]
+    TooLarge,
     #[error("{0} exists and isn't a PNG image; move it, or choose another model file path")]
     NotPng(PathBuf),
     #[error("two nodes are named {0:?}; a model file names each bone after its node")]
@@ -118,7 +118,9 @@ pub enum ModelFileError {
     Unreadable,
     #[error("the model file's default scene has no meshes, or none with faces")]
     NoMesh,
-    #[error("the model file written wouldn't read back, so nothing was written: {0}")]
+    #[error(
+        "mint-rabbit made a model file it can't read back, which is a bug, so nothing was written: {0}"
+    )]
     NotReadable(Box<ModelFileError>),
     #[error("node {node:?} can't go in a model file: {problem}")]
     Unwritable { node: String, problem: &'static str },
@@ -266,6 +268,10 @@ fn check_replaceable(
 }
 
 const GLB_MAGIC: &[u8] = b"glTF";
+/// Smallest ratio of a node's thinnest to its widest model-space scale, by
+/// the measure `encode` uses, for which a model file keeps positions to
+/// about a tenth of a unit.
+const MIN_SCALE_RATIO: f32 = 1e-4;
 /// Largest model file read, far above any villager's.
 const MAX_FILE_BYTES: u64 = 256 << 20;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -515,6 +521,23 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             .collect::<Vec<_>>(),
     );
     let ibms: Vec<Mat4> = written_world.iter().map(Mat4::inverse).collect();
+    for (id, m) in model.ids().zip(&world) {
+        // The file holds model-space positions as f32, so an axis squashed
+        // far below the others loses its coordinates there. |det| over the
+        // widest column cubed is 1 for a uniform scale and falls as one
+        // axis thins, however the pose has turned it.
+        let m3 = Mat3::from_mat4(*m);
+        let widest = [m3.x_axis, m3.y_axis, m3.z_axis]
+            .map(Vec3::length)
+            .into_iter()
+            .fold(0.0, f32::max);
+        if m3.determinant().abs() < widest.powi(3) * MIN_SCALE_RATIO {
+            return Err(ModelFileError::Unwritable {
+                node: model.node(id).name.clone(),
+                problem: "it's scaled far thinner along one axis than another, beyond a model file's precision",
+            });
+        }
+    }
     for id in model.ids() {
         let i = id.index();
         let (sc, r, t) = written[i];
@@ -525,10 +548,11 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             || det == 0.0
             || !ibms[i].is_finite()
             || !normals[i].is_finite()
+            || !world[i].inverse().is_finite()
         {
             return Err(ModelFileError::Unwritable {
                 node: model.node(id).name.clone(),
-                problem: "its transform is scaled to nothing or isn't finite",
+                problem: "its transform is too small, too large, or isn't finite",
             });
         }
     }
@@ -767,9 +791,6 @@ pub fn read(
         .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(io)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(ModelFileError::TooLarge(file.to_owned()));
-    }
     decode(project, &bytes, units)
 }
 
@@ -883,6 +904,9 @@ fn decode(
     bytes: &[u8],
     units: Units,
 ) -> Result<Vec<Option<Mesh>>, ModelFileError> {
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ModelFileError::TooLarge);
+    }
     // The gltf crate panics on some malformed files, such as a short header
     // or a primitive naming a missing accessor, before returning an error.
     let gltf = std::panic::catch_unwind(|| gltf::Gltf::from_slice(bytes))
@@ -1684,11 +1708,25 @@ mod tests {
     }
 
     #[test]
-    fn a_thin_node_keeps_its_normals_through_a_file() {
-        let p = project(Vec3::new(1e-20, 1.0, 1.0), meshes(), &["body"]);
-        for v in &round_trip(&p)[1].as_ref().unwrap().vertices {
-            assert!((v.normal.length() - 1.0).abs() < 1e-5, "{}", v.normal);
-        }
+    fn a_thin_node_keeps_its_vertices_or_is_refused() {
+        let p = project(Vec3::new(1e-2, 1.0, 1.0), meshes(), &["body"]);
+        let read = round_trip(&p);
+        let before = &p.model().node(NodeId(1)).mesh.as_ref().unwrap().vertices;
+        let after = &read[1].as_ref().unwrap().vertices;
+        // The child's own vertex, its last.
+        let (a, b) = (before.last().unwrap(), after.last().unwrap());
+        assert!((b.normal.length() - 1.0).abs() < 1e-5, "{}", b.normal);
+        assert!(
+            (b.position - a.position).abs().max_element() < 1e-2,
+            "{} came back as {}",
+            a.position,
+            b.position
+        );
+        let p = project(Vec3::new(1e-5, 1.0, 1.0), meshes(), &["body"]);
+        assert!(matches!(
+            encode(&p, &["body.png".into()], UNITS),
+            Err(ModelFileError::Unwritable { node, .. }) if node == "child"
+        ));
     }
 
     #[test]
