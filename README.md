@@ -102,7 +102,8 @@ A project saves as a folder (File > Save, Save as).
 
 mint-rabbit has no geometry tools; edit the model in Blender instead. File >
 Send to model file… writes it as glTF binary (`.glb`), with a PNG of each
-texture's shown variant beside it, and the project remembers that file. In
+texture's shown variant beside it, and the project remembers that file and
+takes the model as the file holds it. In
 Blender, File > Import > glTF 2.0 with **Merge Vertices** on, or the model
 arrives split at its UV seams, and **Pack Images** off, or Image > Reload
 won't see new paint. The model is posed as in the Model View and about 3 m

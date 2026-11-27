@@ -171,6 +171,20 @@ impl Doc {
         self.scene_for.0 != self.editor.generation() || self.scene_for.1 != self.variants
     }
 
+    /// Reads the meshes of the model file at `path` into the project, as
+    /// one undo step, and returns whether they changed.
+    fn read_model_file(&mut self, path: &ModelFilePath) -> Result<bool, String> {
+        // Before reading, so a change while it reads is read again.
+        self.watch.known(watch::stamp(path.as_path()));
+        let generation = self.editor.generation();
+        let meshes = model_file::read(self.editor.project(), path, mint_ac::MODEL_FILE_UNITS)
+            .map_err(|e| e.to_string())?;
+        self.editor
+            .edit(|p| p.set_meshes(meshes))
+            .map_err(|e| e.to_string())?;
+        Ok(self.editor.generation() != generation)
+    }
+
     /// The painted variant shown in the Texture View, if any.
     fn variant(&self) -> Option<VariantRef> {
         let t = self.selected?;
@@ -774,17 +788,18 @@ impl App {
                 .map_or_else(|_| doc.name(), |i| i.model.to_owned());
             dialog = dialog.set_file_name(format!("{name}.{}", model_file::EXTENSION));
         }
-        let Some(mut path) = dialog.save_file() else {
-            return;
-        };
-        if path.extension().is_none() {
-            path.set_extension(model_file::EXTENSION);
+        // A name without the extension is refused rather than completed,
+        // since the dialog only asked about overwriting the name it shows.
+        if let Some(path) = dialog.save_file() {
+            self.send_to(path);
         }
-        self.send_to(path);
     }
 
-    /// Writes the model to a model file at `path` and links the project to
-    /// it.
+    /// Writes the model to a model file at `path`, links the project to
+    /// it, and reads it back, so the project holds the model as the file
+    /// does (normals at the target's length, each triangle on the deepest
+    /// node of its corners) for Replace model and later reads to start
+    /// from.
     fn send_to(&mut self, path: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
         let sent = ModelFilePath::new(path).and_then(|path| {
@@ -796,16 +811,18 @@ impl App {
             )?;
             Ok(path)
         });
-        match sent {
-            Ok(path) => {
-                doc.watch.known(watch::stamp(path.as_path()));
-                let shown = path.as_path().display().to_string();
-                doc.editor.set_model_file(path);
-                self.tell(format!(
-                    "Sent the model to {shown}; import it in Blender with Merge Vertices on and Pack Images off"
-                ));
-            }
-            Err(e) => self.fail(e.to_string()),
+        let path = match sent {
+            Ok(path) => path,
+            Err(e) => return self.fail(e.to_string()),
+        };
+        let read = doc.read_model_file(&path);
+        let shown = path.as_path().display().to_string();
+        doc.editor.set_model_file(path);
+        match read {
+            Ok(_) => self.tell(format!(
+                "Sent the model to {shown}; import it in Blender with Merge Vertices on and Pack Images off"
+            )),
+            Err(e) => self.fail(format!("Sent the model to {shown}, but couldn't read it back: {e}")),
         }
     }
 
@@ -815,22 +832,10 @@ impl App {
         let Some(path) = doc.editor.model_file().cloned() else {
             return;
         };
-        // Before reading, so a change while it reads is read again.
-        doc.watch.known(watch::stamp(path.as_path()));
-        let generation = doc.editor.generation();
-        let read = model_file::read(doc.editor.project(), &path, mint_ac::MODEL_FILE_UNITS)
-            .map_err(|e| e.to_string())
-            .and_then(|meshes| {
-                doc.editor
-                    .edit(|p| p.set_meshes(meshes))
-                    .map_err(|e| e.to_string())
-            });
         let shown = path.as_path().display();
-        match read {
-            Ok(()) if doc.editor.generation() == generation => {
-                self.tell(format!("Read {shown}; the model is unchanged"));
-            }
-            Ok(()) => self.tell(format!("Read the model from {shown}")),
+        match doc.read_model_file(&path) {
+            Ok(false) => self.tell(format!("Read {shown}; the model is unchanged")),
+            Ok(true) => self.tell(format!("Read the model from {shown}")),
             Err(e) => self.fail(format!("Couldn't read {shown}: {e}")),
         }
     }
