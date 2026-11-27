@@ -4,11 +4,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, Sense};
 use eframe::egui_wgpu;
 use glam::{Vec2, Vec3};
 use mint_ac::{Decomp, VillagerRef};
+use mint_core::model_file::{self, ModelFileError, ModelFilePath};
 use mint_core::{
     Layer, LayerKind, NonEmpty, PaletteIndex, Project, Stamp, Texture, TextureContent, TextureId,
     VariantRef,
@@ -26,6 +28,7 @@ use crate::scene;
 use crate::stamps::{self, Choice, Library, Placing};
 use crate::surface::Surface;
 use crate::texture_view::{self, Canvas, Frame, ModelPointer, Paint, Selection, TextureView, Tool};
+use crate::watch::{self, Watch};
 
 const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
 const REDO: KeyboardShortcut =
@@ -36,6 +39,9 @@ const REDO_Y: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::
 
 const WARNING: Color32 = Color32::from_rgb(255, 170, 90);
 const ERROR: Color32 = Color32::from_rgb(255, 110, 110);
+
+/// Why the model file commands are disabled.
+const NO_MODEL_FILE: &str = "Send the model to a model file first";
 
 /// Shown in place of the views while no project is open.
 const NOTHING_OPEN: &str =
@@ -88,14 +94,22 @@ struct Doc {
     /// What `scene` was built from.
     scene_for: (u64, Vec<usize>),
     /// Whether the project could export now, as of an editor generation.
-    check: Option<(u64, Result<(), String>)>,
+    check: Option<(u64, Ready)>,
+    /// Follows the editor's model file, when it has one.
+    watch: Watch,
 }
 
 impl Doc {
     /// A document for `project`. Its scene is the `generation`th built, and
     /// its surface finds cutout edges as a view sampling textures `smooth`ly
     /// or not shows them.
-    fn new(project: Project, path: Option<PathBuf>, generation: u64, smooth: bool) -> Self {
+    fn new(
+        project: Project,
+        path: Option<PathBuf>,
+        model_file: Option<ModelFilePath>,
+        generation: u64,
+        smooth: bool,
+    ) -> Self {
         let variants = vec![0; project.textures().len()];
         let selected = project
             .textures()
@@ -113,8 +127,9 @@ impl Doc {
                 },
             )
         });
+        let watch = Watch::new(model_file.as_ref().and_then(|m| watch::stamp(m.as_path())));
         Self {
-            editor: Editor::new(project, path),
+            editor: Editor::new(project, path, model_file),
             scene_for: (0, variants.clone()),
             variants,
             selected,
@@ -124,6 +139,7 @@ impl Doc {
             surface: Surface::new(scene.clone(), smooth),
             scene,
             check: None,
+            watch,
         }
     }
 
@@ -153,6 +169,20 @@ impl Doc {
     /// was built.
     fn scene_stale(&self) -> bool {
         self.scene_for.0 != self.editor.generation() || self.scene_for.1 != self.variants
+    }
+
+    /// Reads the meshes of the model file at `path` into the project, as
+    /// one undo step, and returns whether they changed.
+    fn read_model_file(&mut self, path: &ModelFilePath) -> Result<bool, String> {
+        // Before reading, so a change while it reads is read again.
+        self.watch.known(watch::stamp(path.as_path()));
+        let generation = self.editor.generation();
+        let meshes = model_file::read(self.editor.project(), path, mint_ac::MODEL_FILE_UNITS)
+            .map_err(|e| e.to_string())?;
+        self.editor
+            .edit(|p| p.set_meshes(meshes))
+            .map_err(|e| e.to_string())?;
+        Ok(self.editor.generation() != generation)
     }
 
     /// The painted variant shown in the Texture View, if any.
@@ -196,7 +226,9 @@ enum Confirm {
     /// Replace unsaved changes with another project.
     Discard(Replace),
     /// Overwrite the texture set's source file in the decomp.
-    ReplaceInDecomp(mint_ac::TextureExport, PathBuf),
+    ReplaceTextureSet(mint_ac::TextureExport, PathBuf),
+    /// Overwrite the model's source file in the decomp.
+    ReplaceModel(mint_ac::Export, PathBuf),
     /// Save into a folder that holds another project.
     SaveOver(PathBuf),
     /// Export a texture set over files already in a folder.
@@ -207,10 +239,60 @@ enum Confirm {
 
 /// The texture-only export of a project to the texture set it was imported
 /// from.
-fn export_imported(project: &Project) -> Result<mint_ac::TextureExport, String> {
+fn export_texture_set(project: &Project) -> Result<mint_ac::TextureExport, String> {
     mint_ac::imported_from(project)
         .and_then(|i| mint_ac::export_textures(project, i.texture_set))
         .map_err(|e| e.to_string())
+}
+
+/// The export of a project to the model and texture set it was imported
+/// from.
+fn export_model(project: &Project) -> Result<mint_ac::Export, String> {
+    mint_ac::imported_from(project)
+        .and_then(|i| mint_ac::export(project, i.model, i.texture_set))
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a project can export, or why not.
+#[derive(Clone)]
+enum Ready {
+    /// Its model and texture set.
+    All,
+    /// Only its texture set, for the model as it is in the decomp; the
+    /// model can't export, for this reason.
+    TextureSet(String),
+    /// Nothing, for this reason.
+    Nothing(String),
+}
+
+impl Ready {
+    fn of(project: &Project) -> Self {
+        // The model's export holds the texture set's, so the texture set
+        // alone is tried only when it fails.
+        match export_model(project) {
+            Ok(_) => Self::All,
+            Err(model) => match export_texture_set(project) {
+                Ok(_) => Self::TextureSet(model),
+                Err(e) => Self::Nothing(e),
+            },
+        }
+    }
+
+    /// Why the texture set can't export, if it can't.
+    fn texture_set_problem(&self) -> Option<&str> {
+        match self {
+            Self::All | Self::TextureSet(_) => None,
+            Self::Nothing(e) => Some(e),
+        }
+    }
+
+    /// Why the model can't export, if it can't.
+    fn model_problem(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::TextureSet(e) | Self::Nothing(e) => Some(e),
+        }
+    }
 }
 
 /// The line at the bottom of the window: the last thing done or what
@@ -548,9 +630,20 @@ impl App {
         }
     }
 
-    fn set_doc(&mut self, project: Project, path: Option<PathBuf>) {
+    fn set_doc(
+        &mut self,
+        project: Project,
+        path: Option<PathBuf>,
+        model_file: Option<ModelFilePath>,
+    ) {
         self.generation += 1;
-        let doc = Doc::new(project, path, self.generation, self.view.linear_filter);
+        let doc = Doc::new(
+            project,
+            path,
+            model_file,
+            self.generation,
+            self.view.linear_filter,
+        );
         self.model.camera = Orbit::framing(doc.scene.mesh.bounds_min, doc.scene.mesh.bounds_max);
         self.texture_view = TextureView::default();
         self.paint.color = PaletteIndex(0);
@@ -592,7 +685,7 @@ impl App {
         // The scene is checked here and rebuilt for the open document.
         match picker::import(decomp, v) {
             Ok((project, _)) => {
-                self.set_doc(project, None);
+                self.set_doc(project, None, None);
                 if let Some(picker) = &mut self.picker {
                     picker.imported(v);
                 }
@@ -606,9 +699,16 @@ impl App {
         self.status = None;
         match mint_core::file::load(dir) {
             Ok(loaded) => {
-                self.set_doc(loaded.project, Some(dir.to_owned()));
-                if let Some(doc) = &mut self.doc {
-                    doc.editor.set_model_file(loaded.model_file);
+                self.set_doc(loaded.project, Some(dir.to_owned()), loaded.model_file);
+                // A model file changed since the last save, as in Blender
+                // while the project was closed, is read once it settles.
+                let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                let saved = modified(&dir.join(mint_core::file::PROJECT_FILE));
+                if let Some(doc) = &mut self.doc
+                    && let Some(m) = doc.editor.model_file()
+                    && modified(m.as_path()) > saved
+                {
+                    doc.watch = Watch::new(None);
                 }
                 self.tell(format!("Opened {}", dir.display()));
             }
@@ -640,33 +740,154 @@ impl App {
         }
     }
 
+    /// Saves to `dir`, and rewrites the model file's images, so another
+    /// program reloading them shows the paint as saved.
     fn save_to(&mut self, dir: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
-        match mint_core::file::save(doc.editor.project(), doc.editor.model_file(), &dir) {
-            Ok(()) => {
-                let saved = format!("Saved {}", dir.display());
-                doc.editor.saved(dir);
-                self.tell(saved);
+        let project = doc.editor.project();
+        if let Err(e) = mint_core::file::save(project, doc.editor.model_file(), &dir) {
+            self.fail(e.to_string());
+            return;
+        }
+        let saved = format!("Saved {}", dir.display());
+        let images = doc
+            .editor
+            .model_file()
+            .map(|m| model_file::write_images(project, m, &doc.variants));
+        doc.editor.saved(dir);
+        match images {
+            None | Some(Ok(())) => self.tell(saved),
+            // Reported, but saving succeeded.
+            Some(Err(e @ ModelFileError::NoModelFile(_))) => self.tell(format!("{saved}; {e}")),
+            Some(Err(e)) => self.fail(format!(
+                "{saved}, but the model file's images couldn't be written: {e}"
+            )),
+        }
+    }
+
+    /// Asks where to send the model, starting at the model file it was last
+    /// sent to.
+    fn send_to_model_file(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Send to model file")
+            .add_filter("glTF binary", &[model_file::EXTENSION]);
+        if let Some(m) = doc.editor.model_file() {
+            let path = m.as_path();
+            if let Some(dir) = path.parent() {
+                dialog = dialog.set_directory(dir);
             }
-            Err(e) => self.fail(e.to_string()),
+            if let Some(name) = path.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+        } else {
+            if let Some(dir) = doc.editor.path() {
+                dialog = dialog.set_directory(dir);
+            }
+            let name = mint_ac::imported_from(doc.editor.project())
+                .map_or_else(|_| doc.name(), |i| i.model.to_owned());
+            dialog = dialog.set_file_name(format!("{name}.{}", model_file::EXTENSION));
+        }
+        // A name without the extension is refused rather than completed,
+        // since the dialog only asked about overwriting the name it shows.
+        if let Some(path) = dialog.save_file() {
+            self.send_to(path);
+        }
+    }
+
+    /// Writes the model to a model file at `path`, links the project to
+    /// it, and takes the model as the file holds it (each triangle on the
+    /// deepest node of its corners), as one undo step, for Replace model
+    /// and later reads to start from.
+    fn send_to(&mut self, path: PathBuf) {
+        let Some(doc) = &mut self.doc else { return };
+        let sent = ModelFilePath::new(path).and_then(|path| {
+            let meshes = model_file::write(
+                doc.editor.project(),
+                &path,
+                &doc.variants,
+                mint_ac::MODEL_FILE_UNITS,
+            )?;
+            Ok((path, meshes))
+        });
+        let (path, meshes) = match sent {
+            Ok(sent) => sent,
+            Err(e) => return self.fail(e.to_string()),
+        };
+        doc.watch.known(watch::stamp(path.as_path()));
+        let shown = path.as_path().display().to_string();
+        doc.editor.set_model_file(path);
+        match doc.editor.edit(|p| p.set_meshes(meshes)) {
+            Ok(()) => self.tell(format!(
+                "Sent the model to {shown}; import it in Blender with Merge Vertices on and Pack Images off"
+            )),
+            Err(e) => self.fail(format!("Sent the model to {shown}, but couldn't take it back: {e}")),
+        }
+    }
+
+    /// Reads the model file's meshes into the project, as one undo step.
+    fn reload_model_file(&mut self) {
+        let Some(doc) = &mut self.doc else { return };
+        let Some(path) = doc.editor.model_file().cloned() else {
+            return;
+        };
+        let shown = path.as_path().display();
+        match doc.read_model_file(&path) {
+            Ok(false) => self.tell(format!("Read {shown}; the model is unchanged")),
+            Ok(true) => self.tell(format!("Read the model from {shown}")),
+            Err(e) => self.fail(format!("Couldn't read {shown}: {e}")),
+        }
+    }
+
+    /// Reads the model file again once another program has changed it,
+    /// while nothing else is under way.
+    fn follow_model_file(&mut self, ctx: &egui::Context) {
+        let Some(doc) = &mut self.doc else { return };
+        let Some(path) = doc.editor.model_file() else {
+            return;
+        };
+        ctx.request_repaint_after(watch::POLL);
+        // Nothing changes the project under a dialog or a drag.
+        let busy = self.dialog.is_some()
+            || self.texture_view.dragging()
+            || ctx.input(|i| i.pointer.any_down());
+        if !busy && doc.watch.poll(watch::stamp(path.as_path()), Instant::now()) {
+            self.reload_model_file();
         }
     }
 
     /// Asks to replace the imported texture set's source in the decomp.
-    fn export_in_place(&mut self) {
+    fn replace_texture_set(&mut self) {
         self.status = None;
         let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
             return;
         };
-        let project = doc.editor.project();
-        let result = export_imported(project).and_then(|e| {
+        let result = export_texture_set(doc.editor.project()).and_then(|e| {
             decomp
                 .check_texture_set(&e)
                 .map(|p| (e, p))
                 .map_err(|e| e.to_string())
         });
         match result {
-            Ok((export, path)) => self.ask(Confirm::ReplaceInDecomp(export, path)),
+            Ok((export, path)) => self.ask(Confirm::ReplaceTextureSet(export, path)),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Asks to replace the imported model's source in the decomp.
+    fn replace_model(&mut self) {
+        self.status = None;
+        let (Some(doc), Some(decomp)) = (&self.doc, self.decomp()) else {
+            return;
+        };
+        let result = export_model(doc.editor.project()).and_then(|e| {
+            decomp
+                .check_model(&e)
+                .map(|p| (e, p))
+                .map_err(|e| e.to_string())
+        });
+        match result {
+            Ok((export, path)) => self.ask(Confirm::ReplaceModel(export, path)),
             Err(e) => self.fail(e),
         }
     }
@@ -722,21 +943,20 @@ impl App {
 
     /// Whether the open project can export now, or why not; `None` with no
     /// project open.
-    fn export_ready(&mut self) -> Option<Result<(), String>> {
+    fn export_ready(&mut self) -> Option<Ready> {
         // The picker holds the open decomp.
         let has_decomp = self.picker.is_some();
         let doc = self.doc.as_mut()?;
+        if !has_decomp {
+            return Some(Ready::Nothing(
+                "Open the decomp this project came from".into(),
+            ));
+        }
         let generation = doc.editor.generation();
         if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
-            let result = export_imported(doc.editor.project()).map(|_| ());
-            doc.check = Some((generation, result));
+            doc.check = Some((generation, Ready::of(doc.editor.project())));
         }
-        let (_, check) = doc.check.as_ref()?;
-        Some(match check {
-            Err(e) => Err(e.clone()),
-            Ok(()) if !has_decomp => Err("Open the decomp this project came from".into()),
-            Ok(()) => Ok(()),
-        })
+        doc.check.as_ref().map(|(_, ready)| ready.clone())
     }
 
     /// The painted variant shown and what is picked in it, for a control to
@@ -904,6 +1124,8 @@ impl App {
             picker.open();
         }
         ui.separator();
+        self.model_file_items(ui);
+        ui.separator();
         let folder = self.library.dir();
         let why = folder.as_ref().err().cloned().unwrap_or_default();
         if ui
@@ -921,37 +1143,98 @@ impl App {
             }
         }
         ui.separator();
-        let ready = self.export_ready();
-        let can_export = matches!(ready, Some(Ok(())));
-        let why_not = match &ready {
-            Some(Err(e)) => e.as_str(),
-            _ => "No project is open",
-        };
-        let set = self.doc.as_ref().and_then(|d| {
+        let ready = self
+            .export_ready()
+            .unwrap_or_else(|| Ready::Nothing("No project is open".into()));
+        let textures = ready.texture_set_problem();
+        let model_problem = ready.model_problem();
+        let imported = self.doc.as_ref().and_then(|d| {
             mint_ac::imported_from(d.editor.project())
                 .ok()
-                .map(|i| i.texture_set.to_owned())
+                .map(|i| (i.model.to_owned(), i.texture_set.to_owned()))
         });
-        let replace = set.map_or_else(
-            || "Replace in the decomp…".to_owned(),
-            |set| format!("Replace {set} in the decomp…"),
-        );
+        let (model, set) = imported.unzip();
+        let named = |what: &str, name: Option<String>| {
+            name.map_or_else(
+                || format!("Replace {what} in the decomp…"),
+                |name| format!("Replace {what} {name} in the decomp…"),
+            )
+        };
         if ui
-            .add_enabled(can_export, egui::Button::new(replace))
-            .on_disabled_hover_text(why_not)
+            .add_enabled(
+                textures.is_none(),
+                egui::Button::new(named("texture set", set)),
+            )
+            .on_hover_text("The villager's textures; other villagers on its model keep theirs")
+            .on_disabled_hover_text(textures.unwrap_or_default())
             .clicked()
         {
-            self.export_in_place();
+            self.replace_texture_set();
         }
         if ui
-            .add_enabled(can_export, egui::Button::new("Export new texture set…"))
+            .add_enabled(
+                model_problem.is_none(),
+                egui::Button::new(named("model", model)),
+            )
+            .on_hover_text("The geometry of every villager drawn on this model")
+            .on_disabled_hover_text(model_problem.unwrap_or_default())
+            .clicked()
+        {
+            self.replace_model();
+        }
+        if ui
+            .add_enabled(
+                textures.is_none(),
+                egui::Button::new("Export new texture set…"),
+            )
             .on_hover_text("A new texture set, based on this villager, with the steps to add it")
-            .on_disabled_hover_text(why_not)
+            .on_disabled_hover_text(textures.unwrap_or_default())
             .clicked()
         {
             self.dialog = Some(Dialog::ExportSet {
                 name: self.folder_set.clone(),
             });
+        }
+    }
+
+    /// The File menu's commands for the model file.
+    fn model_file_items(&mut self, ui: &mut egui::Ui) {
+        let has_doc = self.doc.is_some();
+        let linked = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.editor.model_file())
+            .cloned();
+        if ui
+            .add_enabled(has_doc, egui::Button::new("Send to model file…"))
+            .on_hover_text(
+                "Write the model as glTF binary (.glb) for editing in Blender; \
+                 the project reads it again whenever it changes",
+            )
+            .clicked()
+        {
+            self.send_to_model_file();
+        }
+        let path = linked.as_ref().map(ModelFilePath::as_path);
+        let item = |ui: &mut egui::Ui, text: &str| {
+            ui.add_enabled(path.is_some(), egui::Button::new(text))
+                .on_disabled_hover_text(NO_MODEL_FILE)
+                .clicked()
+        };
+        if item(ui, "Reload model file") {
+            self.reload_model_file();
+        }
+        if item(ui, "Copy model file path")
+            && let Some(path) = path
+        {
+            ui.ctx().copy_text(path.display().to_string());
+            self.tell(format!("Copied {}", path.display()));
+        }
+        if item(ui, "Open model file folder")
+            && let Some(dir) = path.and_then(Path::parent)
+            && let Err(e) = open_folder(ui.ctx(), dir, self.opener_failed.0.clone())
+        {
+            self.fail(e);
         }
     }
 
@@ -1041,19 +1324,22 @@ impl App {
         ui.horizontal(|ui| {
             let half = ui.available_width() * 0.5;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &ready {
-                    Some(Ok(())) => {
+                let problem = match &ready {
+                    None => None,
+                    Some(Ready::All) => {
                         ui.label("Ready to export");
+                        None
                     }
-                    Some(Err(e)) => {
-                        let text = egui::RichText::new(format!("Can't export: {e}")).color(WARNING);
-                        ui.scope(|ui| {
-                            ui.set_max_width(half);
-                            // Hovering a cut-off label shows all of it.
-                            ui.add(egui::Label::new(text).truncate());
-                        });
-                    }
-                    None => {}
+                    Some(Ready::TextureSet(e)) => Some(format!("Can't export the model: {e}")),
+                    Some(Ready::Nothing(e)) => Some(format!("Can't export: {e}")),
+                };
+                if let Some(problem) = problem {
+                    let text = egui::RichText::new(problem).color(WARNING);
+                    ui.scope(|ui| {
+                        ui.set_max_width(half);
+                        // Hovering a cut-off label shows all of it.
+                        ui.add(egui::Label::new(text).truncate());
+                    });
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let text = match &self.status {
@@ -1725,11 +2011,20 @@ impl App {
                 "The open project has unsaved changes.".to_owned(),
                 "Discard",
             ),
-            Confirm::ReplaceInDecomp(_, path) => (
+            Confirm::ReplaceTextureSet(_, path) => (
                 "Replace texture set?",
                 format!(
                     "This overwrites {}. Build the decomp with `python configure.py --non-matching && ninja` to see it.",
                     path.display()
+                ),
+                "Replace",
+            ),
+            Confirm::ReplaceModel(export, path) => (
+                "Replace model?",
+                format!(
+                    "This overwrites {}, changing the geometry of every villager drawn on {}. Build the decomp with `python configure.py --non-matching && ninja` to see it.",
+                    path.display(),
+                    export.model()
                 ),
                 "Replace",
             ),
@@ -1766,22 +2061,13 @@ impl App {
             (None, confirm) => self.dialog = Some(Dialog::Confirm(confirm)),
             (Some(false), _) => {}
             (Some(true), Confirm::Discard(r)) => self.do_replace(r, ctx),
-            (Some(true), Confirm::ReplaceInDecomp(export, _)) => {
+            (Some(true), Confirm::ReplaceTextureSet(export, _)) => {
                 let result = self.decomp().map(|d| d.write_texture_set(&export));
-                match result {
-                    Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
-                        Ok(()) => self.tell(format!(
-                            "Wrote {}; build with `python configure.py --non-matching && ninja`",
-                            path.display()
-                        )),
-                        Err(e) => self.fail(format!(
-                            "Wrote {}, but the import list couldn't be refreshed: {e}",
-                            path.display()
-                        )),
-                    },
-                    Some(Err(e)) => self.fail(e.to_string()),
-                    None => {}
-                }
+                self.wrote_to_decomp(result);
+            }
+            (Some(true), Confirm::ReplaceModel(export, _)) => {
+                let result = self.decomp().map(|d| d.write_model(&export));
+                self.wrote_to_decomp(result);
             }
             (Some(true), Confirm::SaveOver(dir)) => self.save_to(dir),
             (Some(true), Confirm::OverwriteFolder(dir)) => self.write_folder(&dir),
@@ -1797,6 +2083,25 @@ impl App {
                 }
                 Err(e) => self.fail(e),
             },
+        }
+    }
+
+    /// Reports a write into the decomp, with no decomp open as `None`, and
+    /// refreshes the import list to show it.
+    fn wrote_to_decomp(&mut self, result: Option<Result<PathBuf, mint_ac::WriteError>>) {
+        match result {
+            Some(Ok(path)) => match self.picker.as_mut().map_or(Ok(()), Picker::reload) {
+                Ok(()) => self.tell(format!(
+                    "Wrote {}; build with `python configure.py --non-matching && ninja`",
+                    path.display()
+                )),
+                Err(e) => self.fail(format!(
+                    "Wrote {}, but the import list couldn't be refreshed: {e}",
+                    path.display()
+                )),
+            },
+            Some(Err(e)) => self.fail(e.to_string()),
+            None => {}
         }
     }
 
@@ -2089,6 +2394,7 @@ impl eframe::App for App {
         }
         // After the views, so a drag released this frame is finished first.
         self.shortcuts(&ctx);
+        self.follow_model_file(&ctx);
         self.ask_stamp_colors();
         self.dialogs(&ctx);
         if let Some(message) = self.refusal.take()

@@ -30,43 +30,6 @@ struct Canonical {
 }
 
 fn canonical(p: &Project) -> Canonical {
-    canonical_with(p, true)
-}
-
-/// [`canonical`] without normals, which a model file keeps only to within a
-/// rounding step; [`assert_normals_close`] compares those.
-fn canonical_shape(p: &Project) -> Canonical {
-    canonical_with(p, false)
-}
-
-/// Asserts that each triangle corner's normal in `b`, read from a model
-/// file, points within about a degree of the one in `a` at AC's usual
-/// length, given that their triangles match.
-fn assert_normals_close(a: &Project, b: &Project, label: &str) {
-    let normals = |p: &Project| -> Vec<glam::Vec3> {
-        p.model()
-            .meshes()
-            .flatten()
-            .flat_map(|m| {
-                m.triangles
-                    .iter()
-                    .flat_map(|t| t.corners.map(|c| m.vertices[c.vertex as usize].normal))
-            })
-            .collect()
-    };
-    for (x, y) in normals(a).into_iter().zip(normals(b)) {
-        if x == glam::Vec3::ZERO {
-            // A few AC normals are zero, which stays zero.
-            assert_eq!(y, x, "{label}");
-            continue;
-        }
-        let close = x.normalize().dot(y.normalize()) > 0.9998
-            && (y.length() - crate::MODEL_FILE_UNITS.normal_length).abs() < 1e-4;
-        assert!(close, "{label}: normal {x} came back as {y}");
-    }
-}
-
-fn canonical_with(p: &Project, normals: bool) -> Canonical {
     let palette = p
         .palette()
         .colors()
@@ -107,7 +70,6 @@ fn canonical_with(p: &Project, normals: bool) -> Canonical {
                             // Adding zero turns -0.0, from float noise, into 0.0.
                             let st = (c.uv * size * 32.0).round() + 0.0;
                             let nrm = (v.normal * 127.0).round() + 0.0;
-                            let nrm = if normals { nrm } else { glam::Vec3::ZERO };
                             let _ = write!(
                                 s,
                                 " p{:?} n{:?} f{} st{:?}",
@@ -400,11 +362,12 @@ fn synthetic_villager_round_trips() {
 fn synthetic_villager_round_trips_through_a_model_file() {
     let (original, pose) = synthetic_project();
     let again = through_model_file(&original);
-    assert_eq!(canonical_shape(&original), canonical_shape(&again));
-    assert_normals_close(&original, &again, "synthetic");
-    assert_eq!(
-        canonical_shape(&original),
-        canonical_shape(&reimport(&again, &pose))
+    assert_eq!(canonical(&original), canonical(&again));
+    assert_eq!(canonical(&original), canonical(&reimport(&again, &pose)));
+    // Sent again without an edit, it comes back exactly.
+    assert!(
+        through_model_file(&again) == again,
+        "changed through a model file a second time"
     );
 }
 
@@ -460,27 +423,44 @@ fn export_rasterizes_painted_layers() {
     assert_eq!(canonical(&p), canonical(&again));
 }
 
+fn write_file(root: &Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A decomp-shaped folder holding `project` as model and texture set
+/// `t_1`, the one villager in its table.
+fn synthetic_decomp(project: &Project) -> (tempfile::TempDir, Decomp) {
+    let dir = tempfile::tempdir().unwrap();
+    let full = export(project, "t_1", "t_1").unwrap();
+    write_file(dir.path(), "src/data/npc/model/mdl/t_1.c", &full.model_c);
+    write_file(dir.path(), "src/data/npc/npc_1_wait1.c", &synthetic_pose());
+    write_file(
+        dir.path(),
+        "src/data/npc/npc_draw_data.c",
+        &synthetic_table(),
+    );
+    write_file(
+        dir.path(),
+        "src/data/npc/model/tex/t_1.c",
+        &full.textures.texture_c,
+    );
+    std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
+    let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
+    (dir, decomp)
+}
+
 /// A texture-only export replaces an existing texture set's source in a
 /// decomp, and only where the villager table will still link.
 #[test]
 fn texture_export_replaces_a_texture_set_in_the_decomp() {
-    use crate::{Decomp, WriteError, export_textures};
+    use crate::{WriteError, export_textures};
     use mint_core::{Layer, PaletteIndex, Shape, Style, TextureId, VariantRef, shape};
 
     let (mut p, _) = synthetic_project();
-    let dir = tempfile::tempdir().unwrap();
-    let write = |rel: &str, text: &str| {
-        let path = dir.path().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    };
-    let full = export(&p, "t_1", "t_1").unwrap();
-    write("src/data/npc/model/mdl/t_1.c", &full.model_c);
-    write("src/data/npc/npc_1_wait1.c", &synthetic_pose());
-    write("src/data/npc/npc_draw_data.c", &synthetic_table());
-    write("src/data/npc/model/tex/t_1.c", &full.textures.texture_c);
-    std::fs::create_dir_all(dir.path().join("build/GAFE01_00/include/assets/npc")).unwrap();
-    let decomp = Decomp::open(dir.path(), "GAFE01_00").unwrap();
+    let (dir, decomp) = synthetic_decomp(&p);
+    let write = |rel: &str, text: &str| write_file(dir.path(), rel, text);
 
     let r = VariantRef {
         texture: TextureId(0),
@@ -573,6 +553,111 @@ fn texture_export_replaces_a_texture_set_in_the_decomp() {
         panic!("expected a symbol mismatch");
     };
     assert_eq!((missing, extra), (vec!["t_1_extra".to_owned()], vec![]));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("t_1_extra[] = { 0 };\n")
+    );
+}
+
+#[test]
+fn model_export_replaces_a_model_in_the_decomp() {
+    use crate::WriteError;
+    use glam::Vec3;
+    use mint_core::MaterialId;
+
+    let (mut p, _) = synthetic_project();
+    let (dir, decomp) = synthetic_decomp(&p);
+    // Move one vertex, as an edit in another program would.
+    let mut meshes: Vec<_> = p.model().meshes().map(Option::<&Mesh>::cloned).collect();
+    let mesh = meshes.iter_mut().flatten().next().unwrap();
+    mesh.vertices[0].position += Vec3::new(0.0, 25.0, 0.0);
+    p.set_meshes(meshes).unwrap();
+
+    let edited = export(&p, "t_1", "t_1").unwrap();
+    let path = decomp.write_model(&edited).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited.model_c);
+    let v = decomp.villagers().unwrap().remove(0);
+    let again = decomp.import(&v).unwrap();
+    assert_eq!(canonical(&again), canonical(&p));
+
+    let other = export(&p, "u_1", "t_1").unwrap();
+    assert!(matches!(
+        decomp.write_model(&other),
+        Err(WriteError::ModelNotInTable(model)) if model == "u_1"
+    ));
+    // A body texture no triangle uses would move where the model finds the
+    // others in the texture set.
+    let (body, moved_to) = {
+        let body = |offset| {
+            p.textures()
+                .iter()
+                .position(|t| t.name.ends_with(offset))
+                .unwrap()
+        };
+        let material = |texture| {
+            MaterialId(
+                p.materials()
+                    .iter()
+                    .position(|m| m.texture.index() == texture)
+                    .unwrap() as u32,
+            )
+        };
+        (material(body("0x000")), material(body("0x080")))
+    };
+    let mut unused = p.clone();
+    let mut meshes: Vec<_> = unused
+        .model()
+        .meshes()
+        .map(Option::<&Mesh>::cloned)
+        .collect();
+    for t in meshes.iter_mut().flatten().flat_map(|m| &mut m.triangles) {
+        if t.material == body {
+            t.material = moved_to;
+        }
+    }
+    unused.set_meshes(meshes).unwrap();
+    assert!(matches!(
+        export(&unused, "t_1", "t_1"),
+        Err(ExportError::Undrawn(name)) if name.ends_with("0x000")
+    ));
+    // Nor may a model replace one its texture set wouldn't import with,
+    let mut moved = edited.clone();
+    moved.model_c = edited
+        .model_c
+        .replace("anime_4_txt + 0x080", "anime_4_txt + 0x040");
+    assert_ne!(moved.model_c, edited.model_c);
+    let refused = decomp.write_model(&moved);
+    assert!(
+        matches!(refused, Err(WriteError::Redraw { .. })),
+        "{refused:?}"
+    );
+    // or one that would load its texture sets at other sizes.
+    let mut resized = edited.clone();
+    resized.model_c = edited.model_c.replace(
+        "anime_3_txt, G_IM_FMT_CI, 32, 32",
+        "anime_3_txt, G_IM_FMT_CI, 32, 16",
+    );
+    assert_ne!(resized.model_c, edited.model_c);
+    let refused = decomp.write_model(&resized);
+    assert!(
+        matches!(refused, Err(WriteError::ModelLoads { .. })),
+        "{refused:?}"
+    );
+    // The file shares an array the export would drop; its own arrays,
+    // which nothing else can refer to, may change.
+    write_file(
+        dir.path(),
+        "src/data/npc/model/mdl/t_1.c",
+        &format!(
+            "{}static unsigned char t_1_own[] = {{ 0 }};\nunsigned char t_1_extra[] = {{ 0 }};\n",
+            edited.model_c
+        ),
+    );
+    let Err(WriteError::Symbols { missing, .. }) = decomp.write_model(&edited) else {
+        panic!("expected a symbol mismatch");
+    };
+    assert_eq!(missing, vec!["t_1_extra".to_owned()]);
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
@@ -801,17 +886,21 @@ fn every_built_villager_round_trips() {
                 }
                 let sent = through_model_file(&p);
                 assert_eq!(
-                    canonical_shape(&expected),
-                    canonical_shape(&sent),
+                    canonical(&expected),
+                    canonical(&sent),
                     "{} changed through a model file",
                     v.texture_set
                 );
-                assert_normals_close(&expected, &sent, &v.texture_set);
+                assert!(
+                    through_model_file(&sent) == sent,
+                    "{} changed through a model file a second time",
+                    v.texture_set
+                );
                 // Reading welds vertices the import kept apart, so the
                 // export may order its vertices differently.
                 assert_eq!(
-                    canonical_shape(&expected),
-                    canonical_shape(&reimport(&sent, &pose)),
+                    canonical(&expected),
+                    canonical(&reimport(&sent, &pose)),
                     "{} exports differently after a model file",
                     v.texture_set
                 );
@@ -828,13 +917,17 @@ fn every_built_villager_round_trips() {
                 decomp
                     .check_texture_set(&textures)
                     .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));
+                let full = export(&p, &v.model, &v.texture_set).unwrap();
+                decomp
+                    .check_model(&full)
+                    .unwrap_or_else(|e| panic!("{}: {e}", v.texture_set));
                 ok += 1;
             }
             Err(e) => refused.push((v.model.clone(), format!("{}: {e}", v.texture_set))),
         }
     }
     eprintln!(
-        "{ok} villagers round-trip, also through a model file, save and load, and could be replaced"
+        "{ok} villagers round-trip, also through a model file, save and load, and their textures and models could be replaced"
     );
     eprintln!(
         "triangles that move to another mesh through a model file: {}",

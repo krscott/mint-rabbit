@@ -70,6 +70,10 @@ pub enum ExportError {
     ClothingSize(glam::UVec2),
     #[error("node {node:?}: {problem}")]
     Node { node: String, problem: String },
+    #[error(
+        "no triangle draws texture {0:?}, so the model wouldn't load it; keep at least one face on one of its materials"
+    )]
+    Undrawn(String),
 }
 
 /// The exported sources of a model and its texture set.
@@ -122,6 +126,14 @@ impl TextureSymbols {
             .chain(&self.eyes)
             .chain(&self.mouths)
             .chain([&self.body])
+    }
+}
+
+impl Export {
+    /// The model, such as `cat_1`.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.textures.model()
     }
 }
 
@@ -898,10 +910,31 @@ fn texture_export(
 pub fn export(project: &Project, model: &str, texture_set: &str) -> Result<Export, ExportError> {
     check_name(model)?;
     let layout = prepare(project, texture_set)?;
+    check_drawn(project)?;
     Ok(Export {
         model_c: model_c(project, model, &layout)?,
         textures: texture_export(project, model, texture_set, &layout),
     })
+}
+
+/// Checks that triangles draw every texture: the model loads only the
+/// textures its triangles use, and where it finds each part of the body
+/// atlas follows from them.
+fn check_drawn(project: &Project) -> Result<(), ExportError> {
+    let materials = project.materials();
+    let mut drawn = vec![false; project.textures().len()];
+    for t in project
+        .model()
+        .meshes()
+        .flatten()
+        .flat_map(|m| &m.triangles)
+    {
+        drawn[materials[t.material.index()].texture.index()] = true;
+    }
+    match drawn.iter().position(|&d| !d) {
+        Some(i) => Err(ExportError::Undrawn(project.textures()[i].name.clone())),
+        None => Ok(()),
+    }
 }
 
 /// Where an AC project was imported from.

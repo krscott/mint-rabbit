@@ -98,11 +98,29 @@ pointer's matching point in the other view, on every part of the model that
 shows that texture point (for a stamp, the box around it and a small ring at
 its center); View > Ghost Cursor in the other view turns it off.
 
-A project saves as a folder (File > Save, Save as). The File menu's exports
-either replace the imported villager's texture set in the decomp, after which
-the decomp must be built with `python configure.py --non-matching && ninja`, or
-write a new texture set to a folder with the steps for adding it. The status
-bar says whether the project can export, and if not, why.
+A project saves as a folder (File > Save, Save as).
+
+mint-rabbit has no geometry tools; edit the model in Blender instead. File >
+Send to model file… writes it as glTF binary (`.glb`), with a PNG of each
+texture's shown variant beside it, and the project remembers that file and
+takes the model as the file holds it. In Blender, File > Import > glTF 2.0
+with **Merge Vertices** on, or the model arrives split at its UV seams, and
+**Pack Images** off, or Image > Reload won't see new paint. The model is posed
+as in the Model View and about 3 m tall. Weight each vertex fully to one bone,
+keep to the existing materials, and leave at least one face on each texture;
+the bones can't change. Export it over the same file as glTF Binary (File >
+Export > glTF 2.0), and mint-rabbit reads it again as one undo step, also when
+the project opens after the file changed; Reload model file does so by hand,
+and a file it can't read leaves the project as it was and says why. Saving the
+project rewrites the PNGs. Copy model file path and Open model file folder help
+find the file from Blender.
+
+The File menu's exports either replace the imported villager's texture set or
+its model in the decomp, after which the decomp must be built with
+`python configure.py --non-matching && ninja`, or write a new texture set to a
+folder with the steps for adding it. Replacing the model changes every villager
+drawn on it. The status bar says whether the project can export, and if not,
+why.
 
 To try the app without a disc, `just demo` writes a generated villager to a
 decomp-shaped directory and opens it.
@@ -125,10 +143,10 @@ The decomp recipes take an ac-decomp checkout as PATH, which defaults to
 - `just test-decomp-sources [PATH]` parses every model source and the
   villager table of a decomp checkout, built or not.
 - `just test-decomp [PATH]` also round-trips every villager (import, export,
-  import), saves and loads each as a project, checks that each texture
-  export could replace its source in the decomp, and reads the villager names
-  from the disc image when there is an uncompressed one; it needs a built
-  checkout.
+  import, also through a model file), saves and loads each as a project,
+  checks that each texture and model export could replace its source in the
+  decomp, and reads the villager names from the disc image when there is an
+  uncompressed one; it needs a built checkout.
 - `just snapshot [PATH]` renders the first villager of a decomp (the demo
   when neither is given) offscreen to `target/model-view.png`; it needs a
   GPU.

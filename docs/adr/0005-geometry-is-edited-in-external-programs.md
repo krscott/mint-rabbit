@@ -37,11 +37,16 @@ nodes' meshes.
 - Blender writes each object's faces grouped by material, so a node's
   drawing order can change, which matters only for coincident faces.
 - The file's nonzero normals are unit length, and the few zero ones in AC
-  models stay zero; reading gives them the length the export target uses
-  (AC: 120/127), so an AC model's normals, about that long, come back at
-  exactly that length.
+  models stay zero; reading gives an edited normal the length the export
+  target uses (AC: 120/127, about as long as AC's own).
 - Positions are scaled by a factor the export target gives (AC: 0.001 m per
   unit), so a model is a usable size in meters.
+- A vertex the file holds exactly as the project would write it keeps the
+  project's exact position if the skeleton still carries it there, and its
+  exact normal if the file holds that as written and the skeleton doesn't
+  turn it, so reading a file nobody edited changes nothing, however often
+  it is sent and read, while any edit to its vertices, however small, is
+  read; a change to its skeleton smaller than the file's roundoff isn't.
 - Added geometry shares its node's textures, such as the body atlas; a
   separate texture per added mesh needs target support first.
 - Blender's glTF importer must merge vertices, or it splits the welded mesh
