@@ -517,13 +517,31 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             (scale, rotation.normalize(), translation * s)
         })
         .collect();
+    // Made into matrices as reading makes them, so the check below sees
+    // what reading will.
     let written_world = model.compose(
         &written
             .iter()
-            .map(|&(sc, r, t)| Mat4::from_scale_rotation_translation(sc, r, t))
+            .map(|&(sc, r, t)| {
+                Mat4::from_cols_array_2d(
+                    &gltf::scene::Transform::Decomposed {
+                        translation: t.to_array(),
+                        rotation: r.to_array(),
+                        scale: sc.to_array(),
+                    }
+                    .matrix(),
+                )
+            })
             .collect::<Vec<_>>(),
     );
     let ibms: Vec<Mat4> = written_world.iter().map(Mat4::inverse).collect();
+    // Each node's bind matrix as reading finds it, which f32 leaves only
+    // near the identity.
+    let binds: Vec<Mat4> = written_world
+        .iter()
+        .zip(&ibms)
+        .map(|(w, i)| *w * *i)
+        .collect();
     for id in model.ids() {
         let i = id.index();
         let (sc, r, t) = written[i];
@@ -575,10 +593,11 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                 }
                 // Mapped back as reading does, so a vertex too far out or
                 // under too small a scale for f32 is refused, not moved.
-                let back = to_local[f.index()].transform_point3(p / s);
+                let back =
+                    to_local[f.index()].transform_point3(binds[f.index()].transform_point3(p) / s);
                 if (back - v.position).abs().max_element() > POSITION_TOLERANCE {
                     return Err(ModelFileError::Unwritable {
-                        node: model.node(id).name.clone(),
+                        node: model.node(f).name.clone(),
                         problem: "a vertex wouldn't keep its position, as it's too far out or under too small a scale",
                     });
                 }
@@ -1703,30 +1722,46 @@ mod tests {
     }
 
     #[test]
-    fn a_thin_or_tiny_node_keeps_its_vertices_or_is_refused() {
-        let p = project(Vec3::new(1e-2, 1.0, 1.0), meshes(), &["body"]);
-        let read = round_trip(&p);
-        let before = &p.model().node(NodeId(1)).mesh.as_ref().unwrap().vertices;
-        let after = &read[1].as_ref().unwrap().vertices;
-        // The child's own vertex, its last.
-        let (a, b) = (before.last().unwrap(), after.last().unwrap());
-        assert!((b.normal.length() - 1.0).abs() < 1e-5, "{}", b.normal);
-        assert!(
-            (b.position - a.position).abs().max_element() <= POSITION_TOLERANCE,
-            "{} came back as {}",
-            a.position,
-            b.position
-        );
-        for scale in [Vec3::new(1e-5, 1.0, 1.0), Vec3::splat(1e-5)] {
-            let p = project(scale, meshes(), &["body"]);
-            assert!(
-                matches!(
-                    encode(&p, &["body.png".into()], UNITS),
-                    Err(ModelFileError::Unwritable { node, .. }) if node == "child"
-                ),
-                "{scale}"
-            );
+    fn a_thin_tiny_or_far_node_keeps_its_vertices_or_is_refused() {
+        let mut kept = 0;
+        for e in 0..=10 {
+            let k = 10f32.powf(-(e as f32) / 2.0);
+            for scale in [Vec3::new(k, 1.0, 1.0), Vec3::new(k, k, 1.0), Vec3::splat(k)] {
+                for far in [1.0, 1000.0] {
+                    let [root, mut child] = meshes();
+                    for v in &mut child.vertices {
+                        if v.follows.is_none() {
+                            v.position *= far;
+                        }
+                    }
+                    let p = project(scale, [root, child], &["body"]);
+                    let label = format!("scale {scale}, far {far}");
+                    match encode(&p, &["body.png".into()], UNITS) {
+                        Err(ModelFileError::Unwritable { node, .. }) => {
+                            assert_eq!(node, "child", "{label}");
+                        }
+                        Err(e) => panic!("{label}: {e}"),
+                        Ok(bytes) => {
+                            kept += 1;
+                            let read = decode(&p, &bytes, UNITS).unwrap();
+                            let before = p.model().node(NodeId(1)).mesh.as_ref().unwrap();
+                            let after = read[1].as_ref().unwrap();
+                            let (a, b) = (before.vertices[2], *after.vertices.last().unwrap());
+                            assert!(
+                                (b.position - a.position).abs().max_element() <= POSITION_TOLERANCE,
+                                "{label}: {} came back as {}",
+                                a.position,
+                                b.position
+                            );
+                        }
+                    }
+                }
+            }
         }
+        // Not by refusing everything: an ordinary thin node is kept.
+        let p = project(Vec3::new(1e-2, 1.0, 1.0), meshes(), &["body"]);
+        assert!(encode(&p, &["body.png".into()], UNITS).is_ok());
+        assert!(kept > 10, "{kept}");
     }
 
     #[test]
