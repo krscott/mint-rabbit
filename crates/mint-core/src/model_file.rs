@@ -123,7 +123,7 @@ pub enum ModelFileError {
     )]
     NotReadable(Box<ModelFileError>),
     #[error("node {node:?} can't go in a model file: {problem}")]
-    Unwritable { node: String, problem: &'static str },
+    Unwritable { node: String, problem: String },
     #[error("the project has {0} nodes; a model file holds at most 65536")]
     TooManyNodes(usize),
     #[error("the model file's nodes form a loop rather than a tree")]
@@ -508,7 +508,8 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
 
     // The skeleton, posed, with translations in the file's units. The
     // inverse bind matrices come from the transforms as written, so they
-    // cancel them exactly even where a node's matrix doesn't decompose.
+    // cancel them, up to f32 rounding, even where a node's matrix doesn't
+    // decompose.
     let written: Vec<(Vec3, glam::Quat, Vec3)> = locals
         .iter()
         .map(|m| {
@@ -535,9 +536,9 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             .collect::<Vec<_>>(),
     );
     let ibms: Vec<Mat4> = written_world.iter().map(Mat4::inverse).collect();
-    // Each node's bind matrix as reading finds it, which f32 leaves only
-    // near the identity.
-    let binds: Vec<Mat4> = written_world
+    // Each joint's matrix (model matrix times inverse bind matrix) as
+    // reading finds it, which f32 leaves only near the identity.
+    let joint_matrices: Vec<Mat4> = written_world
         .iter()
         .zip(&ibms)
         .map(|(w, i)| *w * *i)
@@ -556,7 +557,7 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
         {
             return Err(ModelFileError::Unwritable {
                 node: model.node(id).name.clone(),
-                problem: "its transform is too small, too large, or isn't finite",
+                problem: "its transform is too small, too large, or isn't finite".into(),
             });
         }
     }
@@ -588,17 +589,21 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                 if !(p.is_finite() && n.is_finite() && c.uv.is_finite()) {
                     return Err(ModelFileError::Unwritable {
                         node: model.node(id).name.clone(),
-                        problem: "a vertex's position, normal, or UV isn't a finite number",
+                        problem: "a vertex's position, normal, or UV isn't a finite number".into(),
                     });
                 }
                 // Mapped back as reading does, so a vertex too far out or
                 // under too small a scale for f32 is refused, not moved.
-                let back =
-                    to_local[f.index()].transform_point3(binds[f.index()].transform_point3(p) / s);
-                if (back - v.position).abs().max_element() > POSITION_TOLERANCE {
+                let back = to_local[f.index()]
+                    .transform_point3(joint_matrices[f.index()].transform_point3(p) / s);
+                if !back.is_finite() || (back - v.position).abs().max_element() > POSITION_TOLERANCE
+                {
                     return Err(ModelFileError::Unwritable {
-                        node: model.node(f).name.clone(),
-                        problem: "a vertex wouldn't keep its position, as it's too far out or under too small a scale",
+                        node: model.node(id).name.clone(),
+                        problem: format!(
+                            "a vertex following {:?} wouldn't keep its position, as it's too far out or under too small a scale",
+                            model.node(f).name
+                        ),
                     });
                 }
                 run.push(verts.add(f, p, direction(n), c.uv));
