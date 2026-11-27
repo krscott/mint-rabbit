@@ -269,10 +269,14 @@ fn check_replaceable(
 
 const GLB_MAGIC: &[u8] = b"glTF";
 /// How far, in model units, a vertex may move through a model file, which
-/// holds model-space positions as f32.
+/// holds model-space positions as f32, along the axis it moves most on.
+/// Far above f32's own roundoff, so it also allows for an exporter's
+/// roundoff in the joints: Blender's are within about 5e-7 of what was
+/// written, about 1e-3 units at a villager's size.
 const POSITION_TOLERANCE: f32 = 0.01;
 /// How far a normal's direction may turn through a model file, along the
-/// axis it turns most on.
+/// axis it turns most on; like [`POSITION_TOLERANCE`], it allows for an
+/// exporter's roundoff in the joints.
 const NORMAL_TOLERANCE: f32 = 1e-4;
 /// Largest model file read, far above any villager's.
 const MAX_FILE_BYTES: u64 = 256 << 20;
@@ -582,7 +586,7 @@ impl Written {
         let position = only(written.iter().map(|w| w.position))
             .filter(|p| (*p - read.0).abs().max_element() <= POSITION_TOLERANCE)
             .unwrap_or(read.0);
-        // Compared as the file holds it, where nothing magnifies roundoff.
+        // In the file's space, where no node's scale magnifies roundoff.
         let unturned = (direction(skinned) - normal).abs().max_element() <= NORMAL_TOLERANCE;
         let normal_bits = bits(normal);
         let normal = only(
