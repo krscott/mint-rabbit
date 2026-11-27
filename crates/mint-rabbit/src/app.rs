@@ -814,9 +814,7 @@ impl App {
             Ok(sent) => sent,
             Err(e) => return self.fail(e.to_string()),
         };
-        // Read again once it settles, in case another program wrote it
-        // since; a file as written reads back as the model now is.
-        doc.watch.known(None);
+        doc.watch.known(watch::stamp(path.as_path()));
         let shown = path.as_path().display().to_string();
         doc.editor.set_model_file(path);
         match doc.editor.edit(|p| p.set_meshes(meshes)) {
@@ -853,16 +851,8 @@ impl App {
         let busy = self.dialog.is_some()
             || self.texture_view.dragging()
             || ctx.input(|i| i.pointer.any_down());
-        if busy || !doc.watch.poll(watch::stamp(path.as_path()), Instant::now()) {
-            return;
-        }
-        let path = path.clone();
-        let shown = path.as_path().display();
-        match doc.read_model_file(&path) {
-            // Unchanged, as a file this wrote, says nothing.
-            Ok(false) => {}
-            Ok(true) => self.tell(format!("Read the model from {shown}")),
-            Err(e) => self.fail(format!("Couldn't read {shown}: {e}")),
+        if !busy && doc.watch.poll(watch::stamp(path.as_path()), Instant::now()) {
+            self.reload_model_file();
         }
     }
 
