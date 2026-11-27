@@ -84,7 +84,7 @@ pub enum LoadError {
     Texture(#[from] crate::TextureError),
     #[error(transparent)]
     Project(#[from] crate::ProjectError),
-    #[error("the project's model file {0:?}: {1}")]
+    #[error("the project file's model file {0:?} can't be used: {1}")]
     ModelFile(String, crate::model_file::ModelFileError),
 }
 

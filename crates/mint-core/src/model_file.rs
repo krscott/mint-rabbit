@@ -18,8 +18,8 @@
 //! be read safely is refused, and errors about one object name it.
 //!
 //! The path of a model file comes from a project file, which may be shared,
-//! so writing replaces only a `.glb` model file and the PNGs written beside
-//! it, never a file of another kind.
+//! so writing replaces only a `.glb` model file and PNGs at its image paths,
+//! never a file of another kind.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,8 +38,9 @@ use crate::{
 pub const EXTENSION: &str = "glb";
 
 /// The absolute path of a model file: valid UTF-8, so a project file can
-/// store it, ending in `.glb`, with its directory's links resolved, so it
-/// compares with a project directory's resolved path.
+/// store it, and ending in `.glb`. Where its directory exists, the
+/// directory's links are resolved, so it compares with a project
+/// directory's resolved path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelFilePath(PathBuf);
 
@@ -74,11 +75,6 @@ impl ModelFilePath {
     pub fn as_path(&self) -> &Path {
         &self.0
     }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.to_str().expect("checked when made")
-    }
 }
 
 /// How an export target's model units map to a model file's.
@@ -104,7 +100,9 @@ pub enum ModelFileError {
     },
     #[error("{0} exists and isn't a glTF binary file; choose another path")]
     NotModelFile(PathBuf),
-    #[error("{0} isn't a model file, so its images aren't written beside it")]
+    #[error(
+        "{0} isn't a model file, so its images aren't written beside it; send the model to a model file again"
+    )]
     NoModelFile(PathBuf),
     #[error("{0} is larger than a model file may be ({MAX_FILE_BYTES} bytes)")]
     TooLarge(PathBuf),
@@ -116,10 +114,12 @@ pub enum ModelFileError {
         "can't read the model file as glTF: {0}; export it as glTF Binary (.glb) without compression"
     )]
     Gltf(#[from] gltf::Error),
-    #[error("the model file is malformed glTF")]
+    #[error("the model file is malformed glTF; export it again as glTF Binary (.glb)")]
     Unreadable,
-    #[error("the model file's default scene has no meshes")]
+    #[error("the model file's default scene has no meshes, or none with faces")]
     NoMesh,
+    #[error("the project has {0} nodes; a model file holds at most 65536")]
+    TooManyNodes(usize),
     #[error("the model file's nodes form a loop rather than a tree")]
     Cycle,
     #[error("the model file keeps its data in a separate file; export it as glTF Binary (.glb)")]
@@ -202,7 +202,7 @@ fn file_safe(name: &str) -> String {
 /// file at `path`: `<stem>.<index>-<texture>.png`. The last part before
 /// `.png` holds no dot, so no two textures or stems share an image.
 #[must_use]
-pub fn image_paths(project: &Project, path: &ModelFilePath) -> Vec<PathBuf> {
+fn image_paths(project: &Project, path: &ModelFilePath) -> Vec<PathBuf> {
     let path = path.as_path();
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     project
@@ -227,6 +227,24 @@ fn uri(name: &str) -> String {
         .collect()
 }
 
+/// Whether `path` is a regular file that starts with `magic`, or `None`
+/// when nothing is there.
+fn starts_with(path: &Path, magic: &[u8]) -> Result<Option<bool>, ModelFileError> {
+    use std::io::Read as _;
+    let io = |e| ModelFileError::Io(path.to_owned(), e);
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Ok(Some(false)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io(e)),
+    }
+    let mut head = vec![0; magic.len()];
+    let file = std::fs::File::open(path).map_err(io)?;
+    Ok(Some(
+        file.take(magic.len() as u64).read_exact(&mut head).is_ok() && head == magic,
+    ))
+}
+
 /// Fails unless `path` is missing or starts with `magic`, so writing never
 /// replaces a file of another kind, such as one a shared project names.
 fn check_replaceable(
@@ -234,18 +252,9 @@ fn check_replaceable(
     magic: &[u8],
     error: fn(PathBuf) -> ModelFileError,
 ) -> Result<(), ModelFileError> {
-    use std::io::Read as _;
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => {}
-        Ok(_) => return Err(error(path.to_owned())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(ModelFileError::Io(path.to_owned(), e)),
-    }
-    let mut file = std::fs::File::open(path).map_err(|e| ModelFileError::Io(path.to_owned(), e))?;
-    let mut head = vec![0; magic.len()];
-    match file.read_exact(&mut head) {
-        Ok(()) if head == magic => Ok(()),
-        _ => Err(error(path.to_owned())),
+    match starts_with(path, magic)? {
+        None | Some(true) => Ok(()),
+        Some(false) => Err(error(path.to_owned())),
     }
 }
 
@@ -256,7 +265,8 @@ const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Writes `project`'s model to the model file at `path` and the images its
 /// materials show beside it, each texture in the variant `variants` gives
-/// for it. Refuses to replace a file that isn't a model file or a PNG.
+/// for it. Refuses, before writing anything, to replace a file that isn't
+/// a model file or a PNG; writes the model file last.
 pub fn write(
     project: &Project,
     path: &ModelFilePath,
@@ -265,19 +275,19 @@ pub fn write(
 ) -> Result<(), ModelFileError> {
     let file = path.as_path();
     check_replaceable(file, GLB_MAGIC, ModelFileError::NotModelFile)?;
-    let uris: Vec<String> = image_paths(project, path)
+    let images = image_paths(project, path);
+    let uris: Vec<String> = images
         .iter()
         .map(|p| uri(&p.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
     let bytes = encode(project, &uris, units)?;
-    write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))?;
-    write_images(project, path, variants)
+    write_pngs(project, &images, variants)?;
+    write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))
 }
 
 /// Writes the images the model file at `path`, which must exist, shows for
-/// `project`'s textures, each in the variant `variants` gives for it;
-/// external textures show their preview, whatever `variants` gives.
-/// Refuses to replace a file that isn't a PNG.
+/// `project`'s textures, each in the variant `variants` gives for it.
+/// Refuses, before writing anything, to replace a file that isn't a PNG.
 ///
 /// Panics unless `variants` has one entry per texture, each a variant of a
 /// painted texture.
@@ -286,18 +296,28 @@ pub fn write_images(
     path: &ModelFilePath,
     variants: &[usize],
 ) -> Result<(), ModelFileError> {
+    let file = path.as_path();
+    if starts_with(file, GLB_MAGIC)? != Some(true) {
+        return Err(ModelFileError::NoModelFile(file.to_owned()));
+    }
+    write_pngs(project, &image_paths(project, path), variants)
+}
+
+/// Writes each texture's image to its path in `images`, in the variant
+/// `variants` gives for it; external textures show their preview, whatever
+/// `variants` gives. Refuses, before writing anything, to replace a file
+/// that isn't a PNG.
+fn write_pngs(
+    project: &Project,
+    images: &[PathBuf],
+    variants: &[usize],
+) -> Result<(), ModelFileError> {
     assert_eq!(
         variants.len(),
         project.textures().len(),
         "one variant per texture"
     );
-    let file = path.as_path();
-    if !std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
-        return Err(ModelFileError::NoModelFile(file.to_owned()));
-    }
-    check_replaceable(file, GLB_MAGIC, ModelFileError::NoModelFile)?;
-    let images = image_paths(project, path);
-    for image in &images {
+    for image in images {
         check_replaceable(image, PNG_MAGIC, ModelFileError::NotPng)?;
     }
     for ((i, t), image) in project.textures().iter().enumerate().zip(images) {
@@ -317,7 +337,7 @@ pub fn write_images(
             TextureContent::External { preview } => (preview.size, preview.pixels.clone()),
         };
         let png = encode_png(size, &pixels).map_err(|e| ModelFileError::Png(image.clone(), e))?;
-        write_atomic(&image, &png).map_err(|e| ModelFileError::Io(image.clone(), e))?;
+        write_atomic(image, &png).map_err(|e| ModelFileError::Io(image.clone(), e))?;
     }
     Ok(())
 }
@@ -437,7 +457,7 @@ impl Vertices {
             self.normals.push(normal.to_array());
             self.uvs.push(uv.to_array());
             self.joints
-                .push(u16::try_from(node.0).expect("JOINTS_0 holds node ids below 65536"));
+                .push(u16::try_from(node.0).expect("encode refuses more nodes"));
             self.positions.len() as u32 - 1
         })
     }
@@ -453,6 +473,9 @@ fn normal_matrix(m: Mat4) -> Mat3 {
 fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, ModelFileError> {
     let model = project.model();
     nodes_by_name(model)?;
+    if model.nodes().len() > 1 << 16 {
+        return Err(ModelFileError::TooManyNodes(model.nodes().len()));
+    }
     let s = units.meters_per_unit;
     let world = model.world_matrices(project.pose());
     let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
@@ -879,10 +902,8 @@ fn decode(
 
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut welds: Vec<HashMap<(u32, [u32; 6]), u32>> = vec![HashMap::new(); model.nodes().len()];
-    let mut any = false;
     for node in gltf.nodes().filter(|n| in_scene[n.index()]) {
         let Some(mesh) = node.mesh() else { continue };
-        any = true;
         let object = node
             .name()
             .or(mesh.name())
@@ -925,9 +946,9 @@ fn decode(
                 Ok((m, normal_matrix(m), id))
             })
             .collect();
-        for (m, _, id) in joints.iter().flatten() {
+        for (m, nm, id) in joints.iter().flatten() {
             let det = m.determinant();
-            if !m.is_finite() || !det.is_finite() || det == 0.0 {
+            if !m.is_finite() || !nm.is_finite() || !det.is_finite() || det == 0.0 {
                 return Err(malformed(&format!(
                     "skin: bone {:?} is scaled to nothing or isn't a finite transform",
                     model.node(*id).name
@@ -1023,12 +1044,7 @@ fn decode(
                 let (Some(j), Some(w)) = (reader.read_joints(set), reader.read_weights(set)) else {
                     return Err(missing("bone weights"));
                 };
-                for (v, (j, w)) in j
-                    .into_u16()
-                    .zip(w.into_f32())
-                    .enumerate()
-                    .take(positions.len())
-                {
+                for (v, (j, w)) in j.into_u16().zip(w.into_f32()).enumerate() {
                     for (j, w) in j.into_iter().zip(w) {
                         if !(w.is_finite() && w >= 0.0) {
                             return Err(malformed(
@@ -1080,14 +1096,15 @@ fn decode(
                         ));
                     }
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
-                    let n = nm * normals[v];
+                    // Checked before normalizing, which turns NaN into zero.
+                    let n = to_local_normal[id.index()] * (nm * normals[v]);
                     let local = (
                         id,
                         to_local[id.index()].transform_point3(p),
-                        (to_local_normal[id.index()] * n).normalize_or_zero() * units.normal_length,
+                        n.normalize_or_zero() * units.normal_length,
                         uvs[v],
                     );
-                    if !(local.1.is_finite() && local.2.is_finite() && local.3.is_finite()) {
+                    if !(local.1.is_finite() && n.is_finite() && local.3.is_finite()) {
                         return Err(malformed(
                             "vertex: its position, normal, or UV isn't a finite number in the model",
                         ));
@@ -1117,7 +1134,7 @@ fn decode(
             }
         }
     }
-    if !any {
+    if meshes.iter().all(Option::is_none) {
         return Err(ModelFileError::NoMesh);
     }
     Ok(meshes)
@@ -1590,6 +1607,30 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(other.as_path()).unwrap(), "keep me");
         assert_eq!(std::fs::read_to_string(&image).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn a_refused_image_leaves_the_model_file_alone() {
+        let p = sample();
+        let dir = tempfile::tempdir().unwrap();
+        let path = ModelFilePath::new(dir.path().join("m.glb")).unwrap();
+        std::fs::create_dir(dir.path().join("m.0-body.png")).unwrap();
+        assert!(matches!(
+            write(&p, &path, &[0], UNITS),
+            Err(ModelFileError::NotPng(_))
+        ));
+        assert!(!path.as_path().exists());
+    }
+
+    #[test]
+    fn a_file_with_no_faces_is_refused() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        let empty = edit_json(&bytes, |doc| doc["meshes"][0]["primitives"] = json!([]));
+        assert!(matches!(
+            decode(&p, &empty, UNITS),
+            Err(ModelFileError::NoMesh)
+        ));
     }
 
     #[test]

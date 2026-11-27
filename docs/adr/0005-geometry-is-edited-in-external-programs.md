@@ -36,9 +36,10 @@ nodes' meshes.
   vertices in Blender, which can be moved apart.
 - Blender writes each object's faces grouped by material, so a node's
   drawing order can change, which matters only for coincident faces.
-- The file's normals are unit length; reading gives them the length the
-  export target uses (AC: 120/127), so an AC model's normals, about that
-  long, come back at exactly that length.
+- The file's nonzero normals are unit length, and the few zero ones in AC
+  models stay zero; reading gives them the length the export target uses
+  (AC: 120/127), so an AC model's normals, about that long, come back at
+  exactly that length.
 - Positions are scaled by a factor the export target gives (AC: 0.001 m per
   unit), so a model is a usable size in meters.
 - Added geometry shares its node's textures, such as the body atlas; a
