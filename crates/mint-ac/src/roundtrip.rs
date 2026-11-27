@@ -407,7 +407,10 @@ fn synthetic_villager_round_trips_through_a_model_file() {
         canonical_shape(&reimport(&again, &pose))
     );
     // Sent again without an edit, it comes back exactly.
-    assert!(through_model_file(&again) == again);
+    assert!(
+        through_model_file(&again) == again,
+        "changed through a model file a second time"
+    );
 }
 
 /// Export writes what the layers paint over the base layer, and hidden layers
