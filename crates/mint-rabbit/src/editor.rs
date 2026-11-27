@@ -1,7 +1,7 @@
 //! The open project with its undo history.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mint_core::{EditError, Project, Variant, VariantRef};
 
@@ -34,6 +34,9 @@ pub struct Editor {
     project: Project,
     /// The project directory it was last opened from or saved to.
     path: Option<PathBuf>,
+    /// The absolute path of the project's model file, if it has one. It
+    /// lives here rather than in the project, so undo leaves it alone.
+    model_file: Option<PathBuf>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     /// What could be redone before the open continuous edit cleared it,
@@ -51,6 +54,7 @@ impl Editor {
         Self {
             project,
             path,
+            model_file: None,
             undo: Vec::new(),
             redo: Vec::new(),
             gesture_redo: Vec::new(),
@@ -66,6 +70,14 @@ impl Editor {
 
     pub fn path(&self) -> Option<&PathBuf> {
         self.path.as_ref()
+    }
+
+    pub fn model_file(&self) -> Option<&Path> {
+        self.model_file.as_deref()
+    }
+
+    pub fn set_model_file(&mut self, path: Option<PathBuf>) {
+        self.model_file = path;
     }
 
     pub fn generation(&self) -> u64 {

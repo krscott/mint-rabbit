@@ -31,9 +31,13 @@ pub const OPTION_MODEL: &str = "model";
 /// imported from, such as `cat_2`.
 pub const OPTION_TEXTURE_SET: &str = "texture_set";
 
-/// Size in meters of one model unit in a model file, so a villager stands
-/// about 3 m tall there rather than 3 km.
-pub const METERS_PER_UNIT: f32 = 0.001;
+/// How AC model units map to a model file: a villager stands about 3 m tall
+/// there rather than 3 km, and normals, which AC stores about 120 long and
+/// the import reads as 1/127 of that, come back at that length.
+pub const MODEL_FILE_UNITS: mint_core::model_file::Units = mint_core::model_file::Units {
+    meters_per_unit: 0.001,
+    normal_length: 120.0 / 127.0,
+};
 
 /// Texture slots of the AC villager target.
 pub const SLOT_BODY: &str = "body";

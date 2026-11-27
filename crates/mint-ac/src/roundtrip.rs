@@ -30,6 +30,43 @@ struct Canonical {
 }
 
 fn canonical(p: &Project) -> Canonical {
+    canonical_with(p, true)
+}
+
+/// [`canonical`] without normals, which a model file keeps only to within a
+/// rounding step; [`assert_normals_close`] compares those.
+fn canonical_shape(p: &Project) -> Canonical {
+    canonical_with(p, false)
+}
+
+/// Asserts that each triangle corner's normal in `b`, read from a model
+/// file, points within about a degree of the one in `a` at AC's usual
+/// length, given that their triangles match.
+fn assert_normals_close(a: &Project, b: &Project, label: &str) {
+    let normals = |p: &Project| -> Vec<glam::Vec3> {
+        p.model()
+            .meshes()
+            .flatten()
+            .flat_map(|m| {
+                m.triangles
+                    .iter()
+                    .flat_map(|t| t.corners.map(|c| m.vertices[c.vertex as usize].normal))
+            })
+            .collect()
+    };
+    for (x, y) in normals(a).into_iter().zip(normals(b)) {
+        if x == glam::Vec3::ZERO {
+            // A few AC normals are zero, which stays zero.
+            assert_eq!(y, x, "{label}");
+            continue;
+        }
+        let close = x.normalize().dot(y.normalize()) > 0.9998
+            && (y.length() - crate::MODEL_FILE_UNITS.normal_length).abs() < 1e-4;
+        assert!(close, "{label}: normal {x} came back as {y}");
+    }
+}
+
+fn canonical_with(p: &Project, normals: bool) -> Canonical {
     let palette = p
         .palette()
         .colors()
@@ -70,6 +107,7 @@ fn canonical(p: &Project) -> Canonical {
                             // Adding zero turns -0.0, from float noise, into 0.0.
                             let st = (c.uv * size * 32.0).round() + 0.0;
                             let nrm = (v.normal * 127.0).round() + 0.0;
+                            let nrm = if normals { nrm } else { glam::Vec3::ZERO };
                             let _ = write!(
                                 s,
                                 " p{:?} n{:?} f{} st{:?}",
@@ -124,10 +162,10 @@ fn through_model_file(project: &Project) -> Project {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.glb");
     let variants = vec![0; project.textures().len()];
-    model_file::write(project, &path, &variants, crate::METERS_PER_UNIT).unwrap();
-    let model = model_file::read(project, &path, crate::METERS_PER_UNIT).unwrap();
+    model_file::write(project, &path, &variants, crate::MODEL_FILE_UNITS).unwrap();
+    let meshes = model_file::read(project, &path, crate::MODEL_FILE_UNITS).unwrap();
     let mut out = project.clone();
-    out.set_model(model).unwrap();
+    out.set_meshes(meshes).unwrap();
     out
 }
 
@@ -135,12 +173,7 @@ fn through_model_file(project: &Project) -> Project {
 /// follow, as reading a model file places it, and how many triangles moved.
 fn by_deepest_corner(project: &Project) -> (Project, usize) {
     let model = project.model();
-    let mut depth = vec![0usize; model.nodes().len()];
-    for id in model.ids() {
-        if let Some(p) = model.node(id).parent() {
-            depth[id.index()] = depth[p.index()] + 1;
-        }
-    }
+    let depth = model.depths();
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut moved = 0;
     for id in model.ids() {
@@ -172,12 +205,8 @@ fn by_deepest_corner(project: &Project) -> (Project, usize) {
             out.triangles.push(Triangle { corners, ..*t });
         }
     }
-    let mut out = model.clone();
-    for (id, mesh) in model.ids().zip(meshes) {
-        out.node_mut(id).mesh = mesh;
-    }
     let mut p = project.clone();
-    p.set_model(out).unwrap();
+    p.set_meshes(meshes).unwrap();
     (p, moved)
 }
 
@@ -371,8 +400,12 @@ fn synthetic_villager_round_trips() {
 fn synthetic_villager_round_trips_through_a_model_file() {
     let (original, pose) = synthetic_project();
     let again = through_model_file(&original);
-    assert_eq!(canonical(&original), canonical(&again));
-    assert_eq!(canonical(&original), canonical(&reimport(&again, &pose)));
+    assert_eq!(canonical_shape(&original), canonical_shape(&again));
+    assert_normals_close(&original, &again, "synthetic");
+    assert_eq!(
+        canonical_shape(&original),
+        canonical_shape(&reimport(&again, &pose))
+    );
 }
 
 /// Export writes what the layers paint over the base layer, and hidden layers
@@ -768,22 +801,23 @@ fn every_built_villager_round_trips() {
                 }
                 let sent = through_model_file(&p);
                 assert_eq!(
-                    canonical(&expected),
-                    canonical(&sent),
+                    canonical_shape(&expected),
+                    canonical_shape(&sent),
                     "{} changed through a model file",
                     v.texture_set
                 );
+                assert_normals_close(&expected, &sent, &v.texture_set);
                 // Reading welds vertices the import kept apart, so the
                 // export may order its vertices differently.
                 assert_eq!(
-                    canonical(&expected),
-                    canonical(&reimport(&sent, &pose)),
+                    canonical_shape(&expected),
+                    canonical_shape(&reimport(&sent, &pose)),
                     "{} exports differently after a model file",
                     v.texture_set
                 );
                 let dir = tempfile::tempdir().unwrap();
-                mint_core::file::save(&p, dir.path()).unwrap();
-                let loaded = mint_core::file::load(dir.path()).unwrap();
+                mint_core::file::save(&p, None, dir.path()).unwrap();
+                let loaded = mint_core::file::load(dir.path()).unwrap().project;
                 assert!(loaded == p, "{} changed in save and load", v.texture_set);
                 // Its texture-only export could replace its own source, and
                 // a table entry based on it parses back to the same row.

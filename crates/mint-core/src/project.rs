@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glam::UVec2;
 
 use crate::{
-    Material, MaterialId, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Texture,
+    Material, MaterialId, Mesh, Model, Palette, PaletteFull, PaletteIndex, Pose, Rgba8, Texture,
     TextureId, Variant,
 };
 
@@ -50,8 +49,6 @@ pub struct Project {
     textures: Vec<Texture>,
     materials: Vec<Material>,
     pose: Pose,
-    /// Where the project's model file is, if it has one.
-    model_file: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -86,6 +83,8 @@ pub enum ProjectError {
     MissingVertex { node: String, vertex: u32 },
     #[error("node {node:?} has a vertex following missing node {follows}")]
     MissingFollowedNode { node: String, follows: u32 },
+    #[error("{actual} meshes were given for a model of {expected} nodes")]
+    MeshCount { expected: usize, actual: usize },
     #[error("the palette is empty, but painted textures need at least one entry")]
     EmptyPalette,
     #[error(
@@ -186,7 +185,6 @@ impl Project {
             textures,
             materials,
             pose,
-            model_file: None,
         })
     }
 
@@ -230,27 +228,23 @@ impl Project {
         &self.pose
     }
 
-    /// Replaces the model, checking that every reference in its meshes
-    /// resolves.
-    pub fn set_model(&mut self, model: Model) -> Result<(), ProjectError> {
+    /// Replaces the meshes of the model's nodes, one per node in id order,
+    /// keeping the node tree; every reference in them must resolve.
+    pub fn set_meshes(&mut self, meshes: Vec<Option<Mesh>>) -> Result<(), ProjectError> {
+        let count = self.model.nodes().len();
+        if meshes.len() != count {
+            return Err(ProjectError::MeshCount {
+                expected: count,
+                actual: meshes.len(),
+            });
+        }
+        let mut model = Model::clone(&self.model);
+        for (id, mesh) in model.ids().zip(meshes) {
+            model.node_mut(id).mesh = mesh;
+        }
         check_model(&model, self.materials.len())?;
         self.model = Arc::new(model);
         Ok(())
-    }
-
-    /// The absolute path of the project's model file, if it has one.
-    #[must_use]
-    pub fn model_file(&self) -> Option<&Path> {
-        self.model_file.as_deref()
-    }
-
-    /// Sets where the project's model file is; `path` must be absolute.
-    pub fn set_model_file(&mut self, path: Option<PathBuf>) {
-        assert!(
-            path.as_deref().is_none_or(Path::is_absolute),
-            "model file paths are absolute: {path:?}"
-        );
-        self.model_file = path;
     }
 
     /// Panics if `r` is not a painted variant of this project.

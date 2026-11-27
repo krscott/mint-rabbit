@@ -605,8 +605,11 @@ impl App {
     fn open_project(&mut self, dir: &Path) {
         self.status = None;
         match mint_core::file::load(dir) {
-            Ok(project) => {
-                self.set_doc(project, Some(dir.to_owned()));
+            Ok(loaded) => {
+                self.set_doc(loaded.project, Some(dir.to_owned()));
+                if let Some(doc) = &mut self.doc {
+                    doc.editor.set_model_file(loaded.model_file);
+                }
                 self.tell(format!("Opened {}", dir.display()));
             }
             Err(e) => self.fail(e.to_string()),
@@ -639,7 +642,7 @@ impl App {
 
     fn save_to(&mut self, dir: PathBuf) {
         let Some(doc) = &mut self.doc else { return };
-        match mint_core::file::save(doc.editor.project(), &dir) {
+        match mint_core::file::save(doc.editor.project(), doc.editor.model_file(), &dir) {
             Ok(()) => {
                 let saved = format!("Saved {}", dir.display());
                 doc.editor.saved(dir);

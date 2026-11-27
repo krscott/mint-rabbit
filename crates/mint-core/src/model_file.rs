@@ -3,29 +3,45 @@
 //!
 //! The file holds one mesh skinned to a skeleton of the model's nodes, posed
 //! in the project's display pose, which becomes the rest pose in the other
-//! program. Each vertex is weighted fully to the node it follows, and
-//! vertices that meet across a seam are one vertex, so editing can't open the
-//! seam. Its materials are named after the textures they draw with and show
-//! PNG images of those textures, written beside the file.
+//! program. Each vertex is weighted fully to the node it follows. Vertices
+//! that share their node, position, normal, and UV are one vertex, and
+//! Blender's Merge Vertices joins those that differ only in UV, so a seam
+//! whose sides share a normal stays closed while editing. Materials are
+//! named after the textures they draw with and show PNG images of those
+//! textures, written beside the file.
 //!
 //! Reading takes the meshes back into the project's own node tree, which a
 //! file can't change: each triangle belongs to the deepest node among its
-//! corners', and corners that follow another node become seam vertices.
-//! Whatever else the file holds, such as images and animations, is ignored.
+//! corners', and corners that follow another node become seam vertices. Only
+//! the file's default scene is read, and of it only meshes; images and
+//! animations are ignored. The file is untrusted: anything it says that
+//! can't be read safely is refused with an error naming the object.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use glam::{Mat3, Mat4, Vec2, Vec3};
+use gltf::accessor::{DataType, Dimensions};
 use serde_json::{Value, json};
 
 use crate::file::write_atomic;
 use crate::{
-    AlphaMode, Corner, Mesh, Model, NodeId, Project, Rgba8, TextureContent, Triangle, Vertex, Wrap,
+    AlphaMode, Corner, MaterialId, Mesh, Model, NodeId, Project, Rgba8, TextureContent, TextureId,
+    Triangle, VariantRef, Vertex, Wrap,
 };
 
 /// The extension of a model file.
 pub const EXTENSION: &str = "glb";
+
+/// How an export target's model units map to a model file's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Units {
+    /// Size in meters, the file's unit, of one model unit.
+    pub meters_per_unit: f32,
+    /// Length of the target's normals in the model; the file's are unit
+    /// length.
+    pub normal_length: f32,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelFileError {
@@ -33,11 +49,17 @@ pub enum ModelFileError {
     Io(PathBuf, std::io::Error),
     #[error("{0}: {1}")]
     Png(PathBuf, png::EncodingError),
+    #[error("{0} exists and isn't a glTF binary file; choose another path")]
+    NotModelFile(PathBuf),
+    #[error("{0} exists and isn't a PNG image; move it, or choose another model file path")]
+    NotPng(PathBuf),
     #[error("two nodes are named {0:?}; a model file names each bone after its node")]
     DuplicateNode(String),
-    #[error("not a glTF binary file: {0}")]
+    #[error(
+        "can't read the model file as glTF: {0}; export it as glTF Binary (.glb) without compression"
+    )]
     Gltf(#[from] gltf::Error),
-    #[error("the model file has no meshes")]
+    #[error("the model file's default scene has no meshes")]
     NoMesh,
     #[error("the model file's nodes form a loop rather than a tree")]
     Cycle,
@@ -56,6 +78,8 @@ pub enum ModelFileError {
         object: String,
         attribute: &'static str,
     },
+    #[error("object {object:?} has a malformed {what}")]
+    Malformed { object: String, what: String },
     #[error("object {0:?} has faces with no material")]
     NoMaterial(String),
     #[error(
@@ -79,7 +103,7 @@ pub enum ModelFileError {
 }
 
 /// The name of each of `project`'s materials in a model file: the name of
-/// its texture, made unique with the material's index where two share it.
+/// its texture, made unique with the material's index where two meet.
 #[must_use]
 pub fn material_names(project: &Project) -> Vec<String> {
     let mut taken = HashSet::new();
@@ -88,24 +112,25 @@ pub fn material_names(project: &Project) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let name = &project.texture(m.texture).name;
-            let name = if taken.contains(name) {
-                format!("{name} #{i}")
-            } else {
-                name.clone()
-            };
+            let base = &project.texture(m.texture).name;
+            let mut name = base.clone();
+            let mut n = i;
+            while taken.contains(&name) {
+                name = format!("{base} #{n}");
+                n += 1;
+            }
             taken.insert(name.clone());
             name
         })
         .collect()
 }
 
-/// `name` with every character but ASCII letters, digits, `-`, and `_`
-/// replaced, so it is safe in a file name and a URI.
+/// `name` with every character but ASCII letters, digits, `-`, `_`, and
+/// spaces replaced, so it is safe in a file name.
 fn file_safe(name: &str) -> String {
     name.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ') {
                 c
             } else {
                 '_'
@@ -119,66 +144,107 @@ fn file_safe(name: &str) -> String {
 /// where two names meet.
 #[must_use]
 pub fn image_paths(project: &Project, path: &Path) -> Vec<PathBuf> {
-    let stem = file_safe(&path.file_stem().unwrap_or_default().to_string_lossy());
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let mut taken = HashSet::new();
     project
         .textures()
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let base = format!("{stem}.{}", file_safe(&t.name));
-            let name = if taken.contains(&base) {
-                format!("{base}.{i}.png")
-            } else {
-                format!("{base}.png")
-            };
-            taken.insert(base);
+            let mut name = format!("{stem}.{}.png", file_safe(&t.name));
+            if taken.contains(&name) {
+                name = format!("{stem}.{}.{i}.png", file_safe(&t.name));
+            }
+            taken.insert(name.clone());
             path.with_file_name(name)
         })
         .collect()
 }
 
+/// `name` as a relative URI reference: every byte but unreserved characters
+/// percent-encoded.
+fn uri(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Fails unless `path` is missing or starts with `magic`, so writing never
+/// replaces a file of another kind, such as one a shared project names.
+fn check_replaceable(
+    path: &Path,
+    magic: &[u8],
+    error: fn(PathBuf) -> ModelFileError,
+) -> Result<(), ModelFileError> {
+    use std::io::Read as _;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ModelFileError::Io(path.to_owned(), e)),
+    };
+    let mut head = vec![0; magic.len()];
+    match file.read_exact(&mut head) {
+        Ok(()) if head == magic => Ok(()),
+        _ => Err(error(path.to_owned())),
+    }
+}
+
+const GLB_MAGIC: &[u8] = b"glTF";
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
 /// Writes `project`'s model to the model file at `path` and the images its
-/// materials show beside it. `variants` gives the variant shown for each
-/// texture, and `meters_per_unit` the size of one model unit in the file,
-/// whose units are meters.
+/// materials show beside it, each texture in the variant `variants` gives
+/// for it. Refuses to replace a file that isn't a model file or a PNG.
 pub fn write(
     project: &Project,
     path: &Path,
     variants: &[usize],
-    meters_per_unit: f32,
+    units: Units,
 ) -> Result<(), ModelFileError> {
-    let images = image_paths(project, path);
-    let uris: Vec<String> = images
+    check_replaceable(path, GLB_MAGIC, ModelFileError::NotModelFile)?;
+    let uris: Vec<String> = image_paths(project, path)
         .iter()
-        .map(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|p| uri(&p.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
-    let bytes = encode(project, &uris, meters_per_unit)?;
+    let bytes = encode(project, &uris, units)?;
     write_images(project, path, variants)?;
     write_atomic(path, &bytes).map_err(|e| ModelFileError::Io(path.to_owned(), e))
 }
 
 /// Writes the images the model file at `path` shows for `project`'s
-/// textures, each in its variant given by `variants`.
+/// textures, each in the variant `variants` gives for it; external
+/// textures show their preview, whatever `variants` gives. Refuses to
+/// replace a file that isn't a PNG.
+///
+/// Panics unless `variants` has one entry per texture, each a variant of a
+/// painted texture.
 pub fn write_images(
     project: &Project,
     path: &Path,
     variants: &[usize],
 ) -> Result<(), ModelFileError> {
-    for ((i, t), image) in project
-        .textures()
-        .iter()
-        .enumerate()
-        .zip(image_paths(project, path))
-    {
+    assert_eq!(
+        variants.len(),
+        project.textures().len(),
+        "one variant per texture"
+    );
+    let images = image_paths(project, path);
+    for image in &images {
+        check_replaceable(image, PNG_MAGIC, ModelFileError::NotPng)?;
+    }
+    for ((i, t), image) in project.textures().iter().enumerate().zip(images) {
         let (size, pixels): (_, Vec<Rgba8>) = match t.content() {
-            TextureContent::Painted(v) => {
-                let v = &v[variants.get(i).copied().unwrap_or(0).min(v.len() - 1)];
+            TextureContent::Painted(_) => {
+                let v = project.variant(VariantRef {
+                    texture: TextureId(i as u32),
+                    variant: variants[i],
+                });
                 let colors = project.palette().colors();
                 let img = v.rasterize();
                 (
@@ -204,9 +270,16 @@ fn encode_png(size: glam::UVec2, pixels: &[Rgba8]) -> Result<Vec<u8>, png::Encod
     Ok(out)
 }
 
-/// Each node's model-space matrix in the display pose.
-fn posed(project: &Project) -> Vec<Mat4> {
-    project.model().world_matrices(project.pose())
+/// Each of `model`'s nodes by name, refusing two with one name.
+fn nodes_by_name(model: &Model) -> Result<HashMap<&str, NodeId>, ModelFileError> {
+    let mut out = HashMap::new();
+    for id in model.ids() {
+        let name = model.node(id).name.as_str();
+        if out.insert(name, id).is_some() {
+            return Err(ModelFileError::DuplicateNode(name.to_owned()));
+        }
+    }
+    Ok(out)
 }
 
 /// The glTF binary buffer under construction, with its views and accessors.
@@ -225,7 +298,8 @@ const ARRAY_BUFFER: u32 = 34962;
 const ELEMENT_ARRAY_BUFFER: u32 = 34963;
 
 impl Bin {
-    /// Adds an accessor over `bytes`, which hold `count` elements of `kind`.
+    /// Adds an accessor over `bytes`, which hold `count` elements of `kind`,
+    /// with `extra` fields, such as bounds.
     fn accessor(
         &mut self,
         bytes: &[u8],
@@ -266,25 +340,26 @@ impl Bin {
         values: &[[f32; N]],
         kind: &str,
         target: Option<u32>,
+        extra: Value,
     ) -> usize {
         let bytes: Vec<u8> = values
             .iter()
             .flatten()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        self.accessor(&bytes, FLOAT, kind, values.len(), target, json!({}))
+        self.accessor(&bytes, FLOAT, kind, values.len(), target, extra)
     }
 }
 
-/// A vertex of the file's mesh.
+/// The vertex attributes of the file's mesh, with the index that welds
+/// identical vertices.
 #[derive(Default)]
 struct Vertices {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     joints: Vec<u16>,
-    /// Index of each vertex by its node and attribute bits, which welds
-    /// vertices that meet across a seam.
+    /// Each vertex's index by its node and attribute bits.
     index: HashMap<(u32, [u32; 8]), u32>,
 }
 
@@ -310,34 +385,18 @@ fn normal_matrix(m: Mat4) -> Mat3 {
     Mat3::from_mat4(m).inverse().transpose()
 }
 
-/// `n` turned by normal matrix `m`, keeping its length, which a scale in
-/// `m` would change.
-fn carry_normal(m: Mat3, n: Vec3) -> Vec3 {
-    let t = m * n;
-    let len = t.length();
-    if len > 0.0 { t * (n.length() / len) } else { t }
-}
-
 /// Encodes `project`'s model as a glTF binary whose materials show the
 /// images at `uris`, one per texture, relative to the file.
-fn encode(
-    project: &Project,
-    uris: &[String],
-    meters_per_unit: f32,
-) -> Result<Vec<u8>, ModelFileError> {
+fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, ModelFileError> {
     let model = project.model();
-    let mut names = HashSet::new();
-    for n in model.nodes() {
-        if !names.insert(&n.name) {
-            return Err(ModelFileError::DuplicateNode(n.name.clone()));
-        }
-    }
-    let s = meters_per_unit;
-    let world = posed(project);
+    nodes_by_name(model)?;
+    let s = units.meters_per_unit;
+    let world = model.world_matrices(project.pose());
     let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
 
     // Triangles in drawing order: one primitive per run of a node's
-    // triangles that share a material, so reading keeps the order.
+    // triangles that share a material, so a file read back unchanged keeps
+    // the order. Blender groups each object's faces by material instead.
     let mut verts = Vertices::default();
     let mut runs: Vec<(u32, Vec<u32>)> = Vec::new();
     for id in model.ids() {
@@ -355,10 +414,7 @@ fn encode(
                 let v = mesh.vertices[c.vertex as usize];
                 let f = v.followed(id);
                 let p = world[f.index()].transform_point3(v.position) * s;
-                // Kept at their own length rather than normalized, so the
-                // file reads back exactly; some targets store shorter
-                // normals, such as AC's at 120/127.
-                let n = carry_normal(normals[f.index()], v.normal);
+                let n = (normals[f.index()] * v.normal).normalize_or_zero();
                 run.push(verts.add(f, p, n, c.uv));
             }
         }
@@ -372,24 +428,14 @@ fn encode(
         (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
         |(lo, hi), &p| (lo.min(p.into()), hi.max(p.into())),
     );
-    let position = {
-        let bytes: Vec<u8> = verts
-            .positions
-            .iter()
-            .flatten()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        bin.accessor(
-            &bytes,
-            FLOAT,
-            "VEC3",
-            verts.positions.len(),
-            Some(ARRAY_BUFFER),
-            json!({"min": min.to_array(), "max": max.to_array()}),
-        )
-    };
-    let normal = bin.floats(&verts.normals, "VEC3", Some(ARRAY_BUFFER));
-    let uv = bin.floats(&verts.uvs, "VEC2", Some(ARRAY_BUFFER));
+    let position = bin.floats(
+        &verts.positions,
+        "VEC3",
+        Some(ARRAY_BUFFER),
+        json!({"min": min.to_array(), "max": max.to_array()}),
+    );
+    let normal = bin.floats(&verts.normals, "VEC3", Some(ARRAY_BUFFER), json!({}));
+    let uv = bin.floats(&verts.uvs, "VEC2", Some(ARRAY_BUFFER), json!({}));
     let joints = {
         let bytes: Vec<u8> = verts
             .joints
@@ -410,6 +456,7 @@ fn encode(
         &vec![[1.0f32, 0.0, 0.0, 0.0]; verts.joints.len()],
         "VEC4",
         Some(ARRAY_BUFFER),
+        json!({}),
     );
     let primitives: Vec<Value> = runs
         .iter()
@@ -437,17 +484,31 @@ fn encode(
         })
         .collect();
 
-    // The skeleton, posed, with translations in the file's units.
+    // The skeleton, posed, with translations in the file's units. The
+    // inverse bind matrices come from the transforms as written, so they
+    // cancel them exactly even where a node's matrix doesn't decompose.
+    let written: Vec<(Vec3, glam::Quat, Vec3)> = model
+        .local_matrices(project.pose())
+        .iter()
+        .map(|m| {
+            let (scale, rotation, translation) = m.to_scale_rotation_translation();
+            (scale, rotation, translation * s)
+        })
+        .collect();
+    let written_world = model.compose(
+        &written
+            .iter()
+            .map(|&(sc, r, t)| Mat4::from_scale_rotation_translation(sc, r, t))
+            .collect::<Vec<_>>(),
+    );
     let mut nodes: Vec<Value> = model
         .ids()
-        .map(|id| {
-            let n = model.node(id);
-            let local = n.transform.matrix() * Mat4::from_quat(project.pose().rotation(id));
-            let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        .zip(&written)
+        .map(|(id, (scale, rotation, translation))| {
             let children: Vec<u32> = model.children(id).map(|c| c.0).collect();
             let mut node = json!({
-                "name": n.name,
-                "translation": (translation * s).to_array(),
+                "name": model.node(id).name,
+                "translation": translation.to_array(),
                 "rotation": rotation.to_array(),
                 "scale": scale.to_array(),
             });
@@ -457,15 +518,11 @@ fn encode(
             node
         })
         .collect();
-    let ibms: Vec<[f32; 16]> = world
+    let ibms: Vec<[f32; 16]> = written_world
         .iter()
-        .map(|m| {
-            let mut m = *m;
-            m.w_axis = (m.w_axis.truncate() * s).extend(1.0);
-            m.inverse().to_cols_array()
-        })
+        .map(|m| m.inverse().to_cols_array())
         .collect();
-    let ibm = bin.floats(&ibms, "MAT4", None);
+    let ibm = bin.floats(&ibms, "MAT4", None, json!({}));
     nodes.push(json!({"name": "Model", "mesh": 0, "skin": 0}));
 
     let material_names = material_names(project);
@@ -549,7 +606,7 @@ fn glb(mut json: Vec<u8>, mut bin: Vec<u8>) -> Vec<u8> {
     }
     let total = 12 + 8 + json.len() + 8 + bin.len();
     let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(GLB_MAGIC);
     out.extend_from_slice(&2u32.to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
@@ -561,12 +618,16 @@ fn glb(mut json: Vec<u8>, mut bin: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Reads the model file at `path` as a new model for `project`: its node
-/// tree with the file's meshes. `meters_per_unit` must be what the file was
-/// written with.
-pub fn read(project: &Project, path: &Path, meters_per_unit: f32) -> Result<Model, ModelFileError> {
+/// Reads the model file at `path` as new meshes for `project`'s nodes, one
+/// per node in id order, for [`Project::set_meshes`]. `units` must be what
+/// the file was written with.
+pub fn read(
+    project: &Project,
+    path: &Path,
+    units: Units,
+) -> Result<Vec<Option<Mesh>>, ModelFileError> {
     let bytes = std::fs::read(path).map_err(|e| ModelFileError::Io(path.to_owned(), e))?;
-    decode(project, &bytes, meters_per_unit)
+    decode(project, &bytes, units)
 }
 
 /// The model-space matrix of each of the file's nodes, given each node's
@@ -606,20 +667,88 @@ fn strip_blender_suffix(name: &str) -> &str {
     }
 }
 
-/// Decodes a glTF binary as a new model for `project`.
-fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model, ModelFileError> {
-    let gltf = gltf::Gltf::from_slice(bytes)?;
-    let blob = gltf.blob.as_deref();
-    let buffer = |b: gltf::Buffer<'_>| match b.source() {
-        gltf::buffer::Source::Bin => blob,
-        gltf::buffer::Source::Uri(_) => None,
+/// The accessor of `prim`'s attribute `semantic`, if it has one.
+fn attribute<'a>(
+    prim: &gltf::Primitive<'a>,
+    semantic: &gltf::Semantic,
+) -> Option<gltf::Accessor<'a>> {
+    prim.attributes()
+        .find(|(s, _)| s == semantic)
+        .map(|(_, a)| a)
+}
+
+/// Fails unless `accessor` is one of `kinds` and lies wholly inside the
+/// binary chunk of `blob_len` bytes, so reading it can't panic.
+fn check_accessor(
+    accessor: &gltf::Accessor<'_>,
+    kinds: &[(DataType, Dimensions)],
+    blob_len: usize,
+    object: &str,
+    what: &str,
+) -> Result<(), ModelFileError> {
+    let malformed = || ModelFileError::Malformed {
+        object: object.to_owned(),
+        what: what.to_owned(),
     };
+    let kind = (accessor.data_type(), accessor.dimensions());
+    if !kinds.contains(&kind) || accessor.sparse().is_some() || accessor.count() == 0 {
+        return Err(malformed());
+    }
+    let view = accessor.view().ok_or_else(malformed)?;
+    let size = accessor.size();
+    let stride = view.stride().unwrap_or(size);
+    let fits = (|| {
+        let end_in_view = stride
+            .checked_mul(accessor.count() - 1)?
+            .checked_add(accessor.offset())?
+            .checked_add(size)?;
+        let view_end = view.offset().checked_add(view.length())?;
+        Some(stride >= size && end_in_view <= view.length() && view_end <= blob_len)
+    })();
+    if fits == Some(true) {
+        Ok(())
+    } else {
+        Err(malformed())
+    }
+}
+
+const POSITION_KINDS: &[(DataType, Dimensions)] = &[(DataType::F32, Dimensions::Vec3)];
+const UV_KINDS: &[(DataType, Dimensions)] = &[
+    (DataType::F32, Dimensions::Vec2),
+    (DataType::U8, Dimensions::Vec2),
+    (DataType::U16, Dimensions::Vec2),
+];
+const JOINT_KINDS: &[(DataType, Dimensions)] = &[
+    (DataType::U8, Dimensions::Vec4),
+    (DataType::U16, Dimensions::Vec4),
+];
+const WEIGHT_KINDS: &[(DataType, Dimensions)] = &[
+    (DataType::F32, Dimensions::Vec4),
+    (DataType::U8, Dimensions::Vec4),
+    (DataType::U16, Dimensions::Vec4),
+];
+const INDEX_KINDS: &[(DataType, Dimensions)] = &[
+    (DataType::U8, Dimensions::Scalar),
+    (DataType::U16, Dimensions::Scalar),
+    (DataType::U32, Dimensions::Scalar),
+];
+const MATRIX_KINDS: &[(DataType, Dimensions)] = &[(DataType::F32, Dimensions::Mat4)];
+
+/// Decodes a glTF binary as new meshes for `project`'s nodes.
+fn decode(
+    project: &Project,
+    bytes: &[u8],
+    units: Units,
+) -> Result<Vec<Option<Mesh>>, ModelFileError> {
+    let gltf = gltf::Gltf::from_slice(bytes)?;
+    let blob = gltf.blob.as_deref().unwrap_or_default();
     if gltf
         .buffers()
         .any(|b| matches!(b.source(), gltf::buffer::Source::Uri(_)))
     {
         return Err(ModelFileError::ExternalData);
     }
+    let buffer = |_: gltf::Buffer<'_>| Some(blob);
 
     // Model-space matrices of the file's nodes.
     let count = gltf.nodes().len();
@@ -634,24 +763,28 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
         .map(|n| Mat4::from_cols_array_2d(&n.transform().matrix()))
         .collect();
     let global = globals(&parent, &locals)?;
-
-    let model = project.model();
-    let by_name: HashMap<&str, NodeId> = model
-        .ids()
-        .map(|id| (model.node(id).name.as_str(), id))
-        .collect();
-    let mut depth = vec![0usize; model.nodes().len()];
-    for id in model.ids() {
-        if let Some(p) = model.node(id).parent() {
-            depth[id.index()] = depth[p.index()] + 1;
+    // The default scene's nodes; with no default, the first scene's.
+    let mut in_scene = vec![false; count];
+    let mut stack: Vec<gltf::Node<'_>> = gltf
+        .default_scene()
+        .or_else(|| gltf.scenes().next())
+        .map(|s| s.nodes().collect())
+        .unwrap_or_default();
+    while let Some(n) = stack.pop() {
+        if !std::mem::replace(&mut in_scene[n.index()], true) {
+            stack.extend(n.children());
         }
     }
-    let materials: HashMap<String, u32> = material_names(project)
+
+    let model = project.model();
+    let by_name = nodes_by_name(model)?;
+    let depth = model.depths();
+    let materials: HashMap<String, MaterialId> = material_names(project)
         .into_iter()
         .enumerate()
-        .map(|(i, n)| (n, i as u32))
+        .map(|(i, n)| (n, MaterialId(i as u32)))
         .collect();
-    let world = posed(project);
+    let world = model.world_matrices(project.pose());
     let to_local: Vec<Mat4> = world.iter().map(|m| m.inverse()).collect();
     // Normals carry back by the inverse of the normal matrix, the
     // transpose of the point matrix.
@@ -663,32 +796,47 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut welds: Vec<HashMap<(u32, [u32; 6]), u32>> = vec![HashMap::new(); model.nodes().len()];
     let mut any = false;
-    for node in gltf.nodes() {
+    for node in gltf.nodes().filter(|n| in_scene[n.index()]) {
         let Some(mesh) = node.mesh() else { continue };
         any = true;
         let object = node
             .name()
             .or(mesh.name())
             .map_or_else(|| format!("node {}", node.index()), str::to_owned);
+        let malformed = |what: &str| ModelFileError::Malformed {
+            object: object.clone(),
+            what: what.to_owned(),
+        };
         let skin = node
             .skin()
             .ok_or_else(|| ModelFileError::Unskinned(object.clone()))?;
-        let ibms: Vec<Mat4> = skin
-            .reader(buffer)
-            .read_inverse_bind_matrices()
-            .map_or_else(Vec::new, |r| {
-                r.map(|m| Mat4::from_cols_array_2d(&m)).collect()
-            });
+        let joint_count = skin.joints().len();
+        let ibms: Vec<Mat4> = match skin.inverse_bind_matrices() {
+            // The glTF default when a skin gives none.
+            None => vec![Mat4::IDENTITY; joint_count],
+            Some(a) => {
+                check_accessor(&a, MATRIX_KINDS, blob.len(), &object, "skin")?;
+                let ibms: Vec<Mat4> = skin
+                    .reader(buffer)
+                    .read_inverse_bind_matrices()
+                    .ok_or_else(|| malformed("skin"))?
+                    .map(|m| Mat4::from_cols_array_2d(&m))
+                    .collect();
+                if ibms.len() < joint_count {
+                    return Err(malformed("skin"));
+                }
+                ibms
+            }
+        };
         // Each joint's bind-space-to-file matrix and project node, or the
         // bone's name where the project has no such node.
         let joints: Vec<Result<(Mat4, NodeId), String>> = skin
             .joints()
-            .enumerate()
-            .map(|(j, jn)| {
+            .zip(&ibms)
+            .map(|(jn, ibm)| {
                 let name = jn.name().unwrap_or_default();
                 let id = by_name.get(name).copied().ok_or_else(|| name.to_owned())?;
-                let ibm = ibms.get(j).copied().unwrap_or(Mat4::IDENTITY);
-                Ok((global[jn.index()] * ibm, id))
+                Ok((global[jn.index()] * *ibm, id))
             })
             .collect();
 
@@ -712,11 +860,33 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
                         known: known.join(", "),
                     }
                 })?;
-            let reader = prim.reader(buffer);
             let missing = |attribute| ModelFileError::MissingAttribute {
                 object: object.clone(),
                 attribute,
             };
+            let checked =
+                |semantic: gltf::Semantic, kinds: &[(DataType, Dimensions)], what: &'static str| {
+                    let a = attribute(&prim, &semantic).ok_or_else(|| missing(what))?;
+                    check_accessor(&a, kinds, blob.len(), &object, what)
+                };
+            checked(
+                gltf::Semantic::Positions,
+                POSITION_KINDS,
+                "vertex positions",
+            )?;
+            checked(gltf::Semantic::Normals, POSITION_KINDS, "normals")?;
+            checked(gltf::Semantic::TexCoords(0), UV_KINDS, "UV map")?;
+            let mut sets = 0;
+            while let Some(j) = attribute(&prim, &gltf::Semantic::Joints(sets)) {
+                check_accessor(&j, JOINT_KINDS, blob.len(), &object, "bone list")?;
+                checked(gltf::Semantic::Weights(sets), WEIGHT_KINDS, "bone weights")?;
+                sets += 1;
+            }
+            if let Some(i) = prim.indices() {
+                check_accessor(&i, INDEX_KINDS, blob.len(), &object, "face list")?;
+            }
+
+            let reader = prim.reader(buffer);
             let positions: Vec<Vec3> = reader
                 .read_positions()
                 .ok_or_else(|| missing("vertex positions"))?
@@ -734,14 +904,14 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
                 .map(Vec2::from)
                 .collect();
             if uvs.len() != positions.len() || normals.len() != positions.len() {
-                return Err(missing("UV and normal for every vertex"));
+                return Err(malformed("vertex list: its attributes differ in length"));
             }
             // The one joint each vertex follows, or `None` for none or many.
             let mut bone: Vec<Option<usize>> = vec![None; positions.len()];
             let mut weighted = vec![0u32; positions.len()];
-            for set in 0.. {
+            for set in 0..sets {
                 let (Some(j), Some(w)) = (reader.read_joints(set), reader.read_weights(set)) else {
-                    break;
+                    return Err(missing("bone weights"));
                 };
                 for (v, (j, w)) in j
                     .into_u16()
@@ -769,6 +939,12 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
                 Some(i) => i.into_u32().collect(),
                 None => (0..positions.len() as u32).collect(),
             };
+            if !indices.len().is_multiple_of(3) {
+                return Err(ModelFileError::NotTriangles(object));
+            }
+            if indices.iter().any(|&i| i as usize >= positions.len()) {
+                return Err(malformed("face list: it names vertices past its last"));
+            }
 
             for tri in indices.chunks_exact(3) {
                 let mut corners = [(NodeId::ROOT, Vec3::ZERO, Vec3::ZERO, Vec2::ZERO); 3];
@@ -783,14 +959,20 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
                             object: object.clone(),
                             bone,
                         })?;
-                    let p = m.transform_point3(positions[v]) / meters_per_unit;
-                    let n = carry_normal(normal_matrix(m), normals[v]);
-                    *c = (
+                    let p = m.transform_point3(positions[v]) / units.meters_per_unit;
+                    let n = normal_matrix(m) * normals[v];
+                    let local = (
                         id,
                         to_local[id.index()].transform_point3(p),
-                        carry_normal(to_local_normal[id.index()], n),
+                        (to_local_normal[id.index()] * n).normalize_or_zero() * units.normal_length,
                         uvs[v],
                     );
+                    if !(local.1.is_finite() && local.2.is_finite() && local.3.is_finite()) {
+                        return Err(malformed(
+                            "vertex: its position, normal, or UV isn't a finite number, as from a bone scaled to zero",
+                        ));
+                    }
+                    *c = local;
                 }
                 let owner = corners
                     .iter()
@@ -811,21 +993,14 @@ fn decode(project: &Project, bytes: &[u8], meters_per_unit: f32) -> Result<Model
                     });
                     Corner { vertex, uv }
                 });
-                mesh.triangles.push(Triangle {
-                    corners,
-                    material: crate::MaterialId(material),
-                });
+                mesh.triangles.push(Triangle { corners, material });
             }
         }
     }
     if !any {
         return Err(ModelFileError::NoMesh);
     }
-    let mut out = model.clone();
-    for (id, mesh) in model.ids().zip(meshes) {
-        out.node_mut(id).mesh = mesh;
-    }
-    Ok(out)
+    Ok(meshes)
 }
 
 #[cfg(test)]
@@ -836,13 +1011,36 @@ mod tests {
 
     use super::*;
     use crate::{
-        ExportTarget, IndexedImage, Material, MaterialId, Palette, PaletteIndex, Pose, Slot,
-        Texture, TextureId, Transform, Variant,
+        ExportTarget, IndexedImage, Material, Palette, PaletteIndex, Pose, Slot, Texture,
+        Transform, Variant,
     };
 
-    /// A root with a child turned by the pose, each with a triangle, the
-    /// child's sharing two corners with the root's as seam vertices.
-    fn sample() -> Project {
+    const UNITS: Units = Units {
+        meters_per_unit: 0.01,
+        normal_length: 1.0,
+    };
+
+    fn vertex(x: f32, y: f32, normal: Vec3, follows: Option<NodeId>) -> Vertex {
+        Vertex {
+            position: Vec3::new(x, y, 0.0),
+            normal,
+            follows,
+        }
+    }
+
+    fn triangle(corners: [(u32, f32, f32); 3], material: u32) -> Triangle {
+        Triangle {
+            corners: corners.map(|(vertex, u, v)| Corner {
+                vertex,
+                uv: Vec2::new(u, v),
+            }),
+            material: MaterialId(material),
+        }
+    }
+
+    /// A project whose root and child, the child turned by the pose, have
+    /// `meshes`, drawing with materials named after `textures`.
+    fn project(child_scale: Vec3, meshes: [Mesh; 2], textures: &[&str]) -> Project {
         let mut model = Model::new(
             "root",
             Transform::from_translation(Vec3::new(0.0, 100.0, 0.0)),
@@ -850,87 +1048,30 @@ mod tests {
         let child = model.add_child(
             NodeId::ROOT,
             "child",
-            Transform::from_translation(Vec3::new(50.0, 0.0, 0.0)),
+            Transform {
+                scale: child_scale,
+                ..Transform::from_translation(Vec3::new(50.0, 0.0, 0.0))
+            },
         );
-        let corner = |vertex, u, v| Corner {
-            vertex,
-            uv: Vec2::new(u, v),
-        };
-        model.node_mut(NodeId::ROOT).mesh = Some(Mesh {
-            vertices: vec![
-                Vertex {
-                    position: Vec3::ZERO,
-                    normal: Vec3::Z,
-                    follows: None,
-                },
-                Vertex {
-                    position: Vec3::new(50.0, 0.0, 0.0),
-                    normal: Vec3::Z,
-                    follows: None,
-                },
-                Vertex {
-                    position: Vec3::new(50.0, 10.0, 0.0),
-                    normal: Vec3::Z,
-                    follows: None,
-                },
-            ],
-            triangles: vec![Triangle {
-                corners: [
-                    corner(0, 0.0, 0.0),
-                    corner(1, 0.5, 0.0),
-                    corner(2, 0.5, 0.5),
-                ],
-                material: MaterialId(0),
-            }],
-        });
-        model.node_mut(child).mesh = Some(Mesh {
-            vertices: vec![
-                Vertex {
-                    position: Vec3::new(50.0, 0.0, 0.0),
-                    normal: Vec3::Z,
-                    follows: Some(NodeId::ROOT),
-                },
-                Vertex {
-                    position: Vec3::new(50.0, 10.0, 0.0),
-                    normal: Vec3::Z,
-                    follows: Some(NodeId::ROOT),
-                },
-                Vertex {
-                    position: Vec3::new(20.0, 5.0, 0.0),
-                    normal: Vec3::Y,
-                    follows: None,
-                },
-            ],
-            triangles: vec![
-                Triangle {
-                    corners: [
-                        corner(0, 0.5, 0.0),
-                        corner(1, 0.5, 0.5),
-                        corner(2, 1.0, 0.25),
-                    ],
-                    material: MaterialId(0),
-                },
-                Triangle {
-                    corners: [
-                        corner(2, 1.0, 0.25),
-                        corner(1, 0.5, 0.5),
-                        corner(0, 0.5, 0.0),
-                    ],
-                    material: MaterialId(1),
-                },
-            ],
-        });
+        let [root_mesh, child_mesh] = meshes;
+        model.node_mut(NodeId::ROOT).mesh = Some(root_mesh);
+        model.node_mut(child).mesh = Some(child_mesh);
         let mut pose = Pose::default();
         pose.set_rotation(child, Quat::from_rotation_z(0.5));
         let palette = Palette::from_colors([Rgba8::new(10, 20, 30, 255)]).unwrap();
         let image = IndexedImage::new(UVec2::new(2, 2), vec![PaletteIndex(0); 4]).unwrap();
-        let texture = Texture::painted(
-            "body",
-            Slot("body".into()),
-            UVec2::new(2, 2),
-            [Variant::imported("1", image)],
-        )
-        .unwrap();
+        let textures: Vec<Texture> = textures
+            .iter()
+            .map(|name| {
+                Texture::painted(
+                    *name,
+                    Slot("body".into()),
+                    UVec2::new(2, 2),
+                    [Variant::imported("1", image.clone())],
+                )
+                .unwrap()
+            })
+            .collect();
         let material = Material {
             texture: TextureId(0),
             wrap: [Wrap::Clamp, Wrap::Repeat],
@@ -938,29 +1079,60 @@ mod tests {
             double_sided: false,
             tint: Rgba8::new(255, 255, 255, 255),
         };
-        let cutout = Material {
-            alpha: AlphaMode::Cutout,
-            ..material
-        };
+        let materials = vec![
+            material,
+            Material {
+                alpha: AlphaMode::Cutout,
+                ..material
+            },
+        ];
         Project::new(
             ExportTarget::new("test"),
             palette,
             model,
-            vec![texture],
-            vec![material, cutout],
+            textures,
+            materials,
             pose,
         )
         .unwrap()
     }
 
+    /// The root's triangle and the child's two, which share two corners
+    /// with the root's as seam vertices.
+    fn meshes() -> [Mesh; 2] {
+        [
+            Mesh {
+                vertices: vec![
+                    vertex(0.0, 0.0, Vec3::Z, None),
+                    vertex(50.0, 0.0, Vec3::Z, None),
+                    vertex(50.0, 10.0, Vec3::Z, None),
+                ],
+                triangles: vec![triangle([(0, 0.0, 0.0), (1, 0.5, 0.0), (2, 0.5, 0.5)], 0)],
+            },
+            Mesh {
+                vertices: vec![
+                    vertex(50.0, 0.0, Vec3::Z, Some(NodeId::ROOT)),
+                    vertex(50.0, 10.0, Vec3::Z, Some(NodeId::ROOT)),
+                    vertex(20.0, 5.0, Vec3::Y, None),
+                ],
+                triangles: vec![
+                    triangle([(0, 0.5, 0.0), (1, 0.5, 0.5), (2, 1.0, 0.25)], 0),
+                    triangle([(2, 1.0, 0.25), (1, 0.5, 0.5), (0, 0.5, 0.0)], 1),
+                ],
+            },
+        ]
+    }
+
+    fn sample() -> Project {
+        project(Vec3::ONE, meshes(), &["body"])
+    }
+
     /// Positions rounded to whole units and normals to hundredths, by node.
-    fn summary(model: &Model) -> Vec<Vec<String>> {
-        model
-            .ids()
-            .map(|id| {
-                let Some(m) = &model.node(id).mesh else {
-                    return Vec::new();
-                };
+    fn summary<'a>(meshes: impl Iterator<Item = Option<&'a Mesh>>) -> Vec<Vec<String>> {
+        meshes
+            .enumerate()
+            .map(|(i, m)| {
+                let Some(m) = m else { return Vec::new() };
                 m.triangles
                     .iter()
                     .map(|t| {
@@ -970,9 +1142,9 @@ mod tests {
                             let _ = write!(
                                 s,
                                 " p{:?} n{:?} f{} uv{:?}",
-                                v.position.round().to_array(),
-                                (v.normal * 100.0).round().to_array(),
-                                v.followed(id).0,
+                                (v.position.round() + 0.0).to_array(),
+                                ((v.normal * 100.0).round() + 0.0).to_array(),
+                                v.followed(NodeId(i as u32)).0,
                                 c.uv.to_array()
                             );
                         }
@@ -983,15 +1155,21 @@ mod tests {
             .collect()
     }
 
+    fn round_trip(p: &Project) -> Vec<Option<Mesh>> {
+        let bytes = encode(p, &["body.png".into()], UNITS).unwrap();
+        decode(p, &bytes, UNITS).unwrap()
+    }
+
     #[test]
     fn round_trip_keeps_triangles_seams_and_order() {
         let p = sample();
-        let bytes = encode(&p, &["body.png".into()], 0.01).unwrap();
-        let model = decode(&p, &bytes, 0.01).unwrap();
-        assert_eq!(summary(&model), summary(p.model()));
-        // The root keeps its own vertices; the child's two seam vertices
-        // follow the root.
-        let child = model.node(NodeId(1)).mesh.as_ref().unwrap();
+        let meshes = round_trip(&p);
+        assert_eq!(
+            summary(meshes.iter().map(Option::as_ref)),
+            summary(p.model().meshes())
+        );
+        // The child's two seam vertices still follow the root.
+        let child = meshes[1].as_ref().unwrap();
         assert_eq!(
             child
                 .vertices
@@ -1003,56 +1181,199 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_survives_a_scale_the_pose_shears() {
+        let p = project(Vec3::new(2.0, 1.0, 1.0), meshes(), &["body"]);
+        let meshes = round_trip(&p);
+        assert_eq!(
+            summary(meshes.iter().map(Option::as_ref)),
+            summary(p.model().meshes())
+        );
+    }
+
+    #[test]
+    fn normals_come_back_at_the_target_length() {
+        let p = sample();
+        let units = Units {
+            normal_length: 0.5,
+            ..UNITS
+        };
+        let bytes = encode(&p, &["body.png".into()], units).unwrap();
+        let meshes = decode(&p, &bytes, units).unwrap();
+        for v in &meshes[1].as_ref().unwrap().vertices {
+            assert!((v.normal.length() - 0.5).abs() < 1e-5, "{}", v.normal);
+        }
+    }
+
+    #[test]
+    fn a_triangle_moves_to_the_deepest_node_its_corners_follow() {
+        let [root, mut child] = meshes();
+        // A third child triangle whose corners all follow the root.
+        child
+            .vertices
+            .push(vertex(40.0, 0.0, Vec3::Z, Some(NodeId::ROOT)));
+        child
+            .triangles
+            .push(triangle([(0, 0.5, 0.0), (3, 0.4, 0.0), (1, 0.5, 0.5)], 0));
+        let p = project(Vec3::ONE, [root, child], &["body"]);
+        let meshes = round_trip(&p);
+        assert_eq!(meshes[0].as_ref().unwrap().triangles.len(), 2);
+        assert_eq!(meshes[1].as_ref().unwrap().triangles.len(), 2);
+        let moved = meshes[0].as_ref().unwrap();
+        assert!(moved.vertices.iter().all(|v| v.follows.is_none()));
+    }
+
+    #[test]
     fn seam_vertices_weld_into_one() {
         let p = sample();
-        let bytes = encode(&p, &["body.png".into()], 1.0).unwrap();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
         let gltf = gltf::Gltf::from_slice(&bytes).unwrap();
-        let count = gltf.accessors().next().unwrap().count();
         // The root's three vertices, which the child's seam vertices share,
         // and the child's own vertex.
-        assert_eq!(count, 4);
+        assert_eq!(gltf.accessors().next().unwrap().count(), 4);
     }
 
     #[test]
     fn reading_refuses_unknown_bones_and_materials() {
         let p = sample();
-        let bytes = encode(&p, &["body.png".into()], 1.0).unwrap();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
 
         let mut renamed = p.model().clone();
         renamed.node_mut(NodeId(1)).name = "arm".into();
-        let mut other = p.clone();
-        other.set_model(renamed).unwrap();
-        assert!(matches!(
-            decode(&other, &bytes, 1.0),
-            Err(ModelFileError::UnknownBone { bone, .. }) if bone == "child"
-        ));
-
-        let texture = Texture::painted(
-            "skin",
-            Slot("body".into()),
-            UVec2::new(2, 2),
-            p.textures()[0].variants().to_vec(),
-        )
-        .unwrap();
         let other = Project::new(
             p.target().clone(),
             p.palette().clone(),
-            p.model().clone(),
-            vec![texture],
+            renamed,
+            p.textures().to_vec(),
             p.materials().to_vec(),
             p.pose().clone(),
         )
         .unwrap();
         assert!(matches!(
-            decode(&other, &bytes, 1.0),
+            decode(&other, &bytes, UNITS),
+            Err(ModelFileError::UnknownBone { bone, .. }) if bone == "child"
+        ));
+
+        let other = project(Vec3::ONE, meshes(), &["skin"]);
+        assert!(matches!(
+            decode(&other, &bytes, UNITS),
             Err(ModelFileError::UnknownMaterial { material, known, .. })
                 if material == "body" && known == "skin, skin #1"
         ));
     }
 
+    /// `bytes` with the JSON chunk edited by `f`.
+    fn edit_json(bytes: &[u8], f: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let gltf = gltf::Gltf::from_slice(bytes).unwrap();
+        let mut doc: Value = serde_json::to_value(gltf.document.into_json()).unwrap();
+        f(&mut doc);
+        glb(serde_json::to_vec(&doc).unwrap(), gltf.blob.unwrap())
+    }
+
     #[test]
-    fn materials_are_named_after_textures() {
+    fn reading_refuses_malformed_faces() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        // The root's triangle's index accessor, cut to two indices.
+        let index = |doc: &Value| {
+            doc["meshes"][0]["primitives"][0]["indices"]
+                .as_u64()
+                .unwrap() as usize
+        };
+        let short = edit_json(&bytes, |doc| {
+            let i = index(doc);
+            doc["accessors"][i]["count"] = json!(2);
+        });
+        assert!(matches!(
+            decode(&p, &short, UNITS),
+            Err(ModelFileError::NotTriangles(_))
+        ));
+        // Joints given as floats, which the reader can't take.
+        let floats = edit_json(&bytes, |doc| {
+            let j = doc["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"]
+                .as_u64()
+                .unwrap() as usize;
+            doc["accessors"][j]["componentType"] = json!(FLOAT);
+            doc["accessors"][j]["count"] = json!(1);
+        });
+        assert!(matches!(
+            decode(&p, &floats, UNITS),
+            Err(ModelFileError::Malformed { .. })
+        ));
+        // An accessor longer than its buffer view.
+        let long = edit_json(&bytes, |doc| {
+            let i = index(doc);
+            doc["accessors"][i]["count"] = json!(3_000_000);
+        });
+        assert!(matches!(
+            decode(&p, &long, UNITS),
+            Err(ModelFileError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn reading_refuses_indices_past_the_vertices() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        let gltf = gltf::Gltf::from_slice(&bytes).unwrap();
+        let view = gltf
+            .meshes()
+            .next()
+            .unwrap()
+            .primitives()
+            .next()
+            .unwrap()
+            .indices()
+            .unwrap()
+            .view()
+            .unwrap();
+        let mut blob = gltf.blob.clone().unwrap();
+        blob[view.offset()..view.offset() + 4].copy_from_slice(&999u32.to_le_bytes());
+        let json = serde_json::to_vec(&gltf.document.into_json()).unwrap();
+        assert!(matches!(
+            decode(&p, &glb(json, blob), UNITS),
+            Err(ModelFileError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_default_scene_is_read() {
+        let p = sample();
+        let bytes = encode(&p, &["body.png".into()], UNITS).unwrap();
+        // A second scene holding an unskinned copy of the mesh.
+        let backup = edit_json(&bytes, |doc| {
+            let n = doc["nodes"].as_array().unwrap().len();
+            doc["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name": "backup", "mesh": 0}));
+            doc["scenes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"nodes": [n]}));
+        });
+        assert!(decode(&p, &backup, UNITS).is_ok());
+    }
+
+    #[test]
+    fn material_names_are_unique() {
         assert_eq!(material_names(&sample()), ["body", "body #1"]);
+        // A texture already named like a generated name.
+        let mut p = project(Vec3::ONE, meshes(), &["body", "body #1"]);
+        let mut materials = p.materials().to_vec();
+        materials.push(Material {
+            texture: TextureId(1),
+            ..materials[0]
+        });
+        p = Project::new(
+            p.target().clone(),
+            p.palette().clone(),
+            p.model().clone(),
+            p.textures().to_vec(),
+            materials,
+            p.pose().clone(),
+        )
+        .unwrap();
+        assert_eq!(material_names(&p), ["body", "body #1", "body #1 #2"]);
     }
 
     #[test]
@@ -1063,11 +1384,15 @@ mod tests {
 
     #[test]
     fn image_paths_sit_beside_the_file() {
-        let p = sample();
+        let p = project(Vec3::ONE, meshes(), &["body", "body"]);
         assert_eq!(
-            image_paths(&p, Path::new("/x/my villager.glb")),
-            [PathBuf::from("/x/my_villager.body.png")]
+            image_paths(&p, Path::new("/x/my cat.glb")),
+            [
+                PathBuf::from("/x/my cat.body.png"),
+                PathBuf::from("/x/my cat.body.1.png")
+            ]
         );
+        assert_eq!(uri("my cat.body.png"), "my%20cat.body.png");
     }
 
     #[test]
@@ -1075,20 +1400,46 @@ mod tests {
         let p = sample();
         let mut model = p.model().clone();
         model.node_mut(NodeId(1)).name = "root".into();
-        let mut p2 = p.clone();
-        p2.set_model(model).unwrap();
+        let p = Project::new(
+            p.target().clone(),
+            p.palette().clone(),
+            model,
+            p.textures().to_vec(),
+            p.materials().to_vec(),
+            p.pose().clone(),
+        )
+        .unwrap();
         assert!(
-            matches!(encode(&p2, &["a".into()], 1.0), Err(ModelFileError::DuplicateNode(n)) if n == "root")
+            matches!(encode(&p, &["a".into()], UNITS), Err(ModelFileError::DuplicateNode(n)) if n == "root")
         );
     }
 
     #[test]
-    fn writes_the_file_and_its_images() {
+    fn writes_the_file_and_its_images_but_not_over_other_files() {
         let p = sample();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.glb");
-        write(&p, &path, &[0], 0.01).unwrap();
+        write(&p, &path, &[0], UNITS).unwrap();
         assert!(dir.path().join("m.body.png").is_file());
-        assert_eq!(summary(&read(&p, &path, 0.01).unwrap()), summary(p.model()));
+        let meshes = read(&p, &path, UNITS).unwrap();
+        assert_eq!(
+            summary(meshes.iter().map(Option::as_ref)),
+            summary(p.model().meshes())
+        );
+        // Writing again replaces both.
+        write(&p, &path, &[0], UNITS).unwrap();
+
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, "keep me").unwrap();
+        assert!(matches!(
+            write(&p, &other, &[0], UNITS),
+            Err(ModelFileError::NotModelFile(_))
+        ));
+        std::fs::write(dir.path().join("m.body.png"), "keep me").unwrap();
+        assert!(matches!(
+            write(&p, &path, &[0], UNITS),
+            Err(ModelFileError::NotPng(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep me");
     }
 }

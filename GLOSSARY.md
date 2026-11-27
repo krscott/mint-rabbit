@@ -33,7 +33,8 @@ _Avoid_: Display list, model, geometry
 
 **Pose**:
 Display-only rotations applied to nodes so a model looks as it does in use,
-such as the first frame of a game's idle animation; it is never exported.
+such as the first frame of a game's idle animation; it is never exported to
+a target, though a model file is posed in it.
 _Avoid_: Rest pose, animation, frame
 
 **Seam Vertex**:

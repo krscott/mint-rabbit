@@ -47,6 +47,8 @@ pub enum SaveError {
     Png(PathBuf, png::EncodingError),
     #[error("could not write the project file: {0}")]
     Ron(#[from] ron::Error),
+    #[error("the model file path {0} isn't valid UTF-8, so the project file can't store it")]
+    ModelFilePath(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,10 +121,10 @@ struct ProjectFile {
     textures: Vec<TextureFile>,
     /// Display rotations as quaternions (x, y, z, w), by node.
     pose: BTreeMap<u32, [f32; 4]>,
-    /// The model file's path, relative to the project directory where it
-    /// can be.
+    /// The model file's path: relative to the project directory when it
+    /// sits under that directory or its parent, else absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    model_file: Option<PathBuf>,
+    model_file: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -283,8 +285,21 @@ enum StyleFile {
 /// new one doesn't use removed; an interrupted save leaves the previous
 /// project intact, and the images it wrote stay behind. Saves to one
 /// directory must not overlap.
-pub fn save(project: &Project, dir: &Path) -> Result<(), SaveError> {
-    stage(project, dir)?.commit(dir)
+///
+/// `model_file` is the absolute path of the project's model file, if it has
+/// one. It is stored relative to the project directory when it sits under
+/// that directory or its parent, so the two can move together, and absolute
+/// otherwise.
+pub fn save(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<(), SaveError> {
+    stage(project, model_file, dir)?.commit(dir)
+}
+
+/// A project read from its directory, with its model file's absolute path,
+/// if it has one.
+#[derive(Debug)]
+pub struct Loaded {
+    pub project: Project,
+    pub model_file: Option<PathBuf>,
 }
 
 /// A save whose images are written but whose project file is not.
@@ -298,7 +313,7 @@ struct Staged {
 }
 
 /// Writes the images of `project` into `dir` and prepares its project file.
-fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
+fn stage(project: &Project, model_file: Option<&Path>, dir: &Path) -> Result<Staged, SaveError> {
     // Load would refuse it; checked before anything is written.
     if let Some(t) = project
         .textures()
@@ -397,8 +412,8 @@ fn stage(project: &Project, dir: &Path) -> Result<Staged, SaveError> {
             .rotations()
             .map(|(id, q)| (id.0, q.to_array()))
             .collect(),
-        model_file: match project.model_file() {
-            Some(p) => Some(relative_to(&absolute(dir)?, p)),
+        model_file: match model_file {
+            Some(p) => Some(stored_model_file(dir, p)?),
             None => None,
         },
     };
@@ -488,7 +503,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Reads the project in directory `dir`.
-pub fn load(dir: &Path) -> Result<Project, LoadError> {
+pub fn load(dir: &Path) -> Result<Loaded, LoadError> {
     let path = dir.join(PROJECT_FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| LoadError::Io(path.clone(), e))?;
     // Read the version alone first, so a newer file reports its version
@@ -580,12 +595,15 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
         pose.set_rotation(NodeId(node), Quat::from_array(q));
     }
     let model_file = match file.model_file {
+        // Against the directory's resolved path, as it was stored.
         Some(p) => Some(normalize(
-            &std::path::absolute(dir.join(p)).map_err(|e| LoadError::Io(dir.to_owned(), e))?,
+            &dir.canonicalize()
+                .map_err(|e| LoadError::Io(dir.to_owned(), e))?
+                .join(p),
         )),
         None => None,
     };
-    let mut project = Project::new(
+    let project = Project::new(
         ExportTarget {
             id: file.target.id,
             options: file.target.options,
@@ -596,8 +614,10 @@ pub fn load(dir: &Path) -> Result<Project, LoadError> {
         file.materials.into_iter().map(material).collect(),
         pose,
     )?;
-    project.set_model_file(model_file);
-    Ok(project)
+    Ok(Loaded {
+        project,
+        model_file,
+    })
 }
 
 fn node_file(model: &Model, id: NodeId) -> NodeFile {
@@ -792,30 +812,28 @@ fn relative_inside(rel: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Resolves an image path from the project file, which must stay inside
-/// the project directory, links included; returns its resolved path.
-/// `dir` made absolute, without resolving links.
-fn absolute(dir: &Path) -> Result<PathBuf, SaveError> {
-    std::path::absolute(dir).map_err(|e| SaveError::Io(dir.to_owned(), e))
-}
-
-/// `path` relative to directory `dir`, both absolute, or `path` itself when
-/// they share no root. Lexical, so a link in `dir` can make it wrong; the
-/// model file path it stores is only a convenience.
-fn relative_to(dir: &Path, path: &Path) -> PathBuf {
-    let (dir, path) = (normalize(dir), normalize(path));
-    let mut d = dir.components().peekable();
-    let mut p = path.components().peekable();
-    if d.peek() != p.peek() {
-        return path;
-    }
-    while d.peek().is_some() && d.peek() == p.peek() {
-        d.next();
-        p.next();
-    }
-    let mut out: PathBuf = d.map(|_| Component::ParentDir).collect();
-    out.extend(p);
-    out
+/// How the project file stores the model file at absolute `path` for a
+/// project in `dir`: relative to `dir`'s resolved path when `path` sits
+/// under it or its parent, else absolute.
+fn stored_model_file(dir: &Path, path: &Path) -> Result<String, SaveError> {
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| SaveError::Io(dir.to_owned(), e))?;
+    let path = normalize(path);
+    let stored = if let Ok(inside) = path.strip_prefix(&dir) {
+        inside.to_owned()
+    } else if let Some(rest) = dir
+        .parent()
+        .and_then(|parent| path.strip_prefix(parent).ok())
+    {
+        Path::new("..").join(rest)
+    } else {
+        path.clone()
+    };
+    stored
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(SaveError::ModelFilePath(path))
 }
 
 /// `path` with `.` and `..` components removed lexically.
@@ -835,6 +853,8 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Resolves an image path from the project file, which must stay inside
+/// the project directory, links included; returns its resolved path.
 fn image_path(dir: &Path, rel: &str) -> Result<PathBuf, LoadError> {
     if !relative_inside(rel) {
         return Err(LoadError::ImagePath(rel.to_owned()));
@@ -1177,28 +1197,58 @@ mod tests {
     fn save_then_load_gives_the_same_project() {
         let dir = tempfile::tempdir().unwrap();
         let p = sample();
-        save(&p, dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), p);
+        save(&p, None, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap().project, p);
         // Saving again over the same directory works too.
-        save(&p, dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), p);
+        save(&p, None, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap().project, p);
     }
 
     #[test]
     fn the_model_file_path_is_kept_relative_to_the_project() {
         let root = tempfile::tempdir().unwrap();
-        let (a, b) = (root.path().join("a/project"), root.path().join("b/project"));
-        let mut p = sample();
-        p.set_model_file(Some(root.path().join("a/blender/model.glb")));
-        save(&p, &a).unwrap();
-        let text = std::fs::read_to_string(a.join(PROJECT_FILE)).unwrap();
-        assert!(text.contains("\"../blender/model.glb\""), "{text}");
-        assert_eq!(load(&a).unwrap(), p);
-        // Moved with its project, the file is found beside it again.
-        std::fs::rename(root.path().join("a"), root.path().join("b")).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a/project"), root.join("b/project"));
+        let p = sample();
+        let stored = |dir: &Path| {
+            let text = std::fs::read_to_string(dir.join(PROJECT_FILE)).unwrap();
+            ron::from_str::<ProjectFile>(&text).unwrap().model_file
+        };
+
+        // Beside the project, relative, so the two move together.
+        let model = root.join("a/blender/model.glb");
+        save(&p, Some(&model), &a).unwrap();
+        assert_eq!(stored(&a).as_deref(), Some("../blender/model.glb"));
+        let loaded = load(&a).unwrap();
+        assert_eq!(loaded.project, p);
+        assert_eq!(loaded.model_file.as_deref(), Some(model.as_path()));
+        std::fs::rename(root.join("a"), root.join("b")).unwrap();
         assert_eq!(
-            load(&b).unwrap().model_file(),
-            Some(root.path().join("b/blender/model.glb").as_path())
+            load(&b).unwrap().model_file,
+            Some(root.join("b/blender/model.glb"))
+        );
+
+        // Inside the project, plainly relative.
+        save(&p, Some(&b.join("m.glb")), &b).unwrap();
+        assert_eq!(stored(&b).as_deref(), Some("m.glb"));
+
+        // Elsewhere, absolute.
+        save(&p, Some(Path::new("/mnt/usb/m.glb")), &b).unwrap();
+        assert_eq!(stored(&b).as_deref(), Some("/mnt/usb/m.glb"));
+
+        // Through a link, against the project's real place.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(root.join("b"), &link).unwrap();
+        save(
+            &p,
+            Some(&root.join("b/blender/model.glb")),
+            &link.join("project"),
+        )
+        .unwrap();
+        assert_eq!(stored(&b).as_deref(), Some("../blender/model.glb"));
+        assert_eq!(
+            load(&link.join("project")).unwrap().model_file,
+            Some(root.join("b/blender/model.glb"))
         );
     }
 
@@ -1215,7 +1265,7 @@ mod tests {
     fn saving_keeps_the_previous_images_until_the_project_file_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = sample();
-        save(&p, dir.path()).unwrap();
+        save(&p, None, dir.path()).unwrap();
         let first = images(dir.path());
         assert_eq!(first.len(), 4);
 
@@ -1223,15 +1273,15 @@ mod tests {
         // replaced, the old one still loads with its own images.
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
             .unwrap();
-        let staged = stage(&p, dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), sample());
+        let staged = stage(&p, None, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap().project, sample());
 
         // Once it is replaced, the old project's images go, but files the
         // project never referred to stay.
         let reference = dir.path().join(IMAGE_DIR).join("reference.png");
         std::fs::write(&reference, b"not ours").unwrap();
         staged.commit(dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), p);
+        assert_eq!(load(dir.path()).unwrap().project, p);
         assert!(reference.is_file());
         std::fs::remove_file(&reference).unwrap();
 
@@ -1248,8 +1298,8 @@ mod tests {
             text.replace(&format!("textures/{first_image}"), "project.ron"),
         )
         .unwrap();
-        save(&p, dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), p);
+        save(&p, None, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap().project, p);
         let second = images(dir.path());
         assert_eq!(second.len(), 4);
         assert!(
@@ -1283,16 +1333,16 @@ mod tests {
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let p = sample();
-        save(&p, &link).unwrap();
-        save(&p, &link).unwrap();
-        assert_eq!(load(&link).unwrap(), p);
+        save(&p, None, &link).unwrap();
+        save(&p, None, &link).unwrap();
+        assert_eq!(load(&link).unwrap().project, p);
     }
 
     #[test]
     fn cleanup_never_removes_through_a_link() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = sample();
-        save(&p, dir.path()).unwrap();
+        save(&p, None, dir.path()).unwrap();
         // A link with a saved image's name, pointing at the project file,
         // that the project file names.
         let name = "0-0-0-0123456789abcdef.png";
@@ -1308,8 +1358,8 @@ mod tests {
         std::fs::write(&manifest, text.replace(&first, name)).unwrap();
         p.merge_palette_color(PaletteIndex(1), PaletteIndex(0))
             .unwrap();
-        save(&p, dir.path()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), p);
+        save(&p, None, dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap().project, p);
     }
 
     #[test]
@@ -1336,7 +1386,7 @@ mod tests {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            save(&p, dir.path()),
+            save(&p, None, dir.path()),
             Err(SaveError::TextureTooLarge { .. })
         ));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -1348,7 +1398,7 @@ mod tests {
         let shared = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(shared.path(), dir.path().join(IMAGE_DIR)).unwrap();
         assert!(matches!(
-            save(&sample(), dir.path()),
+            save(&sample(), None, dir.path()),
             Err(SaveError::ImageDirLink(_))
         ));
         assert_eq!(std::fs::read_dir(shared.path()).unwrap().count(), 0);
@@ -1373,7 +1423,7 @@ mod tests {
     #[test]
     fn load_refuses_images_linked_from_outside() {
         let dir = tempfile::tempdir().unwrap();
-        save(&sample(), dir.path()).unwrap();
+        save(&sample(), None, dir.path()).unwrap();
         let inside = images(dir.path()).remove(0);
         let outside = tempfile::tempdir().unwrap();
         let elsewhere = outside.path().join("elsewhere.png");
@@ -1385,7 +1435,7 @@ mod tests {
     #[test]
     fn load_refuses_other_formats_and_escaping_paths() {
         let dir = tempfile::tempdir().unwrap();
-        save(&sample(), dir.path()).unwrap();
+        save(&sample(), None, dir.path()).unwrap();
         let path = dir.path().join(PROJECT_FILE);
         let text = std::fs::read_to_string(&path).unwrap();
 
