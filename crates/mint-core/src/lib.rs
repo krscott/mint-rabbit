@@ -3,6 +3,7 @@
 
 pub mod file;
 mod model;
+pub mod model_file;
 mod modifier;
 mod non_empty;
 mod pose;

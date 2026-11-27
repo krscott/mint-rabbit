@@ -150,13 +150,27 @@ impl Model {
         out
     }
 
+    /// Each node's matrix relative to its parent: its local transform
+    /// followed by the pose rotation for that node.
+    #[must_use]
+    pub fn local_matrices(&self, pose: &crate::Pose) -> Vec<Mat4> {
+        self.ids()
+            .map(|id| self.node(id).transform.matrix() * Mat4::from_quat(pose.rotation(id)))
+            .collect()
+    }
+
     /// Model-space matrix of every node, with each node's local transform
     /// followed by the pose rotation for that node.
     #[must_use]
     pub fn world_matrices(&self, pose: &crate::Pose) -> Vec<Mat4> {
+        self.compose(&self.local_matrices(pose))
+    }
+
+    /// Model-space matrices from each node's matrix relative to its parent.
+    #[must_use]
+    pub fn compose(&self, locals: &[Mat4]) -> Vec<Mat4> {
         let mut out: Vec<Mat4> = Vec::with_capacity(self.nodes.len());
-        for (i, node) in self.nodes.iter().enumerate() {
-            let local = node.transform.matrix() * Mat4::from_quat(pose.rotation(NodeId(i as u32)));
+        for (node, &local) in self.nodes.iter().zip(locals) {
             let world = match node.parent {
                 Some(p) => out[p.index()] * local,
                 None => local,
@@ -164,6 +178,21 @@ impl Model {
             out.push(world);
         }
         out
+    }
+
+    /// Each node's number of ancestors.
+    #[must_use]
+    pub fn depths(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            out.push(node.parent.map_or(0, |p| out[p.index()] + 1));
+        }
+        out
+    }
+
+    /// The nodes' meshes, by node.
+    pub fn meshes(&self) -> impl Iterator<Item = Option<&Mesh>> {
+        self.nodes.iter().map(|n| n.mesh.as_ref())
     }
 }
 
