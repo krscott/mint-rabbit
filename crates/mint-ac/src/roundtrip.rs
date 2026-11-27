@@ -623,7 +623,7 @@ fn model_export_replaces_a_model_in_the_decomp() {
         decomp.write_model(&other),
         Err(WriteError::ModelNotInTable(model)) if model == "u_1"
     ));
-    // A body texture no triangle uses moves where the model finds the
+    // A body texture no triangle uses would move where the model finds the
     // others in the texture set.
     let (body, moved_to) = {
         let body = |offset| {
@@ -655,16 +655,21 @@ fn model_export_replaces_a_model_in_the_decomp() {
     }
     unused.set_meshes(meshes).unwrap();
     assert!(matches!(
-        decomp.write_model(&export(&unused, "t_1", "t_1").unwrap()),
-        Err(WriteError::Redraw { .. } | WriteError::TextureSizes { .. })
+        export(&unused, "t_1", "t_1"),
+        Err(ExportError::Undrawn(name)) if name.ends_with("0x000")
     ));
-    // Other texture sets on the model load textures of the sizes it loads.
-    let mut resized = edited.clone();
-    resized.textures.texture_sizes[0].1 /= 2;
-    assert!(matches!(
-        decomp.write_model(&resized),
-        Err(WriteError::TextureSizes { .. })
-    ));
+    // Nor may a model replace one whose texture sets it would load
+    // differently.
+    let mut moved = edited.clone();
+    moved.model_c = edited
+        .model_c
+        .replace("anime_4_txt + 0x080", "anime_4_txt + 0x040");
+    assert_ne!(moved.model_c, edited.model_c);
+    let refused = decomp.write_model(&moved);
+    assert!(
+        matches!(refused, Err(WriteError::Redraw { .. })),
+        "{refused:?}"
+    );
     // The file shares an array the export would drop; its own arrays,
     // which nothing else can refer to, may change.
     write_file(

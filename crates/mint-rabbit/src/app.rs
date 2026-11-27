@@ -239,22 +239,45 @@ fn export_model(project: &Project) -> Result<mint_ac::Export, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Whether a project can export its texture set alone, and with its model,
-/// or why not.
+/// Whether a project can export, or why not.
 #[derive(Clone)]
-struct Ready {
-    textures: Result<(), String>,
-    model: Result<(), String>,
+enum Ready {
+    /// Its model and texture set.
+    All,
+    /// Only its texture set, for the model as it is in the decomp; the
+    /// model can't export, for this reason.
+    TextureSet(String),
+    /// Nothing, for this reason.
+    Nothing(String),
 }
 
 impl Ready {
     fn of(project: &Project) -> Self {
-        let textures = export_texture_set(project).map(|_| ());
-        // The model's export holds the texture set's, so it fails first.
-        let model = textures
-            .clone()
-            .and_then(|()| export_model(project).map(|_| ()));
-        Self { textures, model }
+        // The model's export holds the texture set's, so the texture set
+        // alone is tried only when it fails.
+        match export_model(project) {
+            Ok(_) => Self::All,
+            Err(model) => match export_texture_set(project) {
+                Ok(_) => Self::TextureSet(model),
+                Err(e) => Self::Nothing(e),
+            },
+        }
+    }
+
+    /// Why the texture set can't export, if it can't.
+    fn texture_set_problem(&self) -> Option<&str> {
+        match self {
+            Self::All | Self::TextureSet(_) => None,
+            Self::Nothing(e) => Some(e),
+        }
+    }
+
+    /// Why the model can't export, if it can't.
+    fn model_problem(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::TextureSet(e) | Self::Nothing(e) => Some(e),
+        }
     }
 }
 
@@ -920,20 +943,16 @@ impl App {
         // The picker holds the open decomp.
         let has_decomp = self.picker.is_some();
         let doc = self.doc.as_mut()?;
+        if !has_decomp {
+            return Some(Ready::Nothing(
+                "Open the decomp this project came from".into(),
+            ));
+        }
         let generation = doc.editor.generation();
         if doc.check.as_ref().is_none_or(|(g, _)| *g != generation) {
             doc.check = Some((generation, Ready::of(doc.editor.project())));
         }
-        let (_, ready) = doc.check.as_ref()?;
-        let decomp = || {
-            has_decomp
-                .then_some(())
-                .ok_or_else(|| "Open the decomp this project came from".to_owned())
-        };
-        Some(Ready {
-            textures: ready.textures.clone().and_then(|()| decomp()),
-            model: ready.model.clone().and_then(|()| decomp()),
-        })
+        doc.check.as_ref().map(|(_, ready)| ready.clone())
     }
 
     /// The painted variant shown and what is picked in it, for a control to
@@ -1120,11 +1139,11 @@ impl App {
             }
         }
         ui.separator();
-        let ready = self.export_ready();
-        let no_project = Err("No project is open".to_owned());
-        let textures = ready.as_ref().map_or(&no_project, |r| &r.textures);
-        let model_ready = ready.as_ref().map_or(&no_project, |r| &r.model);
-        let why_not = |r: &Result<(), String>| r.as_ref().err().cloned().unwrap_or_default();
+        let ready = self
+            .export_ready()
+            .unwrap_or_else(|| Ready::Nothing("No project is open".into()));
+        let textures = ready.texture_set_problem();
+        let model_problem = ready.model_problem();
         let imported = self.doc.as_ref().and_then(|d| {
             mint_ac::imported_from(d.editor.project())
                 .ok()
@@ -1139,33 +1158,33 @@ impl App {
         };
         if ui
             .add_enabled(
-                textures.is_ok(),
+                textures.is_none(),
                 egui::Button::new(named("texture set", set)),
             )
             .on_hover_text("The villager's textures; other villagers on its model keep theirs")
-            .on_disabled_hover_text(why_not(textures))
+            .on_disabled_hover_text(textures.unwrap_or_default())
             .clicked()
         {
             self.replace_texture_set();
         }
         if ui
             .add_enabled(
-                model_ready.is_ok(),
+                model_problem.is_none(),
                 egui::Button::new(named("model", model)),
             )
             .on_hover_text("The geometry of every villager drawn on this model")
-            .on_disabled_hover_text(why_not(model_ready))
+            .on_disabled_hover_text(model_problem.unwrap_or_default())
             .clicked()
         {
             self.replace_model();
         }
         if ui
             .add_enabled(
-                textures.is_ok(),
+                textures.is_none(),
                 egui::Button::new("Export new texture set…"),
             )
             .on_hover_text("A new texture set, based on this villager, with the steps to add it")
-            .on_disabled_hover_text(why_not(textures))
+            .on_disabled_hover_text(textures.unwrap_or_default())
             .clicked()
         {
             self.dialog = Some(Dialog::ExportSet {
@@ -1301,24 +1320,22 @@ impl App {
         ui.horizontal(|ui| {
             let half = ui.available_width() * 0.5;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let problem = ready.as_ref().and_then(|r| match (&r.textures, &r.model) {
-                    (Err(e), _) => Some(format!("Can't export: {e}")),
-                    (Ok(()), Err(e)) => Some(format!("Can't export the model: {e}")),
-                    (Ok(()), Ok(())) => None,
-                });
-                match (&ready, problem) {
-                    (None, _) => {}
-                    (Some(_), None) => {
+                let problem = match &ready {
+                    None => None,
+                    Some(Ready::All) => {
                         ui.label("Ready to export");
+                        None
                     }
-                    (Some(_), Some(problem)) => {
-                        let text = egui::RichText::new(problem).color(WARNING);
-                        ui.scope(|ui| {
-                            ui.set_max_width(half);
-                            // Hovering a cut-off label shows all of it.
-                            ui.add(egui::Label::new(text).truncate());
-                        });
-                    }
+                    Some(Ready::TextureSet(e)) => Some(format!("Can't export the model: {e}")),
+                    Some(Ready::Nothing(e)) => Some(format!("Can't export: {e}")),
+                };
+                if let Some(problem) = problem {
+                    let text = egui::RichText::new(problem).color(WARNING);
+                    ui.scope(|ui| {
+                        ui.set_max_width(half);
+                        // Hovering a cut-off label shows all of it.
+                        ui.add(egui::Label::new(text).truncate());
+                    });
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let text = match &self.status {
