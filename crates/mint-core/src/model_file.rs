@@ -118,6 +118,8 @@ pub enum ModelFileError {
     Unreadable,
     #[error("the model file's default scene has no meshes, or none with faces")]
     NoMesh,
+    #[error("the model file written wouldn't read back, so nothing was written: {0}")]
+    NotReadable(Box<ModelFileError>),
     #[error("node {node:?} can't go in a model file: {problem}")]
     Unwritable { node: String, problem: &'static str },
     #[error("the project has {0} nodes; a model file holds at most 65536")]
@@ -250,7 +252,7 @@ fn starts_with(path: &Path, magic: &[u8]) -> Result<Option<bool>, ModelFileError
     }
 }
 
-/// Fails unless `path` is missing or starts with `magic`, so writing never
+/// Fails unless `path` is missing, empty, or starts with `magic`, so writing never
 /// replaces a file of another kind, such as one a shared project names.
 fn check_replaceable(
     path: &Path,
@@ -271,7 +273,8 @@ const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 /// Writes `project`'s model to the model file at `path` and the images its
 /// materials show beside it, each texture in the variant `variants` gives
 /// for it. Refuses, before writing anything, to replace a file that isn't
-/// a model file or a PNG; writes the model file last.
+/// a model file or a PNG, or to write a model file it can't read back;
+/// writes the model file last.
 pub fn write(
     project: &Project,
     path: &ModelFilePath,
@@ -286,6 +289,8 @@ pub fn write(
         .map(|p| uri(&p.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
     let bytes = encode(project, &uris, units)?;
+    // So a model file is never replaced by one this can't read back.
+    decode(project, &bytes, units).map_err(|e| ModelFileError::NotReadable(Box::new(e)))?;
     write_pngs(project, &images, variants)?;
     write_atomic(file, &bytes).map_err(|e| ModelFileError::Io(file.to_owned(), e))
 }
@@ -473,6 +478,12 @@ fn normal_matrix(m: Mat4) -> Mat3 {
     Mat3::from_mat4(m).inverse().transpose()
 }
 
+/// The unit direction of finite `n`, or zero for zero. Scaled to its
+/// largest part first, so a very long or short vector doesn't round to zero.
+fn direction(n: Vec3) -> Vec3 {
+    (n / n.abs().max_element().max(f32::MIN_POSITIVE)).normalize_or_zero()
+}
+
 /// Encodes `project`'s model as a glTF binary whose materials show the
 /// images at `uris`, one per texture, relative to the file.
 fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, ModelFileError> {
@@ -483,17 +494,44 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
     }
     let s = units.meters_per_unit;
     let locals = model.local_matrices(project.pose());
-    for (id, m) in model.ids().zip(&locals) {
-        let det = m.determinant();
-        if !m.is_finite() || !det.is_finite() || det == 0.0 {
+    let world = model.compose(&locals);
+    let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
+
+    // The skeleton, posed, with translations in the file's units. The
+    // inverse bind matrices come from the transforms as written, so they
+    // cancel them exactly even where a node's matrix doesn't decompose.
+    let written: Vec<(Vec3, glam::Quat, Vec3)> = locals
+        .iter()
+        .map(|m| {
+            let (scale, rotation, translation) = m.to_scale_rotation_translation();
+            // A sheared matrix gives a rotation that isn't unit length.
+            (scale, rotation.normalize(), translation * s)
+        })
+        .collect();
+    let written_world = model.compose(
+        &written
+            .iter()
+            .map(|&(sc, r, t)| Mat4::from_scale_rotation_translation(sc, r, t))
+            .collect::<Vec<_>>(),
+    );
+    let ibms: Vec<Mat4> = written_world.iter().map(Mat4::inverse).collect();
+    for id in model.ids() {
+        let i = id.index();
+        let (sc, r, t) = written[i];
+        let det = written_world[i].determinant();
+        let finite = sc.is_finite() && r.is_finite() && t.is_finite();
+        if !finite
+            || !det.is_finite()
+            || det == 0.0
+            || !ibms[i].is_finite()
+            || !normals[i].is_finite()
+        {
             return Err(ModelFileError::Unwritable {
                 node: model.node(id).name.clone(),
                 problem: "its transform is scaled to nothing or isn't finite",
             });
         }
     }
-    let world = model.compose(&locals);
-    let normals: Vec<Mat3> = world.iter().copied().map(normal_matrix).collect();
 
     // Triangles in drawing order: one primitive per run of a node's
     // triangles that share a material, so a file read back unchanged keeps
@@ -515,16 +553,17 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
                 let v = mesh.vertices[c.vertex as usize];
                 let f = v.followed(id);
                 let p = world[f.index()].transform_point3(v.position) * s;
-                // A zero normal, which a few AC vertices have, stays zero
+                // Checked before normalizing, which turns NaN into zero. A
+                // zero normal, which a few AC vertices have, stays zero
                 // rather than taking a made-up direction.
-                let n = (normals[f.index()] * v.normal).normalize_or_zero();
+                let n = normals[f.index()] * v.normal;
                 if !(p.is_finite() && n.is_finite() && c.uv.is_finite()) {
                     return Err(ModelFileError::Unwritable {
                         node: model.node(id).name.clone(),
                         problem: "a vertex's position, normal, or UV isn't a finite number",
                     });
                 }
-                run.push(verts.add(f, p, n, c.uv));
+                run.push(verts.add(f, p, direction(n), c.uv));
             }
         }
     }
@@ -593,23 +632,6 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
         })
         .collect();
 
-    // The skeleton, posed, with translations in the file's units. The
-    // inverse bind matrices come from the transforms as written, so they
-    // cancel them exactly even where a node's matrix doesn't decompose.
-    let written: Vec<(Vec3, glam::Quat, Vec3)> = locals
-        .iter()
-        .map(|m| {
-            let (scale, rotation, translation) = m.to_scale_rotation_translation();
-            // A sheared matrix gives a rotation that isn't unit length.
-            (scale, rotation.normalize(), translation * s)
-        })
-        .collect();
-    let written_world = model.compose(
-        &written
-            .iter()
-            .map(|&(sc, r, t)| Mat4::from_scale_rotation_translation(sc, r, t))
-            .collect::<Vec<_>>(),
-    );
     let mut nodes: Vec<Value> = model
         .ids()
         .zip(&written)
@@ -627,10 +649,7 @@ fn encode(project: &Project, uris: &[String], units: Units) -> Result<Vec<u8>, M
             node
         })
         .collect();
-    let ibms: Vec<[f32; 16]> = written_world
-        .iter()
-        .map(|m| m.inverse().to_cols_array())
-        .collect();
+    let ibms: Vec<[f32; 16]> = ibms.iter().map(Mat4::to_cols_array).collect();
     let ibm = bin.floats(&ibms, "MAT4", None, json!({}));
     nodes.push(json!({"name": "Model", "mesh": 0, "skin": 0}));
 
@@ -1121,10 +1140,7 @@ fn decode(
                     let local = (
                         id,
                         to_local[id.index()].transform_point3(p),
-                        // Scaled to its largest part first, so a very long or
-                        // short normal doesn't round to zero.
-                        (n / n.abs().max_element().max(f32::MIN_POSITIVE)).normalize_or_zero()
-                            * units.normal_length,
+                        direction(n) * units.normal_length,
                         uvs[v],
                     );
                     if !(local.1.is_finite() && n.is_finite() && local.3.is_finite()) {
@@ -1652,6 +1668,27 @@ mod tests {
             encode(&p, &["body.png".into()], UNITS),
             Err(ModelFileError::Unwritable { node, .. }) if node == "child"
         ));
+    }
+
+    #[test]
+    fn writing_refuses_tiny_scales_and_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ModelFilePath::new(dir.path().join("m.glb")).unwrap();
+        write(&sample(), &path, &[0], UNITS).unwrap();
+        let before = std::fs::read(path.as_path()).unwrap();
+        for scale in [Vec3::splat(1e-13), Vec3::new(1e20, 1.0, 1.0)] {
+            let p = project(scale, meshes(), &["body"]);
+            assert!(write(&p, &path, &[0], UNITS).is_err(), "{scale}");
+        }
+        assert_eq!(std::fs::read(path.as_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_thin_node_keeps_its_normals_through_a_file() {
+        let p = project(Vec3::new(1e-20, 1.0, 1.0), meshes(), &["body"]);
+        for v in &round_trip(&p)[1].as_ref().unwrap().vertices {
+            assert!((v.normal.length() - 1.0).abs() < 1e-5, "{}", v.normal);
+        }
     }
 
     #[test]
