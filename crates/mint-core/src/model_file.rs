@@ -271,6 +271,10 @@ const GLB_MAGIC: &[u8] = b"glTF";
 /// How far, in model units, a vertex may move through a model file, which
 /// holds model-space positions as f32.
 const POSITION_TOLERANCE: f32 = 0.01;
+/// How far a normal may turn or stretch through a model file. Far below the
+/// difference between AC's normals and the target length they come back
+/// at, so those still come back at it.
+const NORMAL_TOLERANCE: f32 = 1e-4;
 /// Largest model file read, far above any villager's.
 const MAX_FILE_BYTES: u64 = 256 << 20;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -491,6 +495,40 @@ fn normal_matrix(m: Mat4) -> Mat3 {
 
 /// The unit direction of finite `n`, or zero for zero. Scaled to its
 /// largest part first, so a very long or short vector doesn't round to zero.
+/// The position and normal of each vertex of `model`, by the node it
+/// follows, in that node's space.
+fn previous_vertices(model: &Model) -> Vec<Vec<(Vec3, Vec3)>> {
+    let mut by_node = vec![Vec::new(); model.nodes().len()];
+    for (owner, mesh) in model.meshes().enumerate() {
+        for v in mesh.iter().flat_map(|m| &m.vertices) {
+            let followed = v.followed(NodeId(owner as u32));
+            by_node[followed.index()].push((v.position, v.normal));
+        }
+    }
+    by_node
+}
+
+/// A read vertex's position and normal, or those of the nearest of the
+/// `previous` vertices following the same node where they differ by no
+/// more than a model file's roundoff, so reading back a model file that
+/// wasn't edited gives the model exactly as it was.
+fn keep_unmoved(previous: &[(Vec3, Vec3)], position: Vec3, normal: Vec3) -> (Vec3, Vec3) {
+    let near = previous
+        .iter()
+        .filter(|(p, _)| p.distance(position) <= POSITION_TOLERANCE);
+    let Some(&(p, _)) = near
+        .clone()
+        .min_by(|a, b| a.0.distance(position).total_cmp(&b.0.distance(position)))
+    else {
+        return (position, normal);
+    };
+    let n = near
+        .map(|&(_, n)| n)
+        .find(|n| n.distance(normal) <= NORMAL_TOLERANCE)
+        .unwrap_or(normal);
+    (p, n)
+}
+
 fn direction(n: Vec3) -> Vec3 {
     (n / n.abs().max_element().max(f32::MIN_POSITIVE)).normalize_or_zero()
 }
@@ -987,6 +1025,7 @@ fn decode(
 
     let mut meshes: Vec<Option<Mesh>> = vec![None; model.nodes().len()];
     let mut welds: Vec<HashMap<(u32, [u32; 6]), u32>> = vec![HashMap::new(); model.nodes().len()];
+    let previous = previous_vertices(model);
     for node in gltf.nodes().filter(|n| in_scene[n.index()]) {
         let Some(mesh) = node.mesh() else { continue };
         let object = node
@@ -1183,12 +1222,12 @@ fn decode(
                     let p = m.transform_point3(positions[v]) / units.meters_per_unit;
                     // Checked before normalizing, which turns NaN into zero.
                     let n = to_local_normal[id.index()] * (nm * normals[v]);
-                    let local = (
-                        id,
+                    let (position, normal) = keep_unmoved(
+                        &previous[id.index()],
                         to_local[id.index()].transform_point3(p),
                         direction(n) * units.normal_length,
-                        uvs[v],
                     );
+                    let local = (id, position, normal, uvs[v]);
                     if !(local.1.is_finite() && n.is_finite() && local.3.is_finite()) {
                         return Err(malformed(
                             "vertex: its position, normal, or UV isn't a finite number in the model",
@@ -1410,6 +1449,21 @@ mod tests {
             summary(meshes.iter().map(Option::as_ref)),
             summary(p.model().meshes())
         );
+    }
+
+    #[test]
+    fn only_roundoff_is_undone() {
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let previous = [(at, Vec3::Z)];
+        let nudged = at + Vec3::X * 0.001;
+        assert_eq!(
+            keep_unmoved(&previous, nudged, Vec3::Z * 1.000_01),
+            previous[0]
+        );
+        let moved = at + Vec3::X * 0.5;
+        assert_eq!(keep_unmoved(&previous, moved, Vec3::Z), (moved, Vec3::Z));
+        let turned = Vec3::new(0.0, 0.1, 1.0);
+        assert_eq!(keep_unmoved(&previous, nudged, turned), (at, turned));
     }
 
     #[test]
